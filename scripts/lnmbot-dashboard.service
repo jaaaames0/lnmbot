@@ -1,0 +1,31 @@
+[Unit]
+Description=lnm-bot: read-only local dashboard
+After=lnmbot.service
+
+[Service]
+Type=simple
+User=james
+Group=james
+WorkingDirectory=/home/james/srv/tradingbot
+EnvironmentFile=/etc/lnmbot/.env.dashboard
+ExecStart=/home/james/srv/tradingbot/.venv/bin/python /home/james/srv/tradingbot/scripts/run_dashboard.py --db /var/lib/lnmbot/lnmarkets.sqlite --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lnmbot-dashboard
+
+# This file must contain a separate LN Markets key with Read permission only.
+# It is only available to the server process; browsers never receive it.
+# SQLite is still opened in read-only mode.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/var/lib/lnmbot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

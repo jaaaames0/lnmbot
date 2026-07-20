@@ -1,0 +1,126 @@
+[project]
+name = "lnmarkets-bot"
+version = "0.0.0"
+description = "LN Markets BTC/USD futures trading bot — backtest + live, sharing one strategy code path"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "james" }]
+
+dependencies = [
+    # Config
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    # HTTP & websockets
+    "httpx>=0.27",
+    "websockets>=12",
+    # DB
+    "sqlalchemy>=2.0",
+    # Logging
+    "structlog>=24.1",
+    # CLI
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+backfill = [
+    # Used by scripts/backfill_binance.py
+    "pandas>=2.2",
+    "pyarrow>=15",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "import-linter>=2.0",
+    "freezegun>=1.5",
+    "respx>=0.21", # httpx mocking for tests
+]
+
+[project.scripts]
+lnmarkets-bot = "lnmarkets_bot.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lnmarkets_bot"]
+
+# --- Ruff ---
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+    "N",  # pep8-naming
+    "SIM", # simplify
+    "TCH", # type-checking
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501", # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+# --- Mypy ---
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+plugins = []
+# Lazy: stubs for libs are not pinned in v0. Easy to add later.
+[[tool.mypy.overrides]]
+module = ["websockets.*"]
+ignore_missing_imports = true
+
+# --- Pytest ---
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+
+# --- Import-linter: enforce the "strategy never imports api or live data" rule ---
+[tool.importlinter]
+root_package = "lnmarkets_bot"
+
+[[tool.importlinter.contracts]]
+name = "Strategy layer isolation"
+type = "forbidden"
+source_modules = ["lnmarkets_bot.strategy"]
+forbidden_modules = [
+    "lnmarkets_bot.api",
+    "lnmarkets_bot.data.live",
+    "lnmarkets_bot.engine.live",
+]
+# Engines and data sources can import strategy. Strategy never imports them.
+
+[[tool.importlinter.contracts]]
+name = "Risk cannot be bypassed"
+type = "forbidden"
+source_modules = ["lnmarkets_bot.engine"]
+forbidden_modules = [
+    "lnmarkets_bot.api.trades",
+]
+# The engine must reach the real API only through risk/guard.py. Enforced below.
+
+[[tool.importlinter.contracts]]
+name = "Strategy cannot touch persistence directly"
+type = "forbidden"
+source_modules = ["lnmarkets_bot.strategy"]
+forbidden_modules = ["lnmarkets_bot.persistence"]
