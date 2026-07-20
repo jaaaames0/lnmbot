@@ -2,8 +2,8 @@
 
 This document describes the repository as it is now: the production `1d` and
 `4h` isolated-margin MA-cross strategy, the `lnmbot` systemd service, and the
-separate read-only dashboard.  Use the paths and service names consistently;
-older `lnm-bot` paths are not part of this runbook.
+separate read-only dashboard.  Replace every angle-bracket placeholder with a
+value for the target host.
 
 ## 1. What runs in production
 
@@ -15,7 +15,7 @@ The strategy uses SMA(20), EMA(21), a 0.5% tolerance band, per-timeframe
 winner and loss cool-offs, and optional 4h high-CHOP entry-size reduction.
 The locked rules are code defaults in
 [`src/lnmarkets_bot/strategy/ma_cross.py`](src/lnmarkets_bot/strategy/ma_cross.py).
-Runtime sizing and hard risk limits come from `/etc/lnmbot/env`.
+Runtime sizing and hard risk limits come from the deployment environment file.
 
 The bot deliberately polls rather than consumes a trading WebSocket.  A
 polling failure retains the last confirmed candle and later catches up.  Three
@@ -23,23 +23,28 @@ consecutive failures emit an error-level journal event; recovery is logged.
 
 ## 2. Files, paths, and service names
 
-| Purpose | Production value |
+| Purpose | Example value |
 |---|---|
-| Project checkout | `/home/james/srv/tradingbot` |
+| Project checkout | `/opt/lnmarkets-bot` (`<project-dir>`) |
 | Trading configuration | `/etc/lnmbot/env` |
 | Dashboard read-only credentials | `/etc/lnmbot/.env.dashboard` |
 | Bot database | `/var/lib/lnmbot/lnmarkets.sqlite` |
 | Halt file | `/var/lib/lnmbot/HALT` |
+| Service account | `lnmbot` (`<service-user>`) |
 | Trading service | `lnmbot.service` |
 | Dashboard service | `lnmbot-dashboard.service` |
 
-The included service files assume user and group `james`, and the checkout
-path above.  Change both values before installing them on a different host.
+The checked-in service templates contain one operator-specific checkout path
+and user.  Before installing them, replace `User=`, `Group=`,
+`WorkingDirectory=`, both `ExecStart=` paths, `EnvironmentFile=`, and
+`ReadWritePaths=` with the equivalents for this host.  Use the example layout
+above or another consistent layout.
 
 ## 3. Configuration reference
 
-Copy [`.env.example`](.env.example) to `/etc/lnmbot/env`, set mode `600`, and
-keep it outside Git.  Blank optional values are disabled.  The service injects
+Copy [`.env.example`](.env.example) to the trading environment-file path, set
+mode `600`, and keep it outside Git.  Blank optional values are disabled.  The
+example service injects
 `STORAGE_DB_PATH=/var/lib/lnmbot/lnmarkets.sqlite`, so that value takes
 precedence over the same variable in the env file.
 
@@ -51,7 +56,7 @@ precedence over the same variable in the env file.
 | `LNM_BASE_URL`, `LNM_WS_URL` | Optional endpoint overrides. Leave blank in normal use. |
 | `LNM_ACCESS_KEY`, `LNM_ACCESS_SECRET`, `LNM_ACCESS_PASSPHRASE` | Trading API credential. All three are needed for authenticated execution. |
 | `HALTED` | Set to `1` to stop processing. Remove or clear it before a later restart. |
-| `HALT_FILE` | Presence halts processing. Production uses `/var/lib/lnmbot/HALT`. |
+| `HALT_FILE` | Presence halts processing. Set it to a path in the service-writable state directory. |
 | `STORAGE_LOG_PATH` | Optional JSONL log path. Leave blank to use journald only. With the supplied hardened unit, place it under `/var/lib/lnmbot` or extend `ReadWritePaths`. |
 | `STORAGE_LOG_LEVEL` | Python logging level, normally `INFO`. |
 
@@ -105,15 +110,15 @@ STRATEGY_CHOP_HIGH_SIZE_MULTIPLIER=0.5
 Install dependencies from the checkout:
 
 ```bash
-cd /home/james/srv/tradingbot
+cd <project-dir>
 uv sync --extra dev --extra backfill
 ```
 
 Create the required directories and trading configuration:
 
 ```bash
-sudo install -d -o james -g james -m 700 /etc/lnmbot /var/lib/lnmbot
-sudo install -o james -g james -m 600 .env.example /etc/lnmbot/env
+sudo install -d -o <service-user> -g <service-user> -m 700 /etc/lnmbot /var/lib/lnmbot
+sudo install -o <service-user> -g <service-user> -m 600 .env.example /etc/lnmbot/env
 sudoedit /etc/lnmbot/env
 ```
 
@@ -180,7 +185,7 @@ Enter exactly:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/home/james/srv/tradingbot/.venv/bin/python /home/james/srv/tradingbot/scripts/run_live.py --env /etc/lnmbot/env --allow-orders --confirm-mainnet
+ExecStart=<project-dir>/.venv/bin/python <project-dir>/scripts/run_live.py --env /etc/lnmbot/env --allow-orders --confirm-mainnet
 ```
 
 Then reload and restart:
@@ -229,7 +234,7 @@ journalctl -u lnmbot-dashboard -n 100 --no-pager
 Use an SSH tunnel for off-host access:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 optiplex
+ssh -L 8080:127.0.0.1:8080 <bot-host>
 ```
 
 ### Change configuration

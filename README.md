@@ -8,8 +8,8 @@ resizes, or otherwise changes the other.
 The intended operating model is deliberately boring:
 
 ```text
-/etc/lnmbot/env       reviewed trading configuration
-systemd (lnmbot)      one always-on strategy process
+deployment env file   reviewed trading configuration
+systemd               one always-on strategy process
 SQLite                local audit trail
 dashboard             loopback-only, read-only monitoring
 journalctl            diagnostics and incident evidence
@@ -32,8 +32,7 @@ presentation-only.
 - A same-direction entry is idempotent.  If an entry response is ambiguous,
   the executor checks remote running trades and stops rather than blindly
   retrying.
-- `HALTED=1` or the presence of `HALT_FILE` prevents new processing.  The
-  production example uses `/var/lib/lnmbot/HALT`.
+- `HALTED=1` or the presence of `HALT_FILE` prevents new processing.
 - The dashboard is read-only, binds to loopback, and should use a separate LN
   Markets API key with **Read** permission only.
 
@@ -42,16 +41,17 @@ exchange failure, liquidation, or operational mistakes.
 
 ## Everyday operation
 
-The production names and paths used by the included units are:
+The included service templates use the following names.  Choose installation
+paths and a service account appropriate to the host; the full adaptation steps
+are in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 | Item | Value |
 |---|---|
 | Trading service | `lnmbot.service` |
 | Dashboard service | `lnmbot-dashboard.service` |
-| Trading configuration | `/etc/lnmbot/env` |
-| Dashboard credentials | `/etc/lnmbot/.env.dashboard` |
-| Database | `/var/lib/lnmbot/lnmarkets.sqlite` |
-| Halt file | `/var/lib/lnmbot/HALT` |
+| Trading configuration | a root-owned env file outside the repository |
+| Dashboard credentials | a separate root-owned read-only env file |
+| Database and halt file | a service-writable state directory |
 
 Monitor the bot:
 
@@ -68,19 +68,20 @@ journalctl -u lnmbot-dashboard -f
 ```
 
 The dashboard is served on the loopback host and port configured in its
-systemd unit (the repository template uses `127.0.0.1:8080`).  From another
-machine, use an SSH tunnel rather than exposing it publicly:
+systemd unit (the template uses `127.0.0.1:8080`).  From another machine, use
+an SSH tunnel rather than exposing it publicly:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 optiplex
+ssh -L 8080:127.0.0.1:8080 <bot-host>
 ```
 
 Then open `http://127.0.0.1:8080` locally.  It shows combined account context
 plus timeframe-specific signals, positions, trade history, funding, P&L,
 active configuration, and health.  It cannot enable trading or change sizing.
 
-For configuration changes, edit `/etc/lnmbot/env`, restart the trading service,
-then verify the new run and configuration in the dashboard and journal:
+For configuration changes, edit the trading environment file, restart the
+service, then verify the new run and configuration in the dashboard and
+journal:
 
 ```bash
 sudo systemctl restart lnmbot
