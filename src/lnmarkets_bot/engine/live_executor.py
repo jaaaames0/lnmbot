@@ -55,6 +55,15 @@ class _Position:
     trade_id: str | None = None  # LNM trade ID
 
 
+@dataclass(frozen=True)
+class _PendingExit:
+    """An exposure-reducing close that failed and must be retried."""
+
+    intent: OrderIntent
+    signal_id: int
+    leverage: float
+
+
 class LiveExecutor:
     """Real-trades executor for LNM isolated-margin futures.
 
@@ -80,6 +89,7 @@ class LiveExecutor:
         self._last_close: float | None = None
         self._unreported_realized_pnl_usd = 0.0
         self._last_funding_sync_at: datetime | None = None
+        self._pending_exits: dict[str, _PendingExit] = {}
 
     def update_price(self, price_usd: float) -> None:
         self._last_close = price_usd
@@ -134,6 +144,29 @@ class LiveExecutor:
             leverage=leverage,
         )
 
+    async def retry_pending_exits(
+        self, *, run_id: int, ts: datetime
+    ) -> list[tuple[str, int, dict[str, Any]]]:
+        """Retry failed exposure-reducing closes on subsequent live bars."""
+        completed: list[tuple[str, int, dict[str, Any]]] = []
+        for tf, pending in list(self._pending_exits.items()):
+            pos = self.positions.get(tf)
+            if pos is None or pos.qty_sats == 0 or pos.trade_id is None:
+                self._pending_exits.pop(tf, None)
+                continue
+            order_id, meta = await self._do_exit(
+                pos=pos,
+                tf=tf,
+                intent=pending.intent,
+                signal_id=pending.signal_id,
+                run_id=run_id,
+                ts=ts,
+                leverage=pending.leverage,
+            )
+            if order_id > 0:
+                completed.append((tf, order_id, meta))
+        return completed
+
     async def _do_exit(
         self,
         *,
@@ -148,15 +181,16 @@ class LiveExecutor:
         """Close the LNM isolated trade for this TF."""
         if pos.qty_sats == 0 or pos.trade_id is None:
             return -1, {"noop": True, "reason": "no_position"}
-        # A settlement immediately before this close is otherwise easy to
-        # miss, since the trade stops being a managed running position below.
-        await self.sync_funding(ts, force=True)
         close_qty_sats = abs(pos.qty_sats)
         side = "sell" if pos.side == "long" else "buy"
         fill_price = self._last_close or 0.0
         order_id = -1
         try:
             resp: IsolatedCloseResponse = await self._api.close_trade(pos.trade_id)
+            # Execution takes precedence over bookkeeping. The close has now
+            # reached LNM; collect any just-settled funding while this trade
+            # remains locally managed, but never let funding block the close.
+            await self.sync_funding(ts, force=True)
             order_id = self._recorder.record_order(
                 run_id,
                 signal_id=signal_id,
@@ -192,8 +226,12 @@ class LiveExecutor:
             self._unreported_realized_pnl_usd += net_pl_sats * exit_price / 1e8
         except Exception as exc:
             _log.warning("live.close_failed", trade_id=pos.trade_id)
+            self._pending_exits[tf] = _PendingExit(
+                intent=intent, signal_id=signal_id, leverage=leverage
+            )
             return -1, {"noop": True, "reason": f"close_failed: {exc}"}
         # Clear the per-TF state. The LNM trade is closed.
+        self._pending_exits.pop(tf, None)
         pos.side = None
         pos.qty_sats = 0
         pos.entry_price_usd = None
@@ -370,22 +408,26 @@ class LiveExecutor:
             ) from cause
 
     async def sync_funding(self, ts: datetime, *, force: bool = False) -> None:
-        """Persist new funding settlements for locally managed running trades."""
-        if (
-            not force
-            and self._last_funding_sync_at
-            and ts - self._last_funding_sync_at < timedelta(minutes=15)
-        ):
-            return
-        self._last_funding_sync_at = ts
-        managed_ids = {pos.trade_id for pos in self.positions.values() if pos.trade_id}
-        if not managed_ids:
-            return
-        from_ts = min(
-            (pos.entry_ts or ts for pos in self.positions.values() if pos.trade_id),
-            default=ts,
-        ) - timedelta(minutes=1)
+        """Best-effort funding persistence for locally managed running trades.
+
+        Funding is accounting, never an execution prerequisite. Every part of
+        this method is therefore safe to defer and retry on the next bar.
+        """
         try:
+            if (
+                not force
+                and self._last_funding_sync_at
+                and ts - self._last_funding_sync_at < timedelta(minutes=15)
+            ):
+                return
+            self._last_funding_sync_at = ts
+            managed_ids = {pos.trade_id for pos in self.positions.values() if pos.trade_id}
+            if not managed_ids:
+                return
+            from_ts = min(
+                (pos.entry_ts or ts for pos in self.positions.values() if pos.trade_id),
+                default=ts,
+            ) - timedelta(minutes=1)
             async for row in self._api.iter_funding_fees(from_ts, ts):
                 trade_id = str(row.get("tradeId", row.get("trade_id", ""))) or None
                 if trade_id not in managed_ids:
@@ -446,7 +488,11 @@ class LiveExecutor:
                 side=side,
                 qty_sats=quantity if side == "long" else -quantity,
                 entry_price_usd=trade.entry_price or trade.price or local["price_usd"],
-                entry_ts=local["ts"],
+                # SQLite returns DATETIME values without tzinfo even when the
+                # original live bar was UTC-aware.  Funding synchronisation
+                # compares this timestamp with UTC bar timestamps, so restore
+                # it through the same normalisation used for API timestamps.
+                entry_ts=_as_utc(local["ts"]),
                 leverage=float(trade.leverage or local["leverage"]),
                 trade_id=trade.id,
             )
@@ -498,3 +544,8 @@ def _parse_lnm_timestamp(value: object) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
         return None
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return a UTC-aware datetime, treating legacy SQLite values as UTC."""
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)

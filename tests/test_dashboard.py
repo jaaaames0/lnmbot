@@ -74,6 +74,47 @@ def test_market_context_spans_restart_runs(tmp_path):
     assert changes[0] == {"period": "1h", "change": "+1.00%"}
 
 
+def test_active_run_ignores_newer_manual_recovery_rows(tmp_path):
+    db_path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "id INTEGER PRIMARY KEY, mode TEXT, status TEXT, started_at TEXT, ended_at TEXT, "
+            "strategy_params_json TEXT, config_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    11,
+                    "live",
+                    "running",
+                    "2026-07-27 00:22:02",
+                    None,
+                    json.dumps({"tfs": ["1d", "4h"]}),
+                    json.dumps({"sizing_mode": "equity_fraction"}),
+                ),
+                (
+                    12,
+                    "manual_recovery",
+                    "complete",
+                    "2026-07-27 00:15:32",
+                    "2026-07-27 00:15:32",
+                    json.dumps({}),
+                    json.dumps({}),
+                ),
+            ),
+        )
+
+    dashboard = _dashboard_module()
+
+    active = dashboard._active_run(db_path)
+    assert active is not None
+    assert active["id"] == 11
+    assert active["status"] == "running"
+    assert json.loads(active["config_json"])["sizing_mode"] == "equity_fraction"
+
+
 def test_position_surfaces_entry_chop_reduction_and_accumulated_funding(tmp_path):
     db_path = tmp_path / "positions.sqlite"
     with sqlite3.connect(db_path) as connection:

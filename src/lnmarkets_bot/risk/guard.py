@@ -20,7 +20,10 @@ from enum import Enum
 from math import floor
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ..logging import get_logger
 from ..strategy import OrderIntent, SignalKind
+
+_log = get_logger("lnmarkets_bot.risk.guard")
 
 if TYPE_CHECKING:
     from ..persistence.recorder import Recorder
@@ -165,12 +168,16 @@ class RiskGuard:
         weight = (self.sizing_policy.timeframe_weights or {}).get(tf, 0.0)
         if weight <= 0:
             return None
-        balance_usd = await self.account_balance_provider.balance_usd(
-            run_id=run_id,
-            ts=ts,
-            price_usd=self.current_price_usd,
-            margin_used_usd=self._open_margin_usd(exclude_tf=tf),
-        )
+        try:
+            balance_usd = await self.account_balance_provider.balance_usd(
+                run_id=run_id,
+                ts=ts,
+                price_usd=self.current_price_usd,
+                margin_used_usd=self._open_margin_usd(exclude_tf=tf),
+            )
+        except Exception as exc:
+            _log.warning("risk.equity_sizing_unavailable", error=str(exc))
+            return None
         margin_budget_usd = (
             balance_usd
             * self.sizing_policy.total_margin_fraction

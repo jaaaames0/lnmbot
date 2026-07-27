@@ -158,6 +158,95 @@ async def test_live_executor_entry_exit(recorder, tmp_path):
     assert n == 2, f"expected 2 orders, got {n}"
 
 
+async def test_exit_executes_when_funding_timestamp_preparation_fails(recorder):
+    """An accounting error must never prevent an exposure-reducing close."""
+    api = FakeIsolatedTradesApi()
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="paper", strategy_name="t", strategy_params={}, config={}, started_at=datetime.now(UTC)
+    )
+    executor.run_id = run_id
+    executor.update_price(50_000.0)
+    entry_ts = datetime.now(UTC)
+    entry_signal_id = recorder.record_signal(
+        run_id, ts=entry_ts, kind="entry", side="long", reason="entry"
+    )
+    await executor.submit(
+        intent=OrderIntent.enter_long("1d", 100, 2),
+        signal_id=entry_signal_id,
+        run_id=run_id,
+        ts=entry_ts,
+        size_usd=100,
+        leverage=2,
+    )
+
+    # Simulate a legacy/reconciliation defect: funding's timestamp
+    # preparation fails before it can make an API request.
+    executor.positions["1d"].entry_ts = datetime(2026, 7, 27, 0, 0)
+    exit_signal_id = recorder.record_signal(
+        run_id, ts=datetime.now(UTC), kind="exit", side=None, reason="exit"
+    )
+    exit_order_id, _ = await executor.submit(
+        intent=OrderIntent.exit("1d", reason="exit"),
+        signal_id=exit_signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        size_usd=0,
+        leverage=2,
+    )
+
+    assert exit_order_id > 0
+    assert api.closes == ["iso-1"]
+
+
+async def test_failed_exit_is_retried_on_next_bar(recorder):
+    class FlakyCloseApi(FakeIsolatedTradesApi):
+        def __init__(self):
+            super().__init__()
+            self.fail_first_close = True
+
+        async def close_trade(self, trade_id):
+            if self.fail_first_close:
+                self.fail_first_close = False
+                raise RuntimeError("temporary LN Markets outage")
+            return await super().close_trade(trade_id)
+
+    api = FlakyCloseApi()
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="paper", strategy_name="t", strategy_params={}, config={}, started_at=datetime.now(UTC)
+    )
+    executor.run_id = run_id
+    executor.update_price(50_000.0)
+    ts = datetime.now(UTC)
+    signal_id = recorder.record_signal(run_id, ts=ts, kind="entry", side="long", reason="entry")
+    await executor.submit(
+        intent=OrderIntent.enter_long("1d", 100, 2),
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=ts,
+        size_usd=100,
+        leverage=2,
+    )
+
+    exit_order_id, _ = await executor.submit(
+        intent=OrderIntent.exit("1d", reason="exit"),
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=ts,
+        size_usd=0,
+        leverage=2,
+    )
+    assert exit_order_id == -1
+    assert executor.position_side("1d") == "long"
+
+    retried = await executor.retry_pending_exits(run_id=run_id, ts=ts + timedelta(minutes=1))
+    assert len(retried) == 1
+    assert retried[0][0] == "1d"
+    assert executor.position_side("1d") is None
+    assert api.closes == ["iso-1"]
+
+
 async def test_live_executor_reports_realized_pnl_delta(recorder):
     api = FakeIsolatedTradesApi()
     api.close_pl_sats = -1_000
@@ -428,6 +517,28 @@ async def test_live_executor_reconciles_recorded_running_trade(recorder, tmp_pat
     assert restored.position_side("1d") == "long"
     assert restored.positions["1d"].trade_id == "iso-1"
     assert restored.positions["1d"].entry_ts is not None
+    assert restored.positions["1d"].entry_ts.tzinfo is UTC
+
+    # Recorder timestamps round-trip through SQLite without tzinfo.  A
+    # restored position must still be closable on an aware live bar, including
+    # the forced funding synchronisation that precedes every close.
+    restored.update_price(50_100.0)
+    exit_signal_id = recorder.record_signal(
+        run_id,
+        ts=datetime.now(UTC),
+        kind="exit",
+        side=None,
+        reason="exit restored position",
+    )
+    exit_order_id, _ = await restored.submit(
+        intent=OrderIntent.exit("1d", reason="exit restored position"),
+        signal_id=exit_signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        size_usd=0,
+        leverage=2.0,
+    )
+    assert exit_order_id > 0
 
 
 async def test_live_executor_records_each_funding_settlement_once(recorder):

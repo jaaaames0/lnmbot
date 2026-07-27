@@ -358,6 +358,42 @@ async def test_equity_fraction_sizing_uses_balance_and_timeframe_weight(recorder
     assert executor.last_size_usd == 40.0
 
 
+async def test_equity_fraction_balance_failure_rejects_only_that_entry(recorder, limits) -> None:
+    class FailingBalanceProvider:
+        async def balance_usd(self, **_kwargs) -> float:
+            raise RuntimeError("account endpoint unavailable")
+
+    executor = StubExecutor(recorder, [])
+    guard = RiskGuard(
+        limits=limits,
+        recorder=recorder,
+        executor=executor,  # type: ignore[arg-type]
+        sizing_policy=SizingPolicy(
+            mode="equity_fraction",
+            timeframe_weights={"1d": 1.0},
+        ),
+        account_balance_provider=FailingBalanceProvider(),
+    )
+    guard.current_price_usd = 60_000.0
+    run_id = recorder.start_run(
+        mode="paper", strategy_name="t", strategy_params={}, config={}, started_at=datetime.now(UTC)
+    )
+    signal_id = recorder.record_signal(
+        run_id, ts=datetime.now(UTC), kind="entry", side="long", reason="entry"
+    )
+
+    decision = await guard.submit(
+        intent=OrderIntent.enter_long("1d", 1.0, 2.0),
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+    )
+
+    assert decision.decision == Decision.REJECTED
+    assert decision.detail["reason"] == "sizing_data_unavailable"
+    assert executor.calls == 0
+
+
 async def test_equity_fraction_honours_strategy_entry_size_multiplier(recorder, limits) -> None:
     class BalanceProvider:
         async def balance_usd(self, **_kwargs) -> float:

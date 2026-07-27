@@ -180,7 +180,7 @@ async def main() -> int:
             symbol="BTCUSD",
         )
         account_balance_provider = LiveAccountBalanceProvider(
-            account_api=AccountApi(client), recorder=recorder
+            account_api=AccountApi(client), isolated_trades_api=trades_api, recorder=recorder
         )
 
     # Run

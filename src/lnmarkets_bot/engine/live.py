@@ -142,6 +142,17 @@ async def run_paper(
                     )
                 executor.update_price(bar.close)
                 guard.current_price_usd = bar.close
+                retry_pending_exits = getattr(executor, "retry_pending_exits", None)
+                if retry_pending_exits is not None and not bar.warmup:
+                    for tf, order_id, detail in await retry_pending_exits(run_id=run_id, ts=bar.ts):
+                        guard.record_realized_pnl(executor.consume_realized_pnl_usd(), bar.ts)
+                        log.warning(
+                            "live.pending_exit_processed",
+                            run_id=run_id,
+                            trigger_tf=tf,
+                            order_id=order_id,
+                            detail=detail,
+                        )
                 sync_funding = getattr(executor, "sync_funding", None)
                 if sync_funding is not None and not bar.warmup:
                     await sync_funding(bar.ts)
