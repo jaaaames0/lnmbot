@@ -416,6 +416,8 @@ async def run_inmemory(
                     decision = await guard.submit(
                         intent=intent, signal_id=sig_id, run_id=run_id, ts=bar.ts,
                     )
+                    if decision.decision.value == "rejected":
+                        strategy.on_intent_rejected(intent)
                     if decision.order_id is not None and decision.order_id > 0:
                         guard.record_realized_pnl(executor.consume_realized_pnl_usd(), bar.ts)
 
@@ -430,6 +432,7 @@ async def run_inmemory(
                     if exec_pos is not None:
                         pos.leverage = exec_pos.leverage
                     total_qty_sats += pos.qty_sats
+                strategy.reconcile_execution_state(state)
                 state.equity_sats = int(state.balance_sats + total_qty_sats * bar.close)
                 if is_exec_bar:
                     recorder.record_account_snapshot(

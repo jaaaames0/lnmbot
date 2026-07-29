@@ -27,6 +27,7 @@ class FakeIsolatedTradesApi:
         self.close_pl_sats = 0
         self.opening_fee_sats = 0
         self.closing_fee_sats = 0
+        self.entry_price = None
         self.funding_rows: list[dict] = []
 
     async def new_trade(self, params):
@@ -48,6 +49,7 @@ class FakeIsolatedTradesApi:
             quantity=params.quantity,
             leverage=params.leverage,
             price=0.0,
+            entry_price=self.entry_price,
             opening_fee=self.opening_fee_sats,
         )
         self.running[tid] = trade
@@ -158,6 +160,46 @@ async def test_live_executor_entry_exit(recorder, tmp_path):
     assert n == 2, f"expected 2 orders, got {n}"
 
 
+async def test_live_executor_uses_the_exchange_entry_price(recorder):
+    api = FakeIsolatedTradesApi()
+    api.entry_price = 50_125.0
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="paper", strategy_name="t", strategy_params={}, config={}, started_at=datetime.now(UTC)
+    )
+    executor.run_id = run_id
+    executor.update_price(50_000.0)
+    signal_id = recorder.record_signal(
+        run_id, ts=datetime.now(UTC), kind="entry", side="long", reason="entry"
+    )
+
+    order_id, detail = await executor.submit(
+        intent=OrderIntent.enter_long("1d", 100, 2),
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        size_usd=100,
+        leverage=2,
+    )
+
+    assert order_id > 0
+    assert detail["price_usd"] == 50_125.0
+    assert executor.position_entry_price("1d") == 50_125.0
+    with recorder._factory() as session:  # type: ignore[attr-defined]
+        assert (
+            session.execute(
+                select(orders_t.c.price_usd).where(orders_t.c.id == order_id)
+            ).scalar_one()
+            == 50_125.0
+        )
+        assert (
+            session.execute(
+                select(fills.c.price_usd).where(fills.c.order_id == order_id)
+            ).scalar_one()
+            == 50_125.0
+        )
+
+
 async def test_exit_executes_when_funding_timestamp_preparation_fails(recorder):
     """An accounting error must never prevent an exposure-reducing close."""
     api = FakeIsolatedTradesApi()
@@ -245,6 +287,45 @@ async def test_failed_exit_is_retried_on_next_bar(recorder):
     assert retried[0][0] == "1d"
     assert executor.position_side("1d") is None
     assert api.closes == ["iso-1"]
+
+
+async def test_successful_remote_close_is_not_retried_when_persistence_fails(recorder, monkeypatch):
+    api = FakeIsolatedTradesApi()
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="paper", strategy_name="t", strategy_params={}, config={}, started_at=datetime.now(UTC)
+    )
+    executor.run_id = run_id
+    executor.update_price(50_000.0)
+    ts = datetime.now(UTC)
+    signal_id = recorder.record_signal(run_id, ts=ts, kind="entry", side="long", reason="entry")
+    await executor.submit(
+        intent=OrderIntent.enter_long("1d", 100, 2),
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=ts,
+        size_usd=100,
+        leverage=2,
+    )
+
+    monkeypatch.setattr(
+        recorder,
+        "record_order",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    with pytest.raises(UnsafeLiveStateError, match="local close persistence failed"):
+        await executor.submit(
+            intent=OrderIntent.exit("1d", reason="exit"),
+            signal_id=signal_id,
+            run_id=run_id,
+            ts=ts,
+            size_usd=0,
+            leverage=2,
+        )
+
+    assert api.closes == ["iso-1"]
+    assert executor.position_side("1d") is None
+    assert executor._pending_exits == {}
 
 
 async def test_live_executor_reports_realized_pnl_delta(recorder):

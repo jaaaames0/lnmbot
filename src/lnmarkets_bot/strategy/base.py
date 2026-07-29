@@ -6,17 +6,20 @@ the strategy interface must accept everything it could ever need from a
 data feed (bar, fills, account state) and must NOT accept anything that's
 specific to one mode (no httpx requests, no websockets, no asyncio).
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 from .intents import OrderIntent
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from datetime import datetime
+
     from .state import FillEvent  # noqa: F401  (re-export)
 
 
@@ -112,15 +115,29 @@ class Strategy(ABC):
         self.params = dict(params or {})
 
     @abstractmethod
-    def on_startup(self, state: StrategyState) -> None:
-        ...
+    def on_startup(self, state: StrategyState) -> None: ...
 
     @abstractmethod
-    def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
-        ...
+    def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]: ...
 
     def on_fill(self, fill: Any, state: StrategyState) -> None:
         """Optional. Default does nothing."""
+        return None
+
+    def persistent_state(self) -> dict[str, Any] | None:
+        """Return durable strategy-internal state, if this strategy supports it."""
+        return None
+
+    def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
+        """Restore a snapshot returned by :meth:`persistent_state` when compatible."""
+        return False
+
+    def reconcile_execution_state(self, state: StrategyState) -> None:
+        """Acknowledge persisted intents that now match actual executor state."""
+        return None
+
+    def on_intent_rejected(self, intent: OrderIntent) -> None:
+        """Forget any retry target for an intentionally rejected intent."""
         return None
 
     def on_shutdown(self, state: StrategyState) -> None:
@@ -131,9 +148,7 @@ class Strategy(ABC):
 def import_strategy(dotted: str) -> Strategy:
     """Resolve `module:ClassName` to an instantiated strategy."""
     if ":" not in dotted:
-        raise ValueError(
-            f"strategy spec must be 'module.path:ClassName', got {dotted!r}"
-        )
+        raise ValueError(f"strategy spec must be 'module.path:ClassName', got {dotted!r}")
     module_name, class_name = dotted.split(":", 1)
     import importlib
 

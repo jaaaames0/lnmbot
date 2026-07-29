@@ -1,5 +1,8 @@
 """Live-candle bootstrap tests without an LN Markets network connection."""
+
 from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -17,7 +20,45 @@ class _FailingClient:
 async def test_warmup_network_failure_is_not_masked_by_logging():
     stream = LnmLiveStream(_FailingClient())
 
-    with pytest.raises(RuntimeError, match="unable to load live strategy warmup candles") as exc_info:
+    with pytest.raises(
+        RuntimeError, match="unable to load live strategy warmup candles"
+    ) as exc_info:
         await anext(stream.stream())
 
     assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+
+
+class _DescendingCatchupClient:
+    def __init__(self, base: datetime) -> None:
+        self.base = base
+        self.calls = 0
+
+    async def iter_list(self, path, *, params):
+        self.calls += 1
+        minutes = [-5] if self.calls == 1 else [-2, -3]
+        for minute in minutes:
+            ts = self.base + timedelta(minutes=minute)
+            yield {
+                "time": ts.isoformat(),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100 + minute,
+                "volume": 1,
+            }
+
+
+@pytest.mark.asyncio
+async def test_live_catchup_sorts_descending_api_rows_before_advancing_cursor():
+    base = datetime.now(UTC).replace(second=0, microsecond=0)
+    stream = LnmLiveStream(_DescendingCatchupClient(base), poll_seconds=0)
+    iterator = stream.stream()
+
+    warmup = await anext(iterator)
+    first_catchup = await anext(iterator)
+    second_catchup = await anext(iterator)
+    await iterator.aclose()
+
+    assert warmup.ts == base - timedelta(minutes=5)
+    assert first_catchup.ts == base - timedelta(minutes=3)
+    assert second_catchup.ts == base - timedelta(minutes=2)

@@ -15,8 +15,10 @@ Idea (paraphrased from the strategy discussion):
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from .base import Bar, Strategy, StrategyState, TfPosition
@@ -35,6 +37,7 @@ class _TfState:
     ema_seeded: bool = False
     verdict: str = "FLAT"  # "UP_TRUE" | "DOWN_TRUE" | "FLAT"
     chop: float | None = None
+    last_bar_ts: datetime | None = None
 
 
 class MaCross(Strategy):
@@ -145,7 +148,15 @@ class MaCross(Strategy):
         self._loss_suppressed_signals: dict[str, int] = {tf: 0 for tf in self.tfs}
         # Last per-TF closed trade P&L as a fraction of notional.
         self._last_trade_pnl_pct: dict[str, float] = {tf: 0.0 for tf in self.tfs}
+        # Operator-set hold after deliberately declining a missed entry. The
+        # hold is released only when the verdict changes away from this value.
+        self._manual_flat_hold: dict[str, str | None] = {tf: None for tf in self.tfs}
+        # Desired final position for an emitted order sequence until the
+        # executor confirms it. This is the only authority for retrying an
+        # order under an unchanged verdict.
+        self._pending_position_reconciliation: dict[str, str | None] = {tf: None for tf in self.tfs}
         self._restart_pending: set[str] = set()
+        self._startup_reconciliation_pending = False
 
     # ---- lifecycle ----
 
@@ -154,6 +165,132 @@ class MaCross(Strategy):
             state.positions.setdefault(tf, TfPosition())
             if state.position(tf).side is not None:
                 self._restart_pending.add(tf)
+        self._startup_reconciliation_pending = bool(
+            self._restart_pending or any(self._pending_position_reconciliation.values())
+        )
+
+    def persistent_state(self) -> dict[str, Any] | None:
+        """Serialize indicator and cool-off state for restart-continuous live EMA."""
+        return {
+            "version": 1,
+            # Persist and compare the JSON representation. SQLite JSON turns
+            # tuples (notably ``tfs``) into lists, so comparing the raw Python
+            # objects would reject every otherwise-compatible live snapshot.
+            "strategy_params": self._json_strategy_params(),
+            "timeframes": {
+                tf: {
+                    "closes": list(item.closes),
+                    "highs": list(item.highs),
+                    "lows": list(item.lows),
+                    "true_ranges": list(item.true_ranges),
+                    "previous_close": item.previous_close,
+                    "sma": item.sma,
+                    "ema": item.ema,
+                    "ema_seeded": item.ema_seeded,
+                    "verdict": item.verdict,
+                    "chop": item.chop,
+                    "last_bar_ts": item.last_bar_ts.isoformat() if item.last_bar_ts else None,
+                }
+                for tf, item in self.tf_state.items()
+            },
+            "winner_suppressed_signals": dict(self._suppressed_signals),
+            "loss_suppressed_signals": dict(self._loss_suppressed_signals),
+            "last_trade_pnl_pct": dict(self._last_trade_pnl_pct),
+            "manual_flat_hold": dict(self._manual_flat_hold),
+            "pending_position_reconciliation": dict(self._pending_position_reconciliation),
+        }
+
+    def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
+        """Restore a compatible snapshot without accepting partial/corrupt state."""
+        try:
+            if snapshot.get("version") != 1:
+                return False
+            if snapshot.get("strategy_params") != self._json_strategy_params():
+                return False
+            timeframes = snapshot["timeframes"]
+            if set(timeframes) != set(self.tfs):
+                return False
+            restored: dict[str, _TfState] = {}
+            for tf in self.tfs:
+                value = timeframes[tf]
+                last_bar_raw = value.get("last_bar_ts")
+                last_bar_ts = (
+                    datetime.fromisoformat(last_bar_raw.replace("Z", "+00:00")).astimezone(UTC)
+                    if last_bar_raw
+                    else None
+                )
+                restored[tf] = _TfState(
+                    closes=deque((float(x) for x in value["closes"]), maxlen=64),
+                    highs=deque((float(x) for x in value["highs"]), maxlen=128),
+                    lows=deque((float(x) for x in value["lows"]), maxlen=128),
+                    true_ranges=deque((float(x) for x in value["true_ranges"]), maxlen=128),
+                    previous_close=(
+                        float(value["previous_close"])
+                        if value["previous_close"] is not None
+                        else None
+                    ),
+                    sma=float(value["sma"]) if value["sma"] is not None else None,
+                    ema=float(value["ema"]) if value["ema"] is not None else None,
+                    ema_seeded=bool(value["ema_seeded"]),
+                    verdict=str(value["verdict"]),
+                    chop=float(value["chop"]) if value["chop"] is not None else None,
+                    last_bar_ts=last_bar_ts,
+                )
+            winner = {tf: int(snapshot["winner_suppressed_signals"][tf]) for tf in self.tfs}
+            loss = {tf: int(snapshot["loss_suppressed_signals"][tf]) for tf in self.tfs}
+            if any(value < 0 for value in (*winner.values(), *loss.values())):
+                return False
+            pnl = {tf: float(snapshot["last_trade_pnl_pct"][tf]) for tf in self.tfs}
+            manual_hold = {
+                tf: (
+                    str(snapshot.get("manual_flat_hold", {}).get(tf))
+                    if snapshot.get("manual_flat_hold", {}).get(tf) is not None
+                    else None
+                )
+                for tf in self.tfs
+            }
+            if any(
+                value not in {None, "UP_TRUE", "DOWN_TRUE", "FLAT"}
+                for value in manual_hold.values()
+            ):
+                return False
+            pending = {
+                tf: (
+                    str(snapshot.get("pending_position_reconciliation", {}).get(tf))
+                    if snapshot.get("pending_position_reconciliation", {}).get(tf) is not None
+                    else None
+                )
+                for tf in self.tfs
+            }
+            if any(value not in {None, "long", "short", "flat"} for value in pending.values()):
+                return False
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+        self.tf_state = restored
+        self._suppressed_signals = winner
+        self._loss_suppressed_signals = loss
+        self._last_trade_pnl_pct = pnl
+        self._manual_flat_hold = manual_hold
+        self._pending_position_reconciliation = pending
+        return True
+
+    def _json_strategy_params(self) -> dict[str, Any]:
+        """Return params in the exact shape produced by a JSON DB round-trip."""
+        return json.loads(json.dumps(self.params, sort_keys=True))
+
+    def reconcile_execution_state(self, state: StrategyState) -> None:
+        """Clear durable pending targets once the executor mirrors them."""
+        for tf, target in self._pending_position_reconciliation.items():
+            if target is None:
+                continue
+            actual = state.position(tf).side or "flat"
+            if actual == target:
+                self._pending_position_reconciliation[tf] = None
+
+    def on_intent_rejected(self, intent: OrderIntent) -> None:
+        """Risk rejection is a deliberate suppression, not an execution failure."""
+        if intent.kind.value == "entry" and intent.trigger_tf in self.tf_state:
+            self._pending_position_reconciliation[intent.trigger_tf] = None
 
     def on_shutdown(self, state: StrategyState) -> None:
         return None
@@ -163,14 +300,23 @@ class MaCross(Strategy):
     def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
         if bar.timeframe == "1m":
             state.push_bar(bar)
+            if not bar.warmup and self._startup_reconciliation_pending:
+                self._startup_reconciliation_pending = False
+                return self._reconcile_startup_positions(state)
 
         tf = bar.timeframe
         if tf not in self.tf_state:
             return []  # not subscribed to this TF
 
         ts = self.tf_state[tf]
+        # Warmup replay deliberately overlaps a restored snapshot. Never
+        # replay an already committed completed TF bar, or a restart would
+        # mutate the EMA a second time.
+        if ts.last_bar_ts is not None and bar.ts <= ts.last_bar_ts:
+            return []
         ts.closes.append(bar.close)
         self._update_chop(ts, bar)
+        ts.last_bar_ts = bar.ts
 
         if len(ts.closes) < self.warmup:
             return []  # warmup
@@ -199,41 +345,166 @@ class MaCross(Strategy):
 
         prev = ts.verdict
         ts.verdict = verdict
+        if verdict != prev:
+            # A pending action for an older verdict is no longer a valid
+            # retry. Normal processing below decides the new target.
+            self._pending_position_reconciliation[tf] = None
         if bar.warmup:
             return []
+        held_verdict = self._manual_flat_hold[tf]
+        if held_verdict == verdict:
+            # The position was manually flattened after a missed entry. Do
+            # not recreate that late entry merely because the same verdict
+            # persists across a restart or subsequent completed bar.
+            self._restart_pending.discard(tf)
+            self._pending_position_reconciliation[tf] = None
+            return [
+                OrderIntent.noop(
+                    trigger_tf=tf,
+                    reason="manual_flat_hold",
+                    metadata={
+                        "held_verdict": held_verdict,
+                        "verdict": verdict,
+                        "bar_ts": bar.ts.isoformat(),
+                    },
+                )
+            ]
+        if held_verdict is not None:
+            # A new verdict resumes normal strategy operation. A fresh UP or
+            # DOWN verdict can therefore create an ordinary entry.
+            self._manual_flat_hold[tf] = None
+        cooldowns_before = self._active_cooldowns(tf)
+        restart_audit: dict[str, Any] = {}
+        if tf in self._restart_pending:
+            restart_audit = self._restart_audit_metadata(
+                tf=tf, verdict=verdict, bar=bar, pos=state.position(tf)
+            )
+        if cooldowns_before and self._position_opposes_verdict(tf=tf, verdict=verdict, state=state):
+            # Cool-off suppresses the replacement entry, never the
+            # exposure-reducing close. This path also recovers a close that
+            # reached strategy state but failed (or was interrupted) at LNM.
+            self._restart_pending.discard(tf)
+            intents = self._cooldown_exposure_exit(
+                tf=tf,
+                previous_verdict=prev,
+                verdict=verdict,
+                bar=bar,
+                state=state,
+                cooldowns_before=cooldowns_before,
+                metadata=restart_audit,
+            )
+            if verdict != prev and self._cooldown_consumes(tf=tf, verdict=verdict, state=state):
+                intents.extend(
+                    self._consume_cooldown(
+                        tf=tf,
+                        previous_verdict=prev,
+                        verdict=verdict,
+                        cooldowns_before=cooldowns_before,
+                        metadata=restart_audit,
+                    )
+                )
+            return intents
+        pending_target = self._pending_position_reconciliation[tf]
+        if pending_target == "flat" and state.position(tf).side is not None:
+            self._restart_pending.discard(tf)
+            pos = state.position(tf)
+            intent = OrderIntent.exit(
+                trigger_tf=tf,
+                reason=f"{tf} retries pending exposure-reducing close",
+                metadata={
+                    "previous_verdict": prev,
+                    "verdict": verdict,
+                    "closed_side": pos.side,
+                    "pending_position_reconciliation": "flat",
+                    **restart_audit,
+                },
+            )
+            pos.side = None
+            pos.qty_sats = 0
+            pos.entry_ts = None
+            return [intent]
         if tf in self._restart_pending:
             self._restart_pending.remove(tf)
+            if (
+                verdict != prev
+                and cooldowns_before
+                and self._cooldown_consumes(tf=tf, verdict=verdict, state=state)
+            ):
+                return self._consume_cooldown(
+                    tf=tf,
+                    previous_verdict=prev,
+                    verdict=verdict,
+                    cooldowns_before=cooldowns_before,
+                    metadata=self._restart_audit_metadata(
+                        tf=tf, verdict=verdict, bar=bar, pos=state.position(tf)
+                    ),
+                )
+            if (
+                verdict == prev
+                and cooldowns_before
+                and self._would_place_order(tf=tf, side=verdict, state=state)
+            ):
+                return [
+                    OrderIntent.noop(
+                        trigger_tf=tf,
+                        reason="cool_off_pending_position_reconciliation",
+                        metadata={
+                            **self._restart_audit_metadata(
+                                tf=tf, verdict=verdict, bar=bar, pos=state.position(tf)
+                            ),
+                            "cooldown_types": sorted(cooldowns_before),
+                            "winner_remaining": cooldowns_before.get("winner", 0),
+                            "loss_remaining": cooldowns_before.get("loss", 0),
+                        },
+                    )
+                ]
             return self._restart_catch_up(tf=tf, verdict=verdict, bar=bar, state=state)
         if verdict == prev:
+            if (
+                pending_target in {"long", "short"}
+                and cooldowns_before
+                and self._would_place_order(tf=tf, side=verdict, state=state)
+            ):
+                # A failed/missed flip can leave a flat position under an
+                # unchanged directional verdict. Do not let the resilience
+                # reconciliation bypass a still-active cool-off. This is not
+                # a verdict transition, so it must not spend a cool-off slot.
+                return [
+                    OrderIntent.noop(
+                        trigger_tf=tf,
+                        reason="cool_off_pending_position_reconciliation",
+                        metadata={
+                            "verdict": verdict,
+                            "cooldown_types": sorted(cooldowns_before),
+                            "winner_remaining": cooldowns_before.get("winner", 0),
+                            "loss_remaining": cooldowns_before.get("loss", 0),
+                        },
+                    )
+                ]
+            # Retry only an explicitly persisted target from an order that was
+            # emitted but not confirmed. A mere flat/verdict mismatch after a
+            # cold restart must not manufacture a late entry.
+            if pending_target in {"long", "short"} and self._would_place_order(
+                tf=tf, side=verdict, state=state
+            ):
+                return self._on_transition(
+                    tf=tf,
+                    previous_verdict=prev,
+                    side=verdict,
+                    bar=bar,
+                    state=state,
+                )
             return []
 
         # Cool-off: if this TF recently closed a big winner, suppress
         # transitions until the suppression counter runs out.
-        cooldowns_before = self._active_cooldowns(tf)
         if cooldowns_before and self._cooldown_consumes(tf=tf, verdict=verdict, state=state):
-            for cooldown_type in cooldowns_before:
-                if cooldown_type == "winner":
-                    self._suppressed_signals[tf] -= 1
-                else:
-                    self._loss_suppressed_signals[tf] -= 1
-            # Record every suppressed verdict transition. FLAT transitions
-            # consume a slot too; retaining the verdict makes that explicit in
-            # the signal audit rather than silently hiding it in a trade log.
-            return [
-                OrderIntent.noop(
-                    trigger_tf=tf,
-                    reason="cool_off",
-                    metadata={
-                        "previous_verdict": prev,
-                        "verdict": verdict,
-                        "cooldown_types": sorted(cooldowns_before),
-                        "winner_remaining_before": cooldowns_before.get("winner", 0),
-                        "winner_remaining_after": self._suppressed_signals[tf],
-                        "loss_remaining_before": cooldowns_before.get("loss", 0),
-                        "loss_remaining_after": self._loss_suppressed_signals[tf],
-                    },
-                )
-            ]
+            return self._consume_cooldown(
+                tf=tf,
+                previous_verdict=prev,
+                verdict=verdict,
+                cooldowns_before=cooldowns_before,
+            )
 
         # A neutral transition does not place an order, but it is still a
         # strategy event and must be visible when reconciling against a chart.
@@ -255,41 +526,148 @@ class MaCross(Strategy):
             state=state,
         )
 
+    def _reconcile_startup_positions(self, state: StrategyState) -> list[OrderIntent]:
+        """Reconcile once after warmup, without replaying historical trades."""
+        intents: list[OrderIntent] = []
+        for tf in self.tfs:
+            pending_target = self._pending_position_reconciliation[tf]
+            if tf not in self._restart_pending and pending_target is None:
+                continue
+            indicator = self.tf_state[tf]
+            if indicator.last_bar_ts is None or not indicator.closes:
+                continue
+            bar = Bar(
+                ts=indicator.last_bar_ts,
+                open=indicator.closes[-1],
+                high=indicator.highs[-1] if indicator.highs else indicator.closes[-1],
+                low=indicator.lows[-1] if indicator.lows else indicator.closes[-1],
+                close=indicator.closes[-1],
+                volume=0.0,
+                timeframe=tf,
+            )
+            verdict = indicator.verdict
+            cooldowns = self._active_cooldowns(tf)
+            pos = state.position(tf)
+            if pending_target == "flat" and pos.side is not None:
+                self._restart_pending.discard(tf)
+                intents.append(
+                    OrderIntent.exit(
+                        trigger_tf=tf,
+                        reason=f"{tf} retries pending exposure-reducing close",
+                        metadata={
+                            "previous_verdict": verdict,
+                            "verdict": verdict,
+                            "closed_side": pos.side,
+                            "pending_position_reconciliation": "flat",
+                            **self._restart_audit_metadata(
+                                tf=tf, verdict=verdict, bar=bar, pos=pos
+                            ),
+                        },
+                    )
+                )
+                pos.side = None
+                pos.qty_sats = 0
+                pos.entry_ts = None
+                continue
+            if pending_target in {"long", "short"} and pos.side != pending_target:
+                self._restart_pending.discard(tf)
+                if cooldowns:
+                    intents.append(
+                        OrderIntent.noop(
+                            trigger_tf=tf,
+                            reason="cool_off_pending_position_reconciliation",
+                            metadata={
+                                "verdict": verdict,
+                                "cooldown_types": sorted(cooldowns),
+                                "winner_remaining": cooldowns.get("winner", 0),
+                                "loss_remaining": cooldowns.get("loss", 0),
+                                **self._restart_audit_metadata(
+                                    tf=tf, verdict=verdict, bar=bar, pos=pos
+                                ),
+                            },
+                        )
+                    )
+                else:
+                    intents.extend(
+                        self._on_transition(
+                            tf=tf,
+                            previous_verdict=verdict,
+                            side=verdict,
+                            bar=bar,
+                            state=state,
+                        )
+                    )
+                continue
+            if cooldowns and self._position_opposes_verdict(tf=tf, verdict=verdict, state=state):
+                self._restart_pending.discard(tf)
+                intents.extend(
+                    self._cooldown_exposure_exit(
+                        tf=tf,
+                        previous_verdict=verdict,
+                        verdict=verdict,
+                        bar=bar,
+                        state=state,
+                        cooldowns_before=cooldowns,
+                        metadata=self._restart_audit_metadata(
+                            tf=tf, verdict=verdict, bar=bar, pos=state.position(tf)
+                        ),
+                    )
+                )
+                continue
+            self._restart_pending.discard(tf)
+            intents.extend(self._restart_catch_up(tf=tf, verdict=verdict, bar=bar, state=state))
+        return intents
+
     def _restart_catch_up(
         self, *, tf: str, verdict: str, bar: Bar, state: StrategyState
     ) -> list[OrderIntent]:
-        """Safely resolve a restored position after a restart gap."""
+        """Apply normal transition semantics to a restored position.
+
+        A restart must not make an opposite confirmed verdict weaker than it
+        would have been in a continuous run.  In particular, an enabled
+        same-bar flip and the usual cool-off rules both apply here.
+        """
         pos = state.position(tf)
         target_side = {"UP_TRUE": "long", "DOWN_TRUE": "short"}.get(verdict)
+        audit = self._restart_audit_metadata(tf=tf, verdict=verdict, bar=bar, pos=pos)
         if pos.side is not None and target_side is not None and pos.side != target_side:
-            old_side = pos.side
-            pos.side = None
-            pos.qty_sats = 0
-            pos.entry_ts = None
-            return [
-                OrderIntent.exit(
-                    trigger_tf=tf,
-                    reason=f"restart_catch_up closes {old_side} against {verdict}",
-                    metadata={
-                        "restart_catch_up": True,
-                        "restored_side": old_side,
-                        "verdict": verdict,
-                        "bar_ts": bar.ts.isoformat(),
-                    },
-                )
-            ]
+            intents = self._on_transition(
+                tf=tf,
+                previous_verdict="RESTART_UNKNOWN",
+                side=verdict,
+                bar=bar,
+                state=state,
+            )
+            for intent in intents:
+                intent.metadata.update(audit)
+            return intents
         return [
             OrderIntent.noop(
                 trigger_tf=tf,
                 reason="restart_state_aligned",
-                metadata={
-                    "restart_catch_up": True,
-                    "position_side": pos.side,
-                    "verdict": verdict,
-                    "bar_ts": bar.ts.isoformat(),
-                },
+                metadata=audit,
             )
         ]
+
+    def _restart_audit_metadata(
+        self, *, tf: str, verdict: str, bar: Bar, pos: TfPosition
+    ) -> dict[str, Any]:
+        """Return enough context to audit a restart decision from the DB."""
+        indicator = self.tf_state[tf]
+        sma = indicator.sma
+        ema = indicator.ema
+        return {
+            "restart_catch_up": True,
+            "restored_side": pos.side,
+            "verdict": verdict,
+            "bar_ts": bar.ts.isoformat(),
+            "close": bar.close,
+            "sma": sma,
+            "ema": ema,
+            "tolerance_pct": self.tolerance_pct,
+            "close_vs_sma_pct": (bar.close / sma - 1.0) if sma else None,
+            "close_vs_ema_pct": (bar.close / ema - 1.0) if ema else None,
+        }
 
     def _cooldown_consumes(
         self,
@@ -313,6 +691,84 @@ class MaCross(Strategy):
         if self._loss_suppressed_signals[tf] > 0:
             active["loss"] = self._loss_suppressed_signals[tf]
         return active
+
+    def _consume_cooldown(
+        self,
+        *,
+        tf: str,
+        previous_verdict: str,
+        verdict: str,
+        cooldowns_before: dict[str, int],
+        metadata: dict[str, Any] | None = None,
+    ) -> list[OrderIntent]:
+        """Spend one slot and record an auditable suppressed transition."""
+        for cooldown_type in cooldowns_before:
+            if cooldown_type == "winner":
+                self._suppressed_signals[tf] -= 1
+            else:
+                self._loss_suppressed_signals[tf] -= 1
+        return [
+            OrderIntent.noop(
+                trigger_tf=tf,
+                reason="cool_off",
+                metadata={
+                    "previous_verdict": previous_verdict,
+                    "verdict": verdict,
+                    "cooldown_types": sorted(cooldowns_before),
+                    "winner_remaining_before": cooldowns_before.get("winner", 0),
+                    "winner_remaining_after": self._suppressed_signals[tf],
+                    "loss_remaining_before": cooldowns_before.get("loss", 0),
+                    "loss_remaining_after": self._loss_suppressed_signals[tf],
+                    **(metadata or {}),
+                },
+            )
+        ]
+
+    @staticmethod
+    def _position_opposes_verdict(*, tf: str, verdict: str, state: StrategyState) -> bool:
+        """Return whether the current exposure points against a directional verdict."""
+        target_side = {"UP_TRUE": "long", "DOWN_TRUE": "short"}.get(verdict)
+        pos_side = state.position(tf).side
+        return pos_side is not None and target_side is not None and pos_side != target_side
+
+    def _cooldown_exposure_exit(
+        self,
+        *,
+        tf: str,
+        previous_verdict: str,
+        verdict: str,
+        bar: Bar,
+        state: StrategyState,
+        cooldowns_before: dict[str, int],
+        metadata: dict[str, Any],
+    ) -> list[OrderIntent]:
+        """Close contrary exposure while leaving its replacement suppressed."""
+        pos = state.position(tf)
+        closed_side = pos.side
+        entry_price = pos.entry_price_usd
+        pnl_pct = 0.0
+        if entry_price and closed_side == "long":
+            pnl_pct = (bar.close - entry_price) / entry_price
+        elif entry_price and closed_side == "short":
+            pnl_pct = (entry_price - bar.close) / entry_price
+        intent = OrderIntent.exit(
+            trigger_tf=tf,
+            reason=f"{tf} cool-off reconciliation closes {closed_side}",
+            metadata={
+                "previous_verdict": previous_verdict,
+                "verdict": verdict,
+                "closed_side": closed_side,
+                "trade_pnl_pct": pnl_pct,
+                "cooldown_types": sorted(cooldowns_before),
+                "suppressed_replacement": ("long" if verdict == "UP_TRUE" else "short"),
+                **metadata,
+            },
+        )
+        pos.side = None
+        pos.qty_sats = 0
+        pos.entry_ts = None
+        self._pending_position_reconciliation[tf] = "flat"
+        return [intent]
 
     @staticmethod
     def _would_place_order(*, tf: str, side: str, state: StrategyState) -> bool:
@@ -477,7 +933,11 @@ class MaCross(Strategy):
                         size_usd=size,
                         leverage=self.base_leverage,
                         reason=f"{tf} MA-cross ↓ at {bar.ts.isoformat()}",
-                        metadata={"previous_verdict": previous_verdict, "verdict": side},
+                        metadata={
+                            "previous_verdict": previous_verdict,
+                            "verdict": side,
+                            **entry_metadata,
+                        },
                     )
                 )
                 pos.side = "short"
@@ -554,6 +1014,9 @@ class MaCross(Strategy):
                     },
                 )
             )
+
+        if any(intent.kind.value in {"entry", "exit"} for intent in intents):
+            self._pending_position_reconciliation[tf] = pos.side or "flat"
 
         return intents
 

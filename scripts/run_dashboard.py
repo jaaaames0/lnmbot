@@ -763,8 +763,49 @@ def _recorded_close_history(db_path: Path) -> pd.DataFrame:
     return frame.set_index("ts").sort_index()
 
 
+def _persisted_strategy_levels(db_path: Path, tolerance_pct: float) -> dict[str, dict[str, object]]:
+    """Return the exact MA state used by the live strategy, when available."""
+    try:
+        rows = _query(
+            db_path,
+            "SELECT ts, state_json FROM strategy_state_snapshots "
+            "WHERE mode = 'live' ORDER BY ts DESC LIMIT 1",
+        )
+    except sqlite3.Error:
+        return {}
+    if not rows:
+        return {}
+    state = _metadata(rows[0]["state_json"])
+    timeframes = state.get("timeframes")
+    if not isinstance(timeframes, dict):
+        return {}
+    levels: dict[str, dict[str, object]] = {}
+    for timeframe in TIMEFRAMES:
+        value = timeframes.get(timeframe)
+        if not isinstance(value, dict):
+            continue
+        try:
+            sma = float(value["sma"])
+            ema = float(value["ema"])
+            completed_bar_ts = str(value["last_bar_ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        levels[timeframe] = {
+            "sma20": sma,
+            "ema21": ema,
+            "long_trigger": max(sma, ema) * (1 + tolerance_pct),
+            "short_trigger": min(sma, ema) * (1 - tolerance_pct),
+            "completed_bar_ts": completed_bar_ts,
+            "bootstrap_source": "persisted_live_state",
+        }
+    return levels
+
+
 def _ma_levels(db_path: Path, tolerance_pct: float) -> dict[str, dict[str, object]]:
-    """Reconstruct MA levels, using local Binance candles only as warmup."""
+    """Return strategy MA levels, preferring the state used for execution."""
+    persisted = _persisted_strategy_levels(db_path, tolerance_pct)
+    if persisted:
+        return persisted
     recorded = _recorded_close_history(db_path)
     if recorded.empty:
         return {}

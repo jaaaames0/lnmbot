@@ -184,13 +184,29 @@ class LiveExecutor:
         close_qty_sats = abs(pos.qty_sats)
         side = "sell" if pos.side == "long" else "buy"
         fill_price = self._last_close or 0.0
-        order_id = -1
+        closed_trade_id = pos.trade_id
         try:
-            resp: IsolatedCloseResponse = await self._api.close_trade(pos.trade_id)
-            # Execution takes precedence over bookkeeping. The close has now
-            # reached LNM; collect any just-settled funding while this trade
-            # remains locally managed, but never let funding block the close.
-            await self.sync_funding(ts, force=True)
+            resp: IsolatedCloseResponse = await self._api.close_trade(closed_trade_id)
+        except Exception as exc:
+            _log.warning("live.close_failed", trade_id=closed_trade_id)
+            self._pending_exits[tf] = _PendingExit(
+                intent=intent, signal_id=signal_id, leverage=leverage
+            )
+            return -1, {"noop": True, "reason": f"close_failed: {exc}"}
+
+        # LN Markets has accepted the exposure-reducing close. From here on,
+        # never retry that remote action—even if local accounting fails.
+        # Clear local execution state first so a caught fatal error cannot
+        # leave this process believing the closed trade is still live.
+        await self.sync_funding(ts, force=True)
+        self._pending_exits.pop(tf, None)
+        pos.side = None
+        pos.qty_sats = 0
+        pos.entry_price_usd = None
+        pos.entry_ts = None
+        pos.trade_id = None
+
+        try:
             order_id = self._recorder.record_order(
                 run_id,
                 signal_id=signal_id,
@@ -201,10 +217,10 @@ class LiveExecutor:
                 leverage=leverage,
                 status="filled",
                 price_usd=fill_price,
-                lnm_order_id=resp.id,
+                lnm_order_id=closed_trade_id,
                 metadata={
                     "isolated_action": "close",
-                    "lnm_trade_id": pos.trade_id,
+                    "lnm_trade_id": closed_trade_id,
                     "gross_pl_sats": resp.pl,
                     "closing_fee_sats": resp.closing_fee,
                 },
@@ -225,22 +241,18 @@ class LiveExecutor:
             )
             self._unreported_realized_pnl_usd += net_pl_sats * exit_price / 1e8
         except Exception as exc:
-            _log.warning("live.close_failed", trade_id=pos.trade_id)
-            self._pending_exits[tf] = _PendingExit(
-                intent=intent, signal_id=signal_id, leverage=leverage
+            _log.critical(
+                "live.closed_trade_persistence_failed",
+                trade_id=closed_trade_id,
+                error=str(exc),
             )
-            return -1, {"noop": True, "reason": f"close_failed: {exc}"}
-        # Clear the per-TF state. The LNM trade is closed.
-        self._pending_exits.pop(tf, None)
-        pos.side = None
-        pos.qty_sats = 0
-        pos.entry_price_usd = None
-        pos.entry_ts = None
-        pos.trade_id = None
+            raise UnsafeLiveStateError(
+                "remote trade closed but local close persistence failed"
+            ) from exc
         return order_id, {
             "fill_id": fill_id,
             "price_usd": exit_price,
-            "lnm_trade_id": resp.id,
+            "lnm_trade_id": closed_trade_id,
             "gross_pl_sats": resp.pl,
             "fee_sats": resp.closing_fee,
             "net_pl_sats": net_pl_sats,
@@ -301,6 +313,7 @@ class LiveExecutor:
             await self._fail_closed_if_entry_is_ambiguous(exc)
             return -1, {"noop": True, "reason": f"order_failed: {exc}"}
 
+        actual_entry_price = float(trade.entry_price or trade.price or fill_price)
         try:
             order_id = self._recorder.record_order(
                 run_id,
@@ -311,7 +324,7 @@ class LiveExecutor:
                 qty_sats=quantity_contracts,
                 leverage=leverage,
                 status="filled",
-                price_usd=fill_price,
+                price_usd=actual_entry_price,
                 lnm_order_id=trade.id,
                 metadata={
                     "isolated_action": "open",
@@ -325,7 +338,7 @@ class LiveExecutor:
                 order_id,
                 ts=ts,
                 qty_sats=quantity_contracts,
-                price_usd=float(trade.entry_price or trade.price or fill_price),
+                price_usd=actual_entry_price,
                 fee_sats=opening_fee_sats,
             )
             if opening_fee_sats:
@@ -334,7 +347,7 @@ class LiveExecutor:
                     date_str=ts.date().isoformat(),
                     realized_delta_sats=-opening_fee_sats,
                 )
-                self._unreported_realized_pnl_usd -= opening_fee_sats * fill_price / 1e8
+                self._unreported_realized_pnl_usd -= opening_fee_sats * actual_entry_price / 1e8
         except Exception as exc:
             # The remote trade is live but absent from local reconciliation
             # state. Compensate immediately; leaving it open would be unsafe.
@@ -364,13 +377,13 @@ class LiveExecutor:
         # The shared strategy-state field retains its legacy name, but for
         # isolated live trades it stores signed USD-contract quantity.
         pos.qty_sats = quantity_contracts if side == "buy" else -quantity_contracts
-        pos.entry_price_usd = fill_price
+        pos.entry_price_usd = actual_entry_price
         pos.entry_ts = ts
         pos.leverage = leverage
         pos.trade_id = trade.id
         return order_id, {
             "fill_id": fill_id,
-            "price_usd": fill_price,
+            "price_usd": actual_entry_price,
             "quantity_contracts": quantity_contracts,
             "lnm_trade_id": trade.id,
             "fee_sats": opening_fee_sats,

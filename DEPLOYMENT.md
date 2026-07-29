@@ -255,6 +255,28 @@ Do not change sizing with an expectation that current positions will be
 resized.  Do not run a second live runner against the same account while the
 service is active.
 
+### Indicator continuity on restart
+
+The first live start after installing the current strategy state schema loads
+100 days of LN Markets candle history. This gives the daily EMA(21) enough
+recursive updates after its seed to closely match a continuously calculated
+EMA. LN Markets currently supplies this historical endpoint as 1-minute
+candles, which the bot aggregates locally; startup can therefore take longer
+than a normal restart.
+
+After the first live minute and each completed 1d or 4h bar, the bot stores its
+indicator, verdict, cool-off, manual-hold, and pending-execution state in the
+configured SQLite database. Signal state is committed before an API order and
+again after the executor position is mirrored. A later restart restores that
+state and skips overlapping warmup bars, so it does not reseed or mutate the
+EMA a second time. A strategy-parameter change intentionally invalidates the
+old snapshot and performs the deep bootstrap again.
+
+An unchanged directional verdict is not itself an entry signal. The bot only
+retries under an unchanged verdict when the durable snapshot says that a
+previously emitted order remains unconfirmed. This prevents a cold restart or
+an intentionally flat position from manufacturing a late MA-cross entry.
+
 ### Halt new processing
 
 To halt via the file switch:
@@ -283,8 +305,10 @@ before resuming.
 4. Start the service and read the journal.  Startup reconciliation refuses an
    unrecorded or ambiguous remote trade rather than opening another one.
 5. If the restored trade is opposite the first confirmed directional verdict,
-   the bot emits a `restart_catch_up` exit and waits for a later fresh
-   transition before entering again.
+   the bot applies the normal transition logic: it closes the restored trade
+   and, when same-bar flips are enabled and no cool-off is triggered, opens
+   the new direction. The recorded signal metadata includes the LNM close,
+   SMA, EMA, tolerance, and distances used for that decision.
 
 The dashboard is useful but not an independent uptime monitor.  External
 monitoring from the VPS is the priority deferred safeguard; see

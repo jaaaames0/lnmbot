@@ -143,3 +143,15 @@ risk_events = Table(
     Column("signal_id", Integer, ForeignKey("signals.id"), nullable=True),
     Column("detail_json", JSON, nullable=False, default=dict),
 )
+
+strategy_state_snapshots = Table(
+    "strategy_state_snapshots",
+    Base.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", Integer, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("mode", String, nullable=False),
+    Column("strategy_name", String, nullable=False),
+    Column("ts", DateTime, nullable=False),
+    Column("state_json", JSON, nullable=False, default=dict),
+    UniqueConstraint("mode", "strategy_name", name="uq_strategy_state_mode_name"),
+)

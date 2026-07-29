@@ -96,9 +96,25 @@ async def run_paper(
         exec_pos = executor.positions.get(tf)
         if exec_pos is not None:
             pos.leverage = exec_pos.leverage
+    strategy_name = f"{type(strategy).__module__}.{type(strategy).__name__}"
+    if run_mode == "live":
+        snapshot = recorder.latest_strategy_state(mode="live", strategy_name=strategy_name)
+        if snapshot is not None:
+            if strategy.restore_persistent_state(snapshot["state"]):
+                get_logger(run_mode).info(
+                    "live.strategy_state_restored",
+                    strategy=strategy_name,
+                    snapshot_ts=snapshot["ts"].isoformat(),
+                )
+            else:
+                get_logger(run_mode).warning(
+                    "live.strategy_state_rejected",
+                    strategy=strategy_name,
+                    snapshot_ts=snapshot["ts"].isoformat(),
+                )
+    strategy.reconcile_execution_state(state)
     strategy.on_startup(state)
 
-    strategy_name = f"{type(strategy).__module__}.{type(strategy).__name__}"
     with run_session(
         recorder,
         cfg=cfg,
@@ -121,6 +137,7 @@ async def run_paper(
         n_bars = 0
         n_intents = 0
         last_account_snapshot_ts = None
+        strategy_snapshot_saved = False
         try:
             async for bar in data_source.stream():
                 if deadline is not None and asyncio.get_running_loop().time() >= deadline:
@@ -179,6 +196,22 @@ async def run_paper(
                 if not bar.warmup:
                     n_bars += 1
                 n_intents += len(intents)
+                # Commit indicator/verdict/cooldown state before a remote
+                # order. If the process dies after LNM accepts an order, the
+                # next restart must not revert to the pre-signal verdict or
+                # lose a newly-started loss cooldown.
+                snapshot_due = bar.timeframe in subscribed_tfs or not strategy_snapshot_saved
+                if run_mode == "live" and not bar.warmup and snapshot_due:
+                    persistent_state = strategy.persistent_state()
+                    if persistent_state is not None:
+                        recorder.save_strategy_state(
+                            run_id,
+                            mode="live",
+                            strategy_name=strategy_name,
+                            ts=bar.ts,
+                            state=persistent_state,
+                        )
+                        strategy_snapshot_saved = True
                 for intent in intents:
                     sig_id = recorder.record_signal(
                         run_id,
@@ -207,6 +240,8 @@ async def run_paper(
                         run_id=run_id,
                         ts=bar.ts,
                     )
+                    if decision.decision.value == "rejected":
+                        strategy.on_intent_rejected(intent)
                     if decision.order_id is not None and decision.order_id > 0:
                         guard.record_realized_pnl(executor.consume_realized_pnl_usd(), bar.ts)
                         log.info(
@@ -226,6 +261,20 @@ async def run_paper(
                     exec_pos = executor.positions.get(tf)
                     if exec_pos is not None:
                         pos.leverage = exec_pos.leverage
+                strategy.reconcile_execution_state(state)
+                # The pre-order snapshot above makes the intended target
+                # crash-safe. Replace it after execution so confirmed targets
+                # are not retried on a later restart.
+                if run_mode == "live" and not bar.warmup and snapshot_due:
+                    persistent_state = strategy.persistent_state()
+                    if persistent_state is not None:
+                        recorder.save_strategy_state(
+                            run_id,
+                            mode="live",
+                            strategy_name=strategy_name,
+                            ts=bar.ts,
+                            state=persistent_state,
+                        )
         finally:
             with suppress(Exception):
                 await data_source.close()

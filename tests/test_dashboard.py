@@ -74,6 +74,45 @@ def test_market_context_spans_restart_runs(tmp_path):
     assert changes[0] == {"period": "1h", "change": "+1.00%"}
 
 
+def test_ma_levels_prefer_the_persisted_live_strategy_state(tmp_path):
+    db_path = tmp_path / "state.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_state_snapshots ("
+            "id INTEGER PRIMARY KEY, run_id INTEGER, mode TEXT, strategy_name TEXT, "
+            "ts TEXT, state_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                1,
+                "live",
+                "lnmarkets_bot.strategy.ma_cross.MaCross",
+                "2026-07-28 04:00:00",
+                json.dumps(
+                    {
+                        "version": 1,
+                        "timeframes": {
+                            "1d": {
+                                "sma": 64_300.0,
+                                "ema": 64_257.0,
+                                "last_bar_ts": "2026-07-28T00:00:00+00:00",
+                            }
+                        },
+                    }
+                ),
+            ),
+        )
+
+    dashboard = _dashboard_module()
+    levels = dashboard._ma_levels(db_path, tolerance_pct=0.005)
+
+    assert levels["1d"]["ema21"] == 64_257.0
+    assert levels["1d"]["short_trigger"] == pytest.approx(63_935.715)
+    assert levels["1d"]["bootstrap_source"] == "persisted_live_state"
+
+
 def test_active_run_ignores_newer_manual_recovery_rows(tmp_path):
     db_path = tmp_path / "runs.sqlite"
     with sqlite3.connect(db_path) as connection:

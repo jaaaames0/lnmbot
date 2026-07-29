@@ -134,6 +134,8 @@ async def run_backtest(
                     decision = await guard.submit(
                         intent=intent, signal_id=sig_id, run_id=run_id, ts=bar.ts,
                     )
+                    if decision.decision.value == "rejected":
+                        strategy.on_intent_rejected(intent)
                     if decision.order_id is not None and decision.order_id > 0:
                         # Update executor's realized P&L into the guard
                         guard.record_realized_pnl(executor.consume_realized_pnl_usd(), bar.ts)
@@ -148,6 +150,7 @@ async def run_backtest(
                     pos.entry_price_usd = executor.position_entry_price(tf)
                     pos.leverage = executor.positions.get(tf).leverage if executor.positions.get(tf) else 1.0
                     total_qty_sats += pos.qty_sats
+                strategy.reconcile_execution_state(state)
                 # equity_sats = balance + sum of per-TF position notionals
                 # (= sum(qty_sats_signed * close) — long positive, short negative)
                 # For v1 we approximate as net signed qty × close.

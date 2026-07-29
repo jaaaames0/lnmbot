@@ -27,6 +27,7 @@ from .models import (
     risk_events,
     runs,
     signals,
+    strategy_state_snapshots,
 )
 
 
@@ -137,6 +138,52 @@ class Recorder:
                 )
             )
             return int(result.inserted_primary_key[0])
+
+    def latest_strategy_state(self, *, mode: str, strategy_name: str) -> dict[str, Any] | None:
+        """Load the latest durable state for one live strategy identity."""
+        with self._factory() as session:
+            row = session.execute(
+                select(strategy_state_snapshots.c.ts, strategy_state_snapshots.c.state_json)
+                .where(strategy_state_snapshots.c.mode == mode)
+                .where(strategy_state_snapshots.c.strategy_name == strategy_name)
+            ).one_or_none()
+        if row is None or not isinstance(row.state_json, dict):
+            return None
+        return {"ts": row.ts, "state": row.state_json}
+
+    def save_strategy_state(
+        self,
+        run_id: int,
+        *,
+        mode: str,
+        strategy_name: str,
+        ts: datetime,
+        state: dict[str, Any],
+    ) -> None:
+        """Atomically replace the durable snapshot after a completed TF bar."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        with self._factory() as session, session.begin():
+            stmt = sqlite_insert(strategy_state_snapshots).values(
+                run_id=run_id,
+                mode=mode,
+                strategy_name=strategy_name,
+                ts=ts,
+                state_json=state,
+            )
+            session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[
+                        strategy_state_snapshots.c.mode,
+                        strategy_state_snapshots.c.strategy_name,
+                    ],
+                    set_={
+                        "run_id": stmt.excluded.run_id,
+                        "ts": stmt.excluded.ts,
+                        "state_json": stmt.excluded.state_json,
+                    },
+                )
+            )
 
     # ---- Orders / fills ----
 

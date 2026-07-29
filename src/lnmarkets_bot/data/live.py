@@ -44,7 +44,9 @@ class LnmLiveStream(DataSource):
         symbol: LNM symbol. Default `BTCUSD` (LNM uses underscores-less).
         poll_seconds: seconds between polls. Default 5.
         warmup_days: historical closed candles to load before live polling.
-            Defaults to 31 days, enough for 21 daily indicator bars.
+            Defaults to 100 days so a new daily EMA has roughly 79 recursive
+            updates after its 21-close seed. Subsequent restarts restore the
+            durable indicator state and do not depend on this bootstrap.
     """
 
     def __init__(
@@ -53,7 +55,7 @@ class LnmLiveStream(DataSource):
         *,
         symbol: str = "BTCUSD",
         poll_seconds: float = 5.0,
-        warmup_days: int = 31,
+        warmup_days: int = 100,
         poll_failure_alert_after: int = 3,
     ) -> None:
         self._client = client
@@ -138,7 +140,11 @@ class LnmLiveStream(DataSource):
                 _log.info("live.poll_recovered", consecutive_failures=consecutive_failures)
                 consecutive_failures = 0
 
-            for c in candles:
+            # Do not rely on endpoint page order. If a catch-up response is
+            # newest-first, advancing ``_last_yielded_ts`` on its first row
+            # would otherwise make every older missing candle look stale and
+            # silently discard it.
+            for c in sorted(candles, key=lambda row: _parse_ts(_candle_time(row)) or end_dt):
                 bar = _to_bar(c, warmup=False)
                 if bar is None:
                     continue

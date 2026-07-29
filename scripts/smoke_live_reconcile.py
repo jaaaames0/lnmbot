@@ -121,7 +121,7 @@ async def main() -> int:
             print(f"CRITICAL: close failed for {trade_id}; close it manually", file=sys.stderr)
             raise RuntimeError(str(close_meta))
         recorder.end_run(run_id, status="done", ended_at=datetime.now(UTC))
-        print(f"closed reconciled trade id={trade_id} realized_pl_sats={close_meta['pl_sats']}")
+        print(f"closed reconciled trade id={trade_id} gross_pl_sats={close_meta['gross_pl_sats']}")
         return 0
     finally:
         await client.aclose()
