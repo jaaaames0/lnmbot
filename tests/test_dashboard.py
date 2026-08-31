@@ -113,6 +113,62 @@ def test_ma_levels_prefer_the_persisted_live_strategy_state(tmp_path):
     assert levels["1d"]["bootstrap_source"] == "persisted_live_state"
 
 
+def test_persisted_cooldowns_and_position_card_explain_remaining_verdict_changes(tmp_path):
+    db_path = tmp_path / "cooldowns.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_state_snapshots ("
+            "id INTEGER PRIMARY KEY, mode TEXT, ts TEXT, state_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?)",
+            (
+                1,
+                "live",
+                "2026-07-30 12:00:00",
+                json.dumps(
+                    {
+                        "winner_suppressed_signals": {"1d": 0, "4h": 6},
+                        "loss_suppressed_signals": {"1d": 2, "4h": 0},
+                    }
+                ),
+            ),
+        )
+
+    dashboard = _dashboard_module()
+
+    cooldowns = dashboard._persisted_cooldowns(db_path)
+    assert cooldowns == {"1d": {"winner": 0, "loss": 2}, "4h": {"winner": 6, "loss": 0}}
+    card = dashboard._position_card("4h", None, "sats", None, None, cooldowns["4h"])
+    assert "Cool-off active" in card
+    assert "6 verdict changes left" in card
+    assert "winner 6" in card
+
+
+def test_strategy_explainer_says_triggering_exit_does_not_spend_a_slot():
+    dashboard = _dashboard_module()
+
+    explainer = dashboard._strategy_explainer(
+        {
+            "strategy_params_json": json.dumps(
+                {
+                    "tolerance_pct": 0.005,
+                    "cooldown_mode": "verdict_transition",
+                    "cooldown_threshold_pct": {"1d": 0.03, "4h": 0.05},
+                    "loss_cooldown_threshold_pct": {"1d": 0.05, "4h": 0.02},
+                    "cooldown_signal_count": {"1d": 12, "4h": 11},
+                    "loss_cooldown_signal_count": {"1d": 3, "4h": 4},
+                }
+            ),
+            "config_json": json.dumps({"strategy_4h_chop_reduce_enabled": True}),
+        }
+    )
+
+    assert "does <b>not</b> spend a slot" in explainer
+    assert "including a move to or from Flat" in explainer
+    assert "high, new 4h entries use the configured reduced size" in explainer
+
+
 def test_active_run_ignores_newer_manual_recovery_rows(tmp_path):
     db_path = tmp_path / "runs.sqlite"
     with sqlite3.connect(db_path) as connection:
@@ -236,3 +292,151 @@ def test_dashboard_price_stream_records_public_last_price():
     assert tick is not None
     assert tick.price == 64_609
     assert tick.ts.tzinfo == dashboard.UTC
+
+
+def _create_normalized_pnl_db(db_path):
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE signals (id INTEGER PRIMARY KEY, metadata_json TEXT)")
+        connection.execute(
+            "CREATE TABLE orders ("
+            "id INTEGER PRIMARY KEY, run_id INTEGER, signal_id INTEGER, ts TEXT, trigger_tf TEXT, "
+            "side TEXT, qty_sats INTEGER, leverage REAL, price_usd REAL, status TEXT, "
+            "lnm_order_id TEXT, rejection_reason TEXT, metadata_json TEXT)"
+        )
+        connection.execute("CREATE TABLE funding_fees (trade_id TEXT, fee_sats INTEGER)")
+        connection.execute("INSERT INTO signals VALUES (?, ?)", (1, "{}"))
+        connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    1,
+                    1,
+                    1,
+                    "2026-08-01 00:00:00",
+                    "4h",
+                    "buy",
+                    100,
+                    5.0,
+                    50_000.0,
+                    "filled",
+                    "trade-1",
+                    None,
+                    json.dumps(
+                        {
+                            "isolated_action": "open",
+                            "lnm_trade_id": "trade-1",
+                            "opening_fee_sats": 100,
+                        }
+                    ),
+                ),
+                (
+                    2,
+                    1,
+                    1,
+                    "2026-08-02 00:00:00",
+                    "4h",
+                    "sell",
+                    100,
+                    1.0,
+                    55_000.0,
+                    "filled",
+                    "trade-1",
+                    None,
+                    json.dumps(
+                        {
+                            "isolated_action": "close",
+                            "lnm_trade_id": "trade-1",
+                            "closing_fee_sats": 100,
+                            "gross_pl_sats": 18_182,
+                        }
+                    ),
+                ),
+                (
+                    3,
+                    1,
+                    1,
+                    "2026-08-03 00:00:00",
+                    "4h",
+                    "buy",
+                    1_000,
+                    5.0,
+                    50_000.0,
+                    "filled",
+                    "trade-2",
+                    None,
+                    json.dumps(
+                        {
+                            "isolated_action": "open",
+                            "lnm_trade_id": "trade-2",
+                            "opening_fee_sats": 1_000,
+                        }
+                    ),
+                ),
+                (
+                    4,
+                    1,
+                    1,
+                    "2026-08-04 00:00:00",
+                    "4h",
+                    "sell",
+                    1_000,
+                    1.0,
+                    55_000.0,
+                    "filled",
+                    "trade-2",
+                    None,
+                    json.dumps(
+                        {
+                            "isolated_action": "close",
+                            "lnm_trade_id": "trade-2",
+                            "closing_fee_sats": 1_000,
+                            "gross_pl_sats": 181_820,
+                        }
+                    ),
+                ),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO funding_fees VALUES (?, ?)", (("trade-1", 50), ("trade-2", 500))
+        )
+
+
+def test_constant_notional_replay_normalizes_by_entry_size_and_includes_costs(tmp_path):
+    db_path = tmp_path / "normalized.sqlite"
+    _create_normalized_pnl_db(db_path)
+    dashboard = _dashboard_module()
+
+    events = dashboard._closed_trade_components(db_path)
+    assert len(events) == 2
+    expected_return_pct = (18_182 - 100 - 100 - 50) * 55_000 / 1e8 / 100 * 100
+    assert [event["net_return_pct"] for event in events] == pytest.approx(
+        [expected_return_pct, expected_return_pct]
+    )
+
+    summary = dashboard._constant_notional_pnl_summary(
+        db_path,
+        [],
+        nominal_usd=dashboard.CONSTANT_NOTIONAL_USD,
+        btc_price=55_000.0,
+        now=dashboard.datetime(2026, 8, 4, 1, tzinfo=dashboard.UTC),
+    )
+    all_time = next(row for row in summary if row["key"] == "alltime")
+    assert all_time["net"] == pytest.approx(expected_return_pct / 100 * 100 * 2)
+    assert all_time["portfolio_return_pct"] == pytest.approx(expected_return_pct)
+
+
+def test_trade_ledger_and_fixed_pnl_controls(tmp_path):
+    db_path = tmp_path / "normalized.sqlite"
+    _create_normalized_pnl_db(db_path)
+    dashboard = _dashboard_module()
+
+    ledger = dashboard._trade_history_rows(db_path, tf=None, denomination="usd", btc_price=55_000.0)
+    assert len(ledger) == 2
+    assert all("+9.86%" in row["net_return"] for row in ledger)
+
+    controls = dashboard._pnl_basis_controls("usd", "weekly", "constant")
+    assert ">Actual</a>" in controls
+    assert ">Constant notional</a>" in controls
+    assert "pnl_basis=constant" in controls
+    assert "nominal_usd" not in controls
+    assert "USD per trade" not in controls

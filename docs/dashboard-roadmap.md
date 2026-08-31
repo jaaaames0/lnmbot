@@ -12,6 +12,9 @@ orders or changing risk limits always requires an explicit reviewed restart.
   funding and net P&L.
 - Funding, P&L, run-history, and health pages, with the active run's sizing,
   risk, CHOP, tolerance, and cooldown configuration.
+- Actual P&L remains the accounting view; the P&L page also provides a fixed
+  $100 constant-notional replay and per-trade return-on-notional so
+  strategy quality can be compared across sizing and deposit changes.
 - A separate read-only LN Markets key supplies authoritative available balance,
   isolated margin, running P&L, and account cash-flow history. The dashboard
   has no write capability.

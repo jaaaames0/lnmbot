@@ -26,6 +26,7 @@ from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTradesApi
 
 TIMEFRAMES = ("1d", "4h")
+CONSTANT_NOTIONAL_USD = 100.0
 BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1h_4y.parquet"
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
 SAT_TOKEN = "__SAT_SYMBOL__"
@@ -337,6 +338,19 @@ def _signed_percent_html(value: object) -> SafeHtml:
     return SafeHtml(display)
 
 
+def _signed_usd_html(value: object) -> SafeHtml:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return SafeHtml("-")
+    display = f"{'+' if amount > 0 else '-' if amount < 0 else ''}${abs(amount):,.2f}"
+    if amount > 0:
+        return SafeHtml(f'<span class="positive">{display}</span>')
+    if amount < 0:
+        return SafeHtml(f'<span class="negative">{display}</span>')
+    return SafeHtml(display)
+
+
 def _render_cell_value(value: object) -> str:
     if isinstance(value, SafeHtml):
         return str(value)
@@ -426,11 +440,27 @@ def _position_card(
     denomination: str,
     btc_price: float | None,
     levels: dict[str, object] | None,
+    cooldown: dict[str, int],
 ) -> str:
+    winner = cooldown.get("winner", 0)
+    loss = cooldown.get("loss", 0)
+    remaining = max(winner, loss)
+    cooldown_detail = ""
+    if remaining:
+        labels = []
+        if winner:
+            labels.append(f"winner {winner}")
+        if loss:
+            labels.append(f"loss {loss}")
+        cooldown_detail = (
+            f"Cool-off · {remaining} verdict {'change' if remaining == 1 else 'changes'} left"
+            f" ({' · '.join(labels)})"
+        )
     if position is None:
         return (
             f'<article class="card position-card flat"><p>{timeframe} position</p>'
-            "<strong>Flat</strong></article>"
+            f"<strong>{'Cool-off active' if remaining else 'Flat'}</strong>"
+            f"<small>{cooldown_detail or 'Ready for the next verdict transition'}</small></article>"
         )
     side = str(position["side"])
     estimate = _signed_amount_html(position["estimated_unrealized_sats"], denomination, btc_price)
@@ -438,7 +468,8 @@ def _position_card(
     return (
         f'<article class="card position-card {side}"><p>{timeframe} position</p>'
         "<div class=position-card-body><div class=position-static>"
-        f"<strong>{side.title()}</strong><small>${position['contracts']:,} · {position['leverage']}x</small>"
+        f"<strong>{side.title()}</strong><small>${position['contracts']:,} · {position['leverage']}x"
+        f"{' · ' + cooldown_detail if cooldown_detail else ''}</small>"
         "</div><div class=position-dynamic>"
         f"<strong>{estimate}</strong><small>{move_display}</small>"
         "</div></div></article>"
@@ -638,6 +669,12 @@ def _trade_history_rows(
         funding_sats = funding.get(trade_id, 0)
         completed = close is not None
         net_sats = gross_pl - opening_fee - closing_fee - funding_sats if completed else None
+        net_return_pct = None
+        if completed:
+            notional_usd = int(opened.get("qty_sats") or 0)
+            exit_price = float(close.get("price_usd") or 0)
+            if notional_usd > 0 and exit_price > 0:
+                net_return_pct = net_sats * exit_price / 1e8 / notional_usd * 100
         rows.append(
             {
                 "trade_id": f"{trade_id[:8]}…{trade_id[-4:]}",
@@ -663,6 +700,7 @@ def _trade_history_rows(
                 "net_pl": _format_signed_amount(net_sats, denomination, btc_price)
                 if net_sats is not None
                 else "-",
+                "net_return": _signed_percent_html(net_return_pct),
             }
         )
     return sorted(rows, key=lambda row: str(row["opened_ts"]), reverse=True)
@@ -799,6 +837,35 @@ def _persisted_strategy_levels(db_path: Path, tolerance_pct: float) -> dict[str,
             "bootstrap_source": "persisted_live_state",
         }
     return levels
+
+
+def _persisted_cooldowns(db_path: Path) -> dict[str, dict[str, int]]:
+    """Return the live strategy's remaining per-timeframe cool-off slots."""
+    empty = {timeframe: {"winner": 0, "loss": 0} for timeframe in TIMEFRAMES}
+    try:
+        rows = _query(
+            db_path,
+            "SELECT state_json FROM strategy_state_snapshots "
+            "WHERE mode = 'live' ORDER BY ts DESC LIMIT 1",
+        )
+    except sqlite3.Error:
+        return empty
+    if not rows:
+        return empty
+    state = _metadata(rows[0]["state_json"])
+    winner = state.get("winner_suppressed_signals")
+    loss = state.get("loss_suppressed_signals")
+    if not isinstance(winner, dict) or not isinstance(loss, dict):
+        return empty
+    for timeframe in TIMEFRAMES:
+        try:
+            empty[timeframe] = {
+                "winner": max(0, int(winner.get(timeframe, 0))),
+                "loss": max(0, int(loss.get(timeframe, 0))),
+            }
+        except (TypeError, ValueError):
+            continue
+    return empty
 
 
 def _ma_levels(db_path: Path, tolerance_pct: float) -> dict[str, dict[str, object]]:
@@ -958,6 +1025,13 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
         )
         funding_pnl = -funding.get(trade_id, 0)
         opened_ts = _parse_ts(opened.get("ts"))
+        entry_notional_usd = int(opened.get("qty_sats") or 0)
+        exit_price_usd = float(closed.get("price_usd") or 0)
+        return_scale = (
+            exit_price_usd / 1e8 / entry_notional_usd * 100
+            if entry_notional_usd > 0 and exit_price_usd > 0
+            else 0.0
+        )
         events.append(
             {
                 "closed_at": closed_ts,
@@ -967,6 +1041,12 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
                 "trading_fees": trading_fees,
                 "funding": funding_pnl,
                 "net": gross + trading_fees + funding_pnl,
+                "entry_notional_usd": entry_notional_usd,
+                "exit_price_usd": exit_price_usd,
+                "gross_return_pct": gross * return_scale,
+                "trading_fees_return_pct": trading_fees * return_scale,
+                "funding_return_pct": funding_pnl * return_scale,
+                "net_return_pct": (gross + trading_fees + funding_pnl) * return_scale,
                 "hold_hours": (closed_ts - opened_ts).total_seconds() / 3600 if opened_ts else None,
             }
         )
@@ -1021,6 +1101,72 @@ def _pnl_summary(
     return result
 
 
+def _open_return_components(
+    positions: list[dict[str, object]], btc_price: float | None
+) -> dict[str, float]:
+    components = {"gross": 0.0, "trading_fees": 0.0, "funding": 0.0}
+    if not btc_price:
+        return components
+    for position in positions:
+        notional_usd = int(position.get("contracts") or 0)
+        gross_sats = position.get("estimated_unrealized_sats")
+        if notional_usd <= 0 or not isinstance(gross_sats, int):
+            continue
+        scale = btc_price / 1e8 / notional_usd
+        components["gross"] += gross_sats * scale
+        components["trading_fees"] -= int(position.get("opening_fee_sats") or 0) * scale
+        components["funding"] -= int(position.get("accumulated_funding_sats") or 0) * scale
+    return components
+
+
+def _constant_notional_pnl_summary(
+    db_path: Path,
+    positions: list[dict[str, object]],
+    nominal_usd: float,
+    btc_price: float | None,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Replay each trade at one USD notional, independent of actual sizing."""
+    now = now or datetime.now(UTC)
+    closed_events = _closed_trade_components(db_path)
+    open_returns = _open_return_components(positions, btc_price)
+    result: list[dict[str, object]] = []
+    for key, label, window in (
+        ("1day", "1 day", timedelta(days=1)),
+        ("7days", "7 days", timedelta(days=7)),
+        ("30days", "30 days", timedelta(days=30)),
+        ("alltime", "All time", None),
+    ):
+        selected = [
+            event for event in closed_events if window is None or event["closed_at"] >= now - window
+        ]
+        gross = nominal_usd * (
+            sum(float(event["gross_return_pct"]) for event in selected) / 100
+            + open_returns["gross"]
+        )
+        trading_fees = nominal_usd * (
+            sum(float(event["trading_fees_return_pct"]) for event in selected) / 100
+            + open_returns["trading_fees"]
+        )
+        funding = nominal_usd * (
+            sum(float(event["funding_return_pct"]) for event in selected) / 100
+            + open_returns["funding"]
+        )
+        net = gross + trading_fees + funding
+        result.append(
+            {
+                "key": key,
+                "period": label,
+                "gross": gross,
+                "trading_fees": trading_fees,
+                "funding": funding,
+                "net": net,
+                "portfolio_return_pct": net / (nominal_usd * len(TIMEFRAMES)) * 100,
+            }
+        )
+    return result
+
+
 def _calendar_pnl_rows(db_path: Path, granularity: str) -> list[dict[str, object]]:
     """Aggregate realized trading P&L and funding by calendar period."""
     realized_rows = _query(
@@ -1054,6 +1200,27 @@ def _calendar_pnl_rows(db_path: Path, granularity: str) -> list[dict[str, object
     return [{"period": period, "net": net} for period, net in sorted(periods.items(), reverse=True)]
 
 
+def _constant_notional_calendar_pnl_rows(
+    db_path: Path, granularity: str, nominal_usd: float
+) -> list[dict[str, object]]:
+    periods: dict[str, float] = {}
+    for event in _closed_trade_components(db_path):
+        closed_at = event.get("closed_at")
+        if not isinstance(closed_at, datetime):
+            continue
+        if granularity == "weekly":
+            iso_year, iso_week, _ = closed_at.date().isocalendar()
+            label = f"{iso_year}-W{iso_week:02d}"
+        elif granularity == "monthly":
+            label = closed_at.strftime("%Y-%m")
+        else:
+            label = closed_at.date().isoformat()
+        periods[label] = periods.get(label, 0.0) + (
+            float(event["net_return_pct"]) / 100 * nominal_usd
+        )
+    return [{"period": period, "net": net} for period, net in sorted(periods.items(), reverse=True)]
+
+
 def _paginate(
     rows: list[dict[str, object]], page: int, page_size: int
 ) -> tuple[list[dict[str, object]], int, int]:
@@ -1063,10 +1230,18 @@ def _paginate(
     return rows[start : start + page_size], page, total_pages
 
 
-def _pagination(page: int, total_pages: int, denomination: str, granularity: str) -> str:
+def _pagination(
+    page: int,
+    total_pages: int,
+    denomination: str,
+    granularity: str,
+    pnl_basis: str,
+) -> str:
     if total_pages <= 1:
         return ""
     base = {"denom": denomination, "pnl_granularity": granularity}
+    if pnl_basis == "constant":
+        base["pnl_basis"] = "constant"
     previous = ""
     if page > 1:
         previous_query = {**base, "pnl_page": str(page - 1)}
@@ -1104,7 +1279,10 @@ def _periodic_pnl_table(
 
 
 def _strategy_performance_rows(
-    db_path: Path, denomination: str, btc_price: float | None
+    db_path: Path,
+    denomination: str,
+    btc_price: float | None,
+    nominal_usd: float | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     events = sorted(_closed_trade_components(db_path), key=lambda event: event["closed_at"])
     open_started: dict[str, list[datetime]] = {timeframe: [] for timeframe in TIMEFRAMES}
@@ -1134,7 +1312,11 @@ def _strategy_performance_rows(
         )
         if not selected:
             continue
-        nets = [int(event["net"]) for event in selected]
+        nets: list[float] = (
+            [float(event["net_return_pct"]) / 100 * nominal_usd for event in selected]
+            if nominal_usd is not None
+            else [float(event["net"]) for event in selected]
+        )
         winners = [net for net in nets if net > 0]
         losers = [net for net in nets if net < 0]
         hold_hours = [
@@ -1146,25 +1328,25 @@ def _strategy_performance_rows(
             if winners and losers
             else None
         )
-        quality_rows.append(
-            {
-                "timeframe": timeframe,
-                "closed_trades": len(selected),
-                "win_rate": f"{len(winners) / len(selected):.1%}",
-                "avg_winner": _format_signed_amount(
-                    round(sum(winners) / len(winners)), denomination, btc_price
-                )
-                if winners
-                else "-",
-                "avg_loser": _format_signed_amount(
-                    round(sum(losers) / len(losers)), denomination, btc_price
-                )
-                if losers
-                else "-",
-                "payoff_ratio": f"{payoff_ratio:.2f}" if payoff_ratio is not None else "-",
-                "profit_factor": f"{profit_factor:.2f}" if profit_factor is not None else "-",
-            }
-        )
+
+        def format_pnl(value: float) -> SafeHtml | str:
+            if nominal_usd is not None:
+                return _signed_usd_html(value)
+            return _format_signed_amount(round(value), denomination, btc_price)
+
+        quality_row: dict[str, object] = {
+            "timeframe": timeframe,
+            "closed_trades": len(selected),
+            "win_rate": f"{len(winners) / len(selected):.1%}",
+            "avg_winner": format_pnl(sum(winners) / len(winners)) if winners else "-",
+            "avg_loser": format_pnl(sum(losers) / len(losers)) if losers else "-",
+            "payoff_ratio": f"{payoff_ratio:.2f}" if payoff_ratio is not None else "-",
+            "profit_factor": f"{profit_factor:.2f}" if profit_factor is not None else "-",
+        }
+        if nominal_usd is not None:
+            return_basis = nominal_usd * (len(TIMEFRAMES) if timeframe == "Combined" else 1)
+            quality_row["cumulative_return"] = _signed_percent_html(sum(nets) / return_basis * 100)
+        quality_rows.append(quality_row)
 
         equity = 0
         peak = 0
@@ -1209,14 +1391,10 @@ def _strategy_performance_rows(
         risk_rows.append(
             {
                 "timeframe": timeframe,
-                "avg_trade": _format_signed_amount(
-                    round(sum(nets) / len(nets)), denomination, btc_price
-                ),
-                "best_trade": _format_signed_amount(max(nets), denomination, btc_price),
-                "worst_trade": _format_signed_amount(min(nets), denomination, btc_price),
-                "max_closed_drawdown": _format_signed_amount(
-                    -max_drawdown, denomination, btc_price
-                ),
+                "avg_trade": format_pnl(sum(nets) / len(nets)),
+                "best_trade": format_pnl(max(nets)),
+                "worst_trade": format_pnl(min(nets)),
+                "max_closed_drawdown": format_pnl(-max_drawdown),
                 "longest_streaks": f"W{max_win_streak} · L{max_loss_streak}",
                 "avg_hold": f"{sum(hold_hours) / len(hold_hours):.1f}h" if hold_hours else "-",
                 "time_in_market": f"{exposure:.1f}%" if exposure is not None else "-",
@@ -1245,6 +1423,21 @@ def _account_profitability_rows(
     ]
 
 
+def _pnl_basis_controls(denomination: str, granularity: str, pnl_basis: str) -> str:
+    common = {"denom": denomination, "pnl_granularity": granularity}
+    actual_url = "/pnl?" + urlencode(common)
+    constant_query = {**common, "pnl_basis": "constant"}
+    constant_url = "/pnl?" + urlencode(constant_query)
+    return (
+        '<nav class="pnl-basis-actions" aria-label="P&amp;L basis">'
+        f'<a class="period-toggle{" active" if pnl_basis == "actual" else ""}" '
+        f'href="{html.escape(actual_url, quote=True)}">Actual</a>'
+        f'<a class="period-toggle{" active" if pnl_basis == "constant" else ""}" '
+        f'href="{html.escape(constant_url, quote=True)}">Constant notional</a>'
+        "</nav>"
+    )
+
+
 def _overview(
     db_path: Path,
     run: dict[str, object],
@@ -1258,10 +1451,15 @@ def _overview(
     levels = _ma_levels(db_path, _strategy_tolerance(run))
     pnl = _pnl_summary(db_path, positions)
     by_timeframe = {str(position["timeframe"]): position for position in positions}
+    cooldowns = _persisted_cooldowns(db_path)
     cards = "".join(
         (
-            _position_card("1d", by_timeframe.get("1d"), denomination, price, levels.get("1d")),
-            _position_card("4h", by_timeframe.get("4h"), denomination, price, levels.get("4h")),
+            _position_card(
+                "1d", by_timeframe.get("1d"), denomination, price, levels.get("1d"), cooldowns["1d"]
+            ),
+            _position_card(
+                "4h", by_timeframe.get("4h"), denomination, price, levels.get("4h"), cooldowns["4h"]
+            ),
             _pnl_card(pnl, denomination, pnl_window, price),
         )
     )
@@ -1465,9 +1663,66 @@ def _active_config(run: dict[str, object]) -> str:
     )
 
 
+def _strategy_explainer(run: dict[str, object]) -> str:
+    """Describe the active MA-cross rules without exposing implementation jargon."""
+    strategy = _metadata(run.get("strategy_params_json"))
+    config = _metadata(run.get("config_json"))
+    try:
+        tolerance = float(strategy.get("tolerance_pct", 0.005))
+    except (TypeError, ValueError):
+        tolerance = 0.005
+    mode = str(strategy.get("cooldown_mode", "verdict_transition"))
+    if mode == "verdict_transition":
+        consumption = "every later verdict change, including a move to or from Flat"
+    elif mode == "directional_transition":
+        consumption = "every later change into an Up or Down verdict"
+    else:
+        consumption = "every later change that would otherwise open or flip a position"
+
+    def threshold(key: str, timeframe: str) -> str:
+        values = strategy.get(key, {})
+        raw = values.get(timeframe) if isinstance(values, dict) else values
+        try:
+            return f"{float(raw):.0%}"
+        except (TypeError, ValueError):
+            return "the configured threshold"
+
+    def count(key: str, timeframe: str) -> str:
+        values = strategy.get(key, {})
+        raw = values.get(timeframe) if isinstance(values, dict) else values
+        try:
+            return str(int(raw))
+        except (TypeError, ValueError):
+            return "the configured number of"
+
+    chop_note = (
+        " When 4h CHOP is high, new 4h entries use the configured reduced size; exits and cool-offs are unchanged."
+        if config.get("strategy_4h_chop_reduce_enabled")
+        else ""
+    )
+    return (
+        "<section class=strategy-explainer><h2>How the active strategy behaves</h2>"
+        "<p>The 1d and 4h timeframes operate independently, each with at most one isolated position. "
+        f"After a completed candle, the bot is bullish only when the close is more than {tolerance:.2%} above both the 20-period SMA and 21-period EMA; "
+        "it is bearish only when it is more than that tolerance below both. Otherwise its verdict is Flat.</p>"
+        "<p>A change to bullish opens or holds a long; a change to bearish opens or holds a short. "
+        "If the verdict reverses an existing position, the bot closes it and normally flips on the same completed candle.</p>"
+        "<p><b>Cool-off:</b> closing a trade starts a winner cool-off after a gain of at least "
+        f"{threshold('cooldown_threshold_pct', '1d')} (1d) or {threshold('cooldown_threshold_pct', '4h')} (4h), "
+        "or a loss cool-off after a loss of at least "
+        f"{threshold('loss_cooldown_threshold_pct', '1d')} (1d) or {threshold('loss_cooldown_threshold_pct', '4h')} (4h). "
+        "The closing/triggering verdict does <b>not</b> spend a slot. It then suppresses "
+        f"{count('cooldown_signal_count', '1d')} winner or {count('loss_cooldown_signal_count', '1d')} loss changes on 1d, and "
+        f"{count('cooldown_signal_count', '4h')} winner or {count('loss_cooldown_signal_count', '4h')} loss changes on 4h. "
+        f"A slot is spent by {consumption}. An exposure-reducing close is still allowed during cool-off; only its replacement entry is suppressed.{chop_note}</p>"
+        "</section>"
+    )
+
+
 def _presentation_style() -> str:
     return """<style>
-.page-header{display:none}:root{--sidebar-width:176px}html,body{font-size:12px}.brand{font-size:1.15rem}.brand-sub,.nav-label{font-size:.72rem}.nav-link{font-size:.9rem}.content{padding-top:1.7rem}h1{font-size:1.7rem}.cards{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.card strong{font-size:1.45rem}.card p,.card small{font-size:.8rem}table{font-size:.9rem}th{font-size:.72rem}.sat-symbol{font-style:normal;margin-left:.08em}.market-changes{display:flex;gap:.35rem;flex-wrap:wrap;color:var(--muted);font-size:.7rem;margin:.4rem 0}.market-changes b{color:var(--text);margin-right:.1rem}.sidebar-controls{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;padding:0 .5rem}.sidebar-control-group{display:flex;flex-direction:column;gap:.35rem}.denom-controls{display:flex;gap:.35rem}.denom-toggle,.pnl-toggle,.period-toggle{border:1px solid var(--border-hover);border-radius:4px;color:var(--muted);padding:.18rem .42rem;text-decoration:none;font-size:.74rem}.denom-toggle:hover,.denom-toggle.active,.pnl-toggle:hover,.pnl-toggle.active,.period-toggle:hover,.period-toggle.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}.position-card.long{border-color:var(--accent)}.position-card.short{border-color:#f87171}.position-card.short strong{color:#f87171}.position-card.flat{opacity:.62}.pnl-card small{display:flex;gap:.3rem;align-items:center;flex-wrap:wrap}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1.2rem}.overview-grid .full-width{grid-column:1/-1}.overview-grid .full-width .table-wrap{width:100%}.activity-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 1.2rem}.activity-grid .table-wrap{width:100%}.compact-table .table-wrap{width:max-content;max-width:100%}.compact-table table{width:auto}.copy-id{border:1px solid var(--border-hover);border-radius:3px;background:var(--surface-2);color:var(--muted);font:inherit;font-size:.72rem;padding:.08rem .3rem;cursor:pointer}.copy-id:hover{border-color:var(--accent);color:var(--accent)}.period-controls{display:flex;gap:.35rem;flex-wrap:wrap;margin:-.15rem 0 1rem}.pagination{display:flex;align-items:center;gap:.65rem;margin-top:.65rem;color:var(--muted)}.pagination a{color:var(--accent);text-decoration:none}.topbar{display:flex;align-items:center;gap:1.4rem;flex-wrap:wrap;border-bottom:1px solid var(--border);padding:0 0 1rem;margin-bottom:1.7rem}.topbar-status,.topbar-metric,.topbar-market{display:flex;flex-direction:column;gap:.1rem}.topbar-status{flex-direction:row;align-items:center;gap:.55rem;margin-right:auto}.topbar span{color:var(--muted);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase}.topbar b,.topbar strong{font-size:.92rem}.topbar small{color:var(--muted);font-size:.7rem}.status-dot{width:.58rem;height:.58rem;border-radius:99px;background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.12)}.status-dot.healthy{background:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:.8rem}.config-group{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.9rem}.config-group h2{margin:0 0 .6rem;font-size:.72rem}.config-group dl{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.38rem .7rem;font-size:.8rem}.config-group dt{color:var(--muted)}.config-group dd{text-align:right}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.overview-grid,.config-grid{grid-template-columns:1fr}.topbar-status{margin-right:0;width:100%}}@media(max-width:700px){html,body{font-size:12px}.content{padding:1.25rem}.topbar{gap:.9rem}.topbar-status{width:100%}}
+.page-header{display:none}:root{--sidebar-width:176px}html,body{font-size:12px}.brand{font-size:1.15rem}.brand-sub,.nav-label{font-size:.72rem}.nav-link{font-size:.9rem}.content{padding-top:1.7rem}h1{font-size:1.7rem}.cards{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.card strong{font-size:1.45rem}.card p,.card small{font-size:.8rem}table{font-size:.9rem}th{font-size:.72rem}.sat-symbol{font-style:normal;margin-left:.08em}.market-changes{display:flex;gap:.35rem;flex-wrap:wrap;color:var(--muted);font-size:.7rem;margin:.4rem 0}.market-changes b{color:var(--text);margin-right:.1rem}.sidebar-controls{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;padding:0 .5rem}.sidebar-control-group{display:flex;flex-direction:column;gap:.35rem}.denom-controls{display:flex;gap:.35rem}.denom-toggle,.pnl-toggle,.period-toggle{border:1px solid var(--border-hover);border-radius:4px;color:var(--muted);padding:.18rem .42rem;text-decoration:none;font-size:.74rem}.denom-toggle:hover,.denom-toggle.active,.pnl-toggle:hover,.pnl-toggle.active,.period-toggle:hover,.period-toggle.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}.position-card.long{border-color:var(--accent)}.position-card.short{border-color:#f87171}.position-card.short strong{color:#f87171}.position-card.flat{opacity:.62}.pnl-card small{display:flex;gap:.3rem;align-items:center;flex-wrap:wrap}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1.2rem}.overview-grid .full-width{grid-column:1/-1}.overview-grid .full-width .table-wrap{width:100%}.activity-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 1.2rem}.activity-grid .table-wrap{width:100%}.compact-table .table-wrap{width:max-content;max-width:100%}.compact-table table{width:auto}.copy-id{border:1px solid var(--border-hover);border-radius:3px;background:var(--surface-2);color:var(--muted);font:inherit;font-size:.72rem;padding:.08rem .3rem;cursor:pointer}.copy-id:hover{border-color:var(--accent);color:var(--accent)}.period-controls{display:flex;gap:.35rem;flex-wrap:wrap;margin:-.15rem 0 1rem}.pagination{display:flex;align-items:center;gap:.65rem;margin-top:.65rem;color:var(--muted)}.pagination a{color:var(--accent);text-decoration:none}.topbar{display:flex;align-items:center;gap:1.4rem;flex-wrap:wrap;border-bottom:1px solid var(--border);padding:0 0 1rem;margin-bottom:1.7rem}.topbar-status,.topbar-metric,.topbar-market{display:flex;flex-direction:column;gap:.1rem}.topbar-status{flex-direction:row;align-items:center;gap:.55rem;margin-right:auto}.topbar span{color:var(--muted);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase}.topbar b,.topbar strong{font-size:.92rem}.topbar small{color:var(--muted);font-size:.7rem}.status-dot{width:.58rem;height:.58rem;border-radius:99px;background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.12)}.status-dot.healthy{background:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:.8rem}.config-group{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.9rem}.config-group h2{margin:0 0 .6rem;font-size:.72rem}.config-group dl{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.38rem .7rem;font-size:.8rem}.config-group dt{color:var(--muted)}.config-group dd{text-align:right}.strategy-explainer{max-width:76rem}.strategy-explainer p{color:var(--muted);margin:.65rem 0;line-height:1.7}.strategy-explainer b{color:var(--text)}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.overview-grid,.config-grid{grid-template-columns:1fr}.topbar-status{margin-right:0;width:100%}}@media(max-width:700px){html,body{font-size:12px}.content{padding:1.25rem}.topbar{gap:.9rem}.topbar-status{width:100%}}
+.pnl-page-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.25rem}.pnl-page-heading h1{margin:0}.pnl-basis-actions{display:flex;align-items:center;justify-content:flex-end;gap:.4rem;flex-wrap:wrap}@media(max-width:700px){.pnl-page-heading{align-items:flex-start;flex-direction:column}.pnl-basis-actions{justify-content:flex-start}}
 .config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
 </style>"""
 
@@ -1481,6 +1736,7 @@ def _detail_page(
     exchange: ExchangeSnapshot | None,
     pnl_granularity: str = "daily",
     pnl_page: int = 1,
+    pnl_basis: str = "actual",
 ) -> str:
     run_id = int(run["id"])
     suffix = f" · {tf}" if tf else ""
@@ -1519,6 +1775,7 @@ def _detail_page(
                 "trading_fees",
                 "funding",
                 "net_pl",
+                "net_return",
             ),
         )
     if page == "funding":
@@ -1548,57 +1805,124 @@ def _detail_page(
     if page == "pnl":
         price, _, _ = _market_context(db_path)
         positions = _open_positions(db_path, _orders(db_path), price, exchange)
+        constant = pnl_basis == "constant"
+        nominal_usd = CONSTANT_NOTIONAL_USD
+        raw_summary = (
+            _constant_notional_pnl_summary(db_path, positions, nominal_usd, price)
+            if constant
+            else _pnl_summary(db_path, positions)
+        )
         summary = [
             {
                 "period": row["period"],
-                "gross_pnl": _format_signed_amount(row["gross"], denomination, price),
-                "trading_fees": _format_signed_amount(row["trading_fees"], denomination, price),
-                "funding_pnl": _format_signed_amount(row["funding"], denomination, price),
-                "net": _format_signed_amount(row["net"], denomination, price),
+                "gross_pnl": (
+                    _signed_usd_html(row["gross"])
+                    if constant
+                    else _format_signed_amount(row["gross"], denomination, price)
+                ),
+                "trading_fees": (
+                    _signed_usd_html(row["trading_fees"])
+                    if constant
+                    else _format_signed_amount(row["trading_fees"], denomination, price)
+                ),
+                "funding_pnl": (
+                    _signed_usd_html(row["funding"])
+                    if constant
+                    else _format_signed_amount(row["funding"], denomination, price)
+                ),
+                "net": (
+                    _signed_usd_html(row["net"])
+                    if constant
+                    else _format_signed_amount(row["net"], denomination, price)
+                ),
+                "portfolio_return": (
+                    _signed_percent_html(row["portfolio_return_pct"]) if constant else None
+                ),
             }
-            for row in _pnl_summary(db_path, positions)
+            for row in raw_summary
         ]
         labels = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}
         controls = "".join(
             f'<a class="period-toggle{" active" if key == pnl_granularity else ""}" '
-            f'href="/pnl?{urlencode({"denom": denomination, "pnl_granularity": key})}">{label}</a>'
+            f'href="/pnl?{urlencode({"denom": denomination, "pnl_granularity": key, **({"pnl_basis": "constant"} if constant else {})})}">{label}</a>'
             for key, label in labels.items()
         )
-        calendar_rows = _calendar_pnl_rows(db_path, pnl_granularity)
+        calendar_rows = (
+            _constant_notional_calendar_pnl_rows(db_path, pnl_granularity, nominal_usd)
+            if constant
+            else _calendar_pnl_rows(db_path, pnl_granularity)
+        )
         calendar_rows, current_page, total_pages = _paginate(calendar_rows, pnl_page, 12)
         display_rows = [
-            {"period": row["period"], "net": _format_signed_amount(row["net"], denomination, price)}
+            {
+                "period": row["period"],
+                "net": (
+                    _signed_usd_html(row["net"])
+                    if constant
+                    else _format_signed_amount(row["net"], denomination, price)
+                ),
+            }
             for row in calendar_rows
         ]
-        strategy_quality, strategy_risk = _strategy_performance_rows(db_path, denomination, price)
+        strategy_quality, strategy_risk = _strategy_performance_rows(
+            db_path, denomination, price, nominal_usd if constant else None
+        )
+        summary_columns = (
+            ("period", "gross_pnl", "trading_fees", "funding_pnl", "net", "portfolio_return")
+            if constant
+            else ("period", "gross_pnl", "trading_fees", "funding_pnl", "net")
+        )
+        quality_columns = (
+            (
+                "timeframe",
+                "closed_trades",
+                "win_rate",
+                "avg_winner",
+                "avg_loser",
+                "payoff_ratio",
+                "profit_factor",
+                "cumulative_return",
+            )
+            if constant
+            else (
+                "timeframe",
+                "closed_trades",
+                "win_rate",
+                "avg_winner",
+                "avg_loser",
+                "payoff_ratio",
+                "profit_factor",
+            )
+        )
+        replay_label = f" · ${nominal_usd:g} per trade" if constant else ""
         return (
             '<div class="pnl-grid">'
             + _table(
-                "Rolling P&L",
+                "Rolling P&L" + replay_label,
                 summary,
-                ("period", "gross_pnl", "trading_fees", "funding_pnl", "net"),
+                summary_columns,
                 compact=True,
             )
             + '<div class="calendar-pnl">'
-            + _periodic_pnl_table(f"{labels[pnl_granularity]} P&L", display_rows, controls)
-            + _pagination(current_page, total_pages, denomination, pnl_granularity)
+            + _periodic_pnl_table(
+                f"{labels[pnl_granularity]} P&L{replay_label}", display_rows, controls
+            )
+            + _pagination(
+                current_page,
+                total_pages,
+                denomination,
+                pnl_granularity,
+                pnl_basis,
+            )
             + "</div></div>"
             + _table(
-                "Strategy · trade quality",
+                "Strategy · trade quality" + replay_label,
                 strategy_quality,
-                (
-                    "timeframe",
-                    "closed_trades",
-                    "win_rate",
-                    "avg_winner",
-                    "avg_loser",
-                    "payoff_ratio",
-                    "profit_factor",
-                ),
+                quality_columns,
                 compact=True,
             )
             + _table(
-                "Strategy · risk & holding",
+                "Strategy · risk & holding" + replay_label,
                 strategy_risk,
                 (
                     "timeframe",
@@ -1613,7 +1937,7 @@ def _detail_page(
                 compact=True,
             )
             + _table(
-                "Account profitability",
+                "Account profitability · actual",
                 _account_profitability_rows(exchange, denomination, price),
                 (
                     "equity",
@@ -1625,21 +1949,27 @@ def _detail_page(
                 ),
                 compact=True,
             )
-            + '<p class="muted account-note">Account return is cash-flow adjusted, not time-weighted or annualised.</p>'
         )
     if page == "runs":
-        rows = [
-            dict(row)
-            for row in _query(
-                db_path,
-                "SELECT id, mode, status, started_at, ended_at, strategy_name FROM runs "
-                "ORDER BY CASE WHEN mode = 'live' AND status = 'running' THEN 0 ELSE 1 END, "
-                "started_at DESC, id DESC LIMIT 100",
-            )
+        active_details = [
+            {
+                "run": run_id,
+                "mode": run.get("mode", "-"),
+                "status": run.get("status", "-"),
+                "started_at": run.get("started_at", "-"),
+                "strategy": str(run.get("strategy_name", "-")).rsplit(".", maxsplit=1)[-1],
+            }
         ]
-        return _table(
-            "Run history", rows, ("id", "mode", "status", "started_at", "ended_at", "strategy_name")
-        ) + _active_config(run)
+        return (
+            _table(
+                "Active run",
+                active_details,
+                ("run", "mode", "status", "started_at", "strategy"),
+                compact=True,
+            )
+            + _active_config(run)
+            + _strategy_explainer(run)
+        )
     if page == "health":
         price, _, last_bar = _market_context(db_path)
         risk_events = [
@@ -1672,6 +2002,7 @@ def _render(
     pnl_window: str = "7days",
     pnl_granularity: str = "daily",
     pnl_page: int = 1,
+    pnl_basis: str = "actual",
 ) -> str:
     run: dict[str, object] | None = None
     exchange: ExchangeSnapshot | None = None
@@ -1698,9 +2029,16 @@ def _render(
                 "health": "Health",
             }[page]
             suffix = f" · {tf}" if tf else ""
+            heading = (
+                '<div class="pnl-page-heading"><h1>P&amp;L</h1>'
+                + _pnl_basis_controls(denomination, pnl_granularity, pnl_basis)
+                + "</div>"
+                if page == "pnl"
+                else f"<h1>{title}{suffix}</h1>"
+            )
             content = (
                 _presentation_style()
-                + f"<h1>{title}{suffix}</h1>"
+                + heading
                 + _detail_page(
                     db_path,
                     run,
@@ -1710,6 +2048,7 @@ def _render(
                     exchange,
                     pnl_granularity,
                     pnl_page,
+                    pnl_basis,
                 )
             )
     except sqlite3.Error as exc:
@@ -1728,6 +2067,8 @@ def _render(
                 query["pnl_granularity"] = pnl_granularity
             if pnl_page != 1:
                 query["pnl_page"] = str(pnl_page)
+            if pnl_basis == "constant":
+                query["pnl_basis"] = "constant"
         if target in filterable_pages and target_tf:
             query["tf"] = target_tf
         return f"{path}?{urlencode(query)}" if query else path
@@ -1832,6 +2173,8 @@ def _render(
                 query["pnl_granularity"] = pnl_granularity
             if pnl_page != 1:
                 query["pnl_page"] = str(pnl_page)
+            if pnl_basis == "constant":
+                query["pnl_basis"] = "constant"
         if page in filterable_pages and tf:
             query["tf"] = tf
         path = "/" if page == "overview" else f"/{page}"
@@ -1887,6 +2230,7 @@ def main() -> None:
                 denomination = query.get("denom", ["sats"])[0]
                 pnl_window = query.get("pnl_window", ["7days"])[0]
                 pnl_granularity = query.get("pnl_granularity", ["daily"])[0]
+                pnl_basis = query.get("pnl_basis", ["actual"])[0]
                 try:
                     pnl_page = int(query.get("pnl_page", ["1"])[0])
                 except ValueError:
@@ -1897,8 +2241,17 @@ def main() -> None:
                     pnl_window = "7days"
                 if pnl_granularity not in {"daily", "weekly", "monthly"}:
                     pnl_granularity = "daily"
+                if pnl_basis not in {"actual", "constant"}:
+                    pnl_basis = "actual"
                 payload = _render(
-                    args.db, page, tf, denomination, pnl_window, pnl_granularity, pnl_page
+                    args.db,
+                    page,
+                    tf,
+                    denomination,
+                    pnl_window,
+                    pnl_granularity,
+                    pnl_page,
+                    pnl_basis,
                 ).encode()
                 content_type = "text/html; charset=utf-8"
             else:
