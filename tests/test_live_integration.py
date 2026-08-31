@@ -58,7 +58,7 @@ async def test_live_engine_with_fake_api():
     with tempfile.TemporaryDirectory() as td:
         # Use a slice of the real 2y fixture that contains known MA-crosses
         # (around the Nov 5, 2024 area per the user's chart observations).
-        src = Path("/home/james/srv/tradingbot/data/cache/btcusdt_perp_1m_2y.parquet")
+        src = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1m_2y.parquet"
         import pandas as pd
         df = pd.read_parquet(src)
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
@@ -133,7 +133,7 @@ async def test_live_engine_with_fake_api():
 async def test_live_engine_per_tf_isolation():
     """1d and 4h signals should be processed independently through LiveExecutor."""
     with tempfile.TemporaryDirectory() as td:
-        src = Path("/home/james/srv/tradingbot/data/cache/btcusdt_perp_1m_2y.parquet")
+        src = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1m_2y.parquet"
         import pandas as pd
         df = pd.read_parquet(src)
         df["ts"] = pd.to_datetime(df["ts"], utc=True)

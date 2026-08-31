@@ -25,20 +25,23 @@ consecutive failures emit an error-level journal event; recovery is logged.
 
 | Purpose | Example value |
 |---|---|
-| Project checkout | `/opt/lnmarkets-bot` (`<project-dir>`) |
-| Trading configuration | `/etc/lnmbot/env` |
-| Dashboard read-only credentials | `/etc/lnmbot/.env.dashboard` |
+| Editable source | `/home/james/src/lnmbot` |
+| Immutable trader release | `/usr/local/lib/lnmbot/<release>` |
+| Immutable dashboard release | `/usr/local/lib/lnmbot-dashboard/<release>` |
+| Trading configuration | `/etc/lnmbot/trader.env` |
+| Dashboard read-only credentials | `/etc/lnmbot-dashboard/dashboard.env` |
 | Bot database | `/var/lib/lnmbot/lnmarkets.sqlite` |
 | Halt file | `/var/lib/lnmbot/HALT` |
-| Service account | `lnmbot` (`<service-user>`) |
+| Trading service account | `lnmbot` |
+| Dashboard service account | `lnmbot-dashboard` |
 | Trading service | `lnmbot.service` |
 | Dashboard service | `lnmbot-dashboard.service` |
 
-The checked-in service templates contain one operator-specific checkout path
-and user.  Before installing them, replace `User=`, `Group=`,
-`WorkingDirectory=`, both `ExecStart=` paths, `EnvironmentFile=`, and
-`ReadWritePaths=` with the equivalents for this host.  Use the example layout
-above or another consistent layout.
+The checked-in service templates deliberately contain the invalid placeholders
+`@TRADER_RELEASE_DIR@` and `@DASHBOARD_RELEASE_DIR@`. Render those placeholders
+to two independently built immutable release directories before installation.
+Never point either production service at the editable source checkout, and do
+not switch the trader merely because a dashboard release is ready.
 
 ## 3. Configuration reference
 
@@ -110,16 +113,18 @@ STRATEGY_CHOP_HIGH_SIZE_MULTIPLIER=0.5
 Install dependencies from the checkout:
 
 ```bash
-cd <project-dir>
-uv sync --extra dev --extra backfill
+cd /home/james/src/lnmbot
+uv sync --extra dev --extra dashboard --extra backfill
 ```
 
 Create the required directories and trading configuration:
 
 ```bash
-sudo install -d -o <service-user> -g <service-user> -m 700 /etc/lnmbot /var/lib/lnmbot
-sudo install -o <service-user> -g <service-user> -m 600 .env.example /etc/lnmbot/env
-sudoedit /etc/lnmbot/env
+sudo install -d -o root -g lnmbot -m 750 /etc/lnmbot
+sudo install -d -o root -g lnmbot-dashboard -m 750 /etc/lnmbot-dashboard
+sudo install -d -o lnmbot -g lnmbot-db -m 750 /var/lib/lnmbot
+sudo install -o root -g lnmbot -m 640 .env.example /etc/lnmbot/trader.env
+sudoedit /etc/lnmbot/trader.env
 ```
 
 Set `LNM_NETWORK`, credentials, sizing, and conservative hard caps before
@@ -128,7 +133,7 @@ continuing.  Do not put API credentials in the checkout or Git.
 Verify authenticated access without placing an order:
 
 ```bash
-uv run python scripts/smoke_isolated_trade.py --env /etc/lnmbot/env
+uv run python scripts/smoke_isolated_trade.py --env /etc/lnmbot/trader.env
 ```
 
 It must report the account and `running_isolated=0`.  If a trade is already
@@ -139,7 +144,7 @@ For an explicit tiny mainnet order-path test, this opens exactly one USD 1
 contract at 1x and immediately closes it:
 
 ```bash
-uv run python scripts/smoke_isolated_trade.py --env /etc/lnmbot/env \
+uv run python scripts/smoke_isolated_trade.py --env /etc/lnmbot/trader.env \
   --execute --confirm-mainnet
 ```
 
@@ -148,7 +153,7 @@ restored into a fresh executor and closed.  Run it only with no other isolated
 trades running:
 
 ```bash
-uv run python scripts/smoke_live_reconcile.py --env /etc/lnmbot/env \
+uv run python scripts/smoke_live_reconcile.py --env /etc/lnmbot/trader.env \
   --execute --confirm-mainnet
 ```
 
@@ -185,7 +190,7 @@ Enter exactly:
 ```ini
 [Service]
 ExecStart=
-ExecStart=<project-dir>/.venv/bin/python <project-dir>/scripts/run_live.py --env /etc/lnmbot/env --allow-orders --confirm-mainnet
+ExecStart=<trader-release>/.venv/bin/python <trader-release>/scripts/run_live.py --env /etc/lnmbot/trader.env --allow-orders --confirm-mainnet
 ```
 
 Then reload and restart:
@@ -208,17 +213,18 @@ LN Markets key restricted to **Read** permission; never copy the trading key
 into its env file.
 
 ```bash
-sudo install -m 600 scripts/lnmbot-dashboard.env.example /etc/lnmbot/.env.dashboard
-sudoedit /etc/lnmbot/.env.dashboard
+sudo install -o root -g lnmbot-dashboard -m 640 \
+  scripts/lnmbot-dashboard.env.example /etc/lnmbot-dashboard/dashboard.env
+sudoedit /etc/lnmbot-dashboard/dashboard.env
 sudo systemctl enable --now lnmbot-dashboard
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8082/healthz
 ```
 
-The repository unit listens on `127.0.0.1:8080`.  If you intentionally choose
-a different port in the installed unit, use that port for the health check and
-SSH tunnel.  The dashboard uses the separate key for authoritative account
-snapshots and a public WebSocket for the visual BTC/USD ticker; neither path
-can submit orders.
+The Optiplex unit listens on wildcard port `8082`, while the host firewall
+admits it only from the intended LAN. A loopback bind plus SSH tunnel is a good
+default on hosts without that firewall boundary. The dashboard uses the
+separate key for authoritative account snapshots and a public WebSocket for
+the visual BTC/USD ticker; neither path can submit orders.
 
 ## 6. Normal operation
 
@@ -234,19 +240,19 @@ journalctl -u lnmbot-dashboard -n 100 --no-pager
 Use an SSH tunnel for off-host access:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 <bot-host>
+ssh -L 8082:127.0.0.1:8082 <bot-host>
 ```
 
 ### Change configuration
 
 1. Inspect any running positions in the dashboard and LN Markets.
-2. Edit `/etc/lnmbot/env`.
+2. Edit `/etc/lnmbot/trader.env`.
 3. Restart `lnmbot`.
 4. Confirm a fresh run starts, reconciles positions, and displays the intended
    configuration on the dashboard's Runs page.
 
 ```bash
-sudoedit /etc/lnmbot/env
+sudoedit /etc/lnmbot/trader.env
 sudo systemctl restart lnmbot
 journalctl -u lnmbot -n 80 --no-pager
 ```
@@ -293,7 +299,7 @@ position manually if required.  To permit a later restart, remove the file:
 sudo rm /var/lib/lnmbot/HALT
 ```
 
-Alternatively set `HALTED=1` in `/etc/lnmbot/env` and restart.  Clear it
+Alternatively set `HALTED=1` in `/etc/lnmbot/trader.env` and restart.  Clear it
 before resuming.
 
 ### If the service is down with an open position
@@ -323,8 +329,8 @@ and must not run alongside the production service using the same account.
 Use a separate database for paper-only experiments:
 
 ```bash
-STORAGE_DB_PATH="$HOME/srv/tradingbot/runs/test-5m.sqlite" \
-  uv run python scripts/run_live.py --env /etc/lnmbot/env --test-5m
+STORAGE_DB_PATH="$HOME/src/lnmbot/runs/test-5m.sqlite" \
+  uv run python scripts/run_live.py --env /etc/lnmbot/trader.env --test-5m
 ```
 
 It stays observe-only without `--allow-orders`.  Mainnet execution also needs

@@ -5,28 +5,67 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=james
-Group=james
-WorkingDirectory=/home/james/srv/tradingbot
-EnvironmentFile=/etc/lnmbot/env
-# Observe-only by default. Add --allow-orders only after the dedicated
-# reconciliation smoke test; mainnet additionally requires --confirm-mainnet.
-ExecStart=/home/james/srv/tradingbot/.venv/bin/python /home/james/srv/tradingbot/scripts/run_live.py --env /etc/lnmbot/env
+User=lnmbot
+Group=lnmbot
+SupplementaryGroups=lnmbot-db
+WorkingDirectory=@TRADER_RELEASE_DIR@
+EnvironmentFile=/etc/lnmbot/trader.env
+Environment=HOME=/nonexistent
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/local/bin/sqlite3 /var/lib/lnmbot/lnmarkets.sqlite "BEGIN IMMEDIATE; ROLLBACK; PRAGMA quick_check;"
+# Deliberately observe-only. Production requires a reviewed unit override that
+# adds both --allow-orders and --confirm-mainnet.
+ExecStart=/usr/bin/env STORAGE_DB_PATH=/var/lib/lnmbot/lnmarkets.sqlite @TRADER_RELEASE_DIR@/.venv/bin/python @TRADER_RELEASE_DIR@/scripts/run_live.py --env /etc/lnmbot/trader.env
 Restart=always
 RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lnmbot
 
-# Hardening
 NoNewPrivileges=true
+UMask=0027
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=false
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=@TRADER_RELEASE_DIR@
 ReadWritePaths=/var/lib/lnmbot
-Environment=STORAGE_DB_PATH=/var/lib/lnmbot/lnmarkets.sqlite
-
-# Resource limits
+InaccessiblePaths=-/etc/lnmbot/.env
+InaccessiblePaths=-/etc/lnmbot-dashboard
+InaccessiblePaths=-/etc/lnd
+InaccessiblePaths=-/etc/bitcoin
+InaccessiblePaths=-/etc/btcpay
+InaccessiblePaths=-/etc/nbxplorer
+InaccessiblePaths=-/etc/comstac
+InaccessiblePaths=-/var/lib/lnd
+InaccessiblePaths=-/var/lib/lndg
+InaccessiblePaths=-/var/lib/btcpayserver
+InaccessiblePaths=-/var/lib/nbxplorer
+InaccessiblePaths=-/var/lib/vaultwarden
+InaccessiblePaths=-/var/lib/transmission/config
+InaccessiblePaths=-/var/lib/comstac
+InaccessiblePaths=-/data/bitcoin
+InaccessiblePaths=-/data/electrs
+InaccessiblePaths=-/data/security-backups
 MemoryMax=512M
 CPUQuota=50%
 

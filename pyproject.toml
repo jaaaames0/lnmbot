@@ -23,6 +23,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dashboard = [
+    # The dashboard reads cached Parquet history for market context and MA warmup.
+    "pandas>=2.2",
+    "pyarrow>=15",
+]
 backfill = [
     # Used by scripts/backfill_binance.py
     "pandas>=2.2",

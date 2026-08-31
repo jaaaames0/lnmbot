@@ -33,8 +33,9 @@ presentation-only.
   the executor checks remote running trades and stops rather than blindly
   retrying.
 - `HALTED=1` or the presence of `HALT_FILE` prevents new processing.
-- The dashboard is read-only, binds to loopback, and should use a separate LN
-  Markets API key with **Read** permission only.
+- The dashboard is read-only and should use a separate LN Markets API key with
+  **Read** permission only. Its production listener is restricted to the LAN by
+  the host firewall; a loopback bind is preferred where LAN access is not needed.
 
 This is risk-control infrastructure, not a guarantee against market loss,
 exchange failure, liquidation, or operational mistakes.
@@ -67,15 +68,15 @@ systemctl status lnmbot-dashboard
 journalctl -u lnmbot-dashboard -f
 ```
 
-The dashboard is served on the loopback host and port configured in its
-systemd unit (the template uses `127.0.0.1:8080`).  From another machine, use
-an SSH tunnel rather than exposing it publicly:
+The dashboard is served on the host and port configured in its systemd unit.
+The Optiplex deployment uses firewall-restricted LAN port `8082`; for a
+loopback deployment, use an SSH tunnel rather than exposing it publicly:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 <bot-host>
+ssh -L 8082:127.0.0.1:8082 <bot-host>
 ```
 
-Then open `http://127.0.0.1:8080` locally.  It shows combined account context
+Then open `http://127.0.0.1:8082` locally.  It shows combined account context
 plus timeframe-specific signals, positions, trade history, funding, P&L,
 active configuration, and health.  It cannot enable trading or change sizing.
 

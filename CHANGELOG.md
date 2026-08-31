@@ -5,6 +5,21 @@ UTC and entries describe deployed behaviour rather than every internal refactor.
 
 ## Unreleased
 
+### Dashboard operational context
+
+- Add fixed-notional P&L replay, return-on-notional, cool-off visibility, and
+  a plain-language explanation of the active strategy configuration.
+- Keep actual P&L as the accounting view while allowing strategy quality to be
+  compared across sizing and deposit changes.
+
+### Service and source hygiene
+
+- Avoid redundant database initialization when the live runner supplies its
+  already-initialized recorder.
+- Separate editable source from immutable trader and dashboard releases, and
+  remove retired `~/srv/tradingbot` paths from current templates and tests.
+- Correct the project copyright holder name.
+
 ### Restart-safe indicator and execution recovery
 
 - Bootstrap a new live strategy from 100 days of LN Markets 1-minute candles,

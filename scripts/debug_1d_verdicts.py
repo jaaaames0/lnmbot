@@ -31,7 +31,7 @@ def ema_seed_then_iterate(closes: deque, alpha: float = 2.0 / 22.0):
 
 
 def main() -> None:
-    parquet = Path("/home/james/srv/tradingbot/data/cache/btcusdt_perp_1m_6m.parquet")
+    parquet = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1m_6m.parquet"
     df = pd.read_parquet(parquet)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts")
