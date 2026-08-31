@@ -57,10 +57,13 @@ async def run_paper(
     """
     if run_mode not in {"paper", "live"}:
         raise ValueError(f"unsupported run mode: {run_mode!r}")
-    engine = make_engine(cfg.storage_db_path)
-    init_schema(engine)
-    factory = make_session_factory(engine)
-    recorder = recorder_override or Recorder(factory)
+    if recorder_override is None:
+        engine = make_engine(cfg.storage_db_path)
+        init_schema(engine)
+        factory = make_session_factory(engine)
+        recorder = Recorder(factory)
+    else:
+        recorder = recorder_override
     limits = limits_from_config(cfg)
     if executor_factory is None:
         executor = PaperFillExecutor(recorder=recorder, run_id=-1)
