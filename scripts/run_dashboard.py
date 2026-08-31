@@ -767,7 +767,7 @@ def _strategy_tolerance(run: dict[str, object]) -> float:
 def _binance_hourly_close_history() -> pd.DataFrame:
     """Small historical close series for dashboard-only context and MA warmup."""
     if not BINANCE_HOURLY_CACHE.exists():
-        return pd.DataFrame(columns=("close",))
+        return pd.DataFrame(columns=("close",), index=pd.DatetimeIndex([], tz="UTC"))
     frame = pd.read_parquet(BINANCE_HOURLY_CACHE, columns=["ts", "close"])
     frame["ts"] = pd.to_datetime(frame["ts"], utc=True)
     return frame.set_index("ts").sort_index()[["close"]]
@@ -777,7 +777,7 @@ def _binance_hourly_close_history() -> pd.DataFrame:
 def _binance_daily_close_history() -> pd.DataFrame:
     """Tiny daily fallback when the hourly cache predates the bot's start."""
     if not BINANCE_DAILY_CACHE.exists():
-        return pd.DataFrame(columns=("close",))
+        return pd.DataFrame(columns=("close",), index=pd.DatetimeIndex([], tz="UTC"))
     frame = pd.read_parquet(BINANCE_DAILY_CACHE, columns=["ts", "close"])
     frame["ts"] = pd.to_datetime(frame["ts"], utc=True) + pd.Timedelta(days=1)
     return frame.set_index("ts").sort_index()[["close"]]

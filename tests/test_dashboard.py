@@ -52,7 +52,7 @@ def test_signals_span_restart_runs_by_default(tmp_path):
     assert dashboard._signals(db_path, tf="4h")[0]["timeframe"] == "4h"
 
 
-def test_market_context_spans_restart_runs(tmp_path):
+def test_market_context_spans_restart_runs_without_optional_binance_cache(tmp_path, monkeypatch):
     db_path = tmp_path / "market.sqlite"
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -67,6 +67,10 @@ def test_market_context_spans_restart_runs(tmp_path):
         )
 
     dashboard = _dashboard_module()
+    monkeypatch.setattr(dashboard, "BINANCE_HOURLY_CACHE", tmp_path / "missing-hourly.parquet")
+    monkeypatch.setattr(dashboard, "BINANCE_DAILY_CACHE", tmp_path / "missing-daily.parquet")
+    dashboard._binance_hourly_close_history.cache_clear()
+    dashboard._binance_daily_close_history.cache_clear()
 
     price, changes, last_bar = dashboard._market_context(db_path)
     assert price == 101_000.0
