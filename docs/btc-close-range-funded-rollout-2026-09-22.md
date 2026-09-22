@@ -1,7 +1,6 @@
 # BTC close-range funded rollout
 
-Date: 2026-09-22. Status: source implementation and read-only production
-rehearsal complete; live service not yet changed.
+Date: 2026-09-22. Status: accepted live rollout.
 
 ## Accepted operating model
 
@@ -56,6 +55,8 @@ restore its lifetime slot.
   `strategy_pnl_events` table. The old release tolerates these additions.
 - The dashboard keeps the MA cards, adds strategy/slot ownership to positions
   and journals, and reports signed live attribution separately.
+- Run audit metadata excludes LN Markets API credentials. The rollout scrubbed
+  the three credential keys from all 48 historical rows that contained them.
 
 `STRATEGY_BREAKOUT_ENABLED` defaults to false. The rollout additionally sets
 the unit to 100 and leverage to 5 and points the service at release-contained
@@ -80,39 +81,29 @@ suite passes. Ruff and strict mypy pass on the new runtime. The repository's
 existing live-integration/full-suite paths can hang after their deterministic
 cases; they are not counted as successful evidence.
 
-## Deployment transaction
+## Accepted deployment
 
-Authoritative inputs and state:
+The sole funded executor now runs from
+`/usr/local/lib/lnmbot/prod-20260922.3-g12d9baac7b2a`. The dashboard runs from
+`/usr/local/lib/lnmbot-dashboard/prod-20260922.2-g70b2486cdc66`. Both retain
+their locked identities, protected environments and shared database boundary.
 
-- source: `/home/james/src/lnmbot`;
-- trader unit: `/etc/systemd/system/lnmbot.service`;
-- protected environment: `/etc/lnmbot/trader.env`;
-- mutable database: `/var/lib/lnmbot/lnmarkets.sqlite`;
-- current rollback release:
-  `/usr/local/lib/lnmbot/prod-20260901.1-gcc3abc36a1f1`;
-- dashboard unit/release remain a separate second transaction.
+Acceptance proved that both services are active with zero restarts; the
+39-row order journal did not change; the existing remote trade exactly
+reconciles to `ma_cross_primary:4h`; both strategy snapshots restored and
+checkpointed; historical campaign `20260822L` restored with four lifetime
+units and no venue ownership; SQLite passes `quick_check`; and no startup or
+backdated order was submitted. Core, LND, the backup timer and infrastructure
+monitor remained active, and a fresh encrypted backup completed successfully.
 
-Before the switch, take a consistent SQLite backup and record its integrity and
-hash, current unit definition, PID/restart count, latest MA snapshot and exact
-local/remote open-trade set. Export a clean reviewed commit into a new empty,
-root-owned release, build dependencies offline from the existing locked set,
-and validate import/help/schema against a disposable copy.
+The dashboard's first editable-package candidate failed inside its systemd
+sandbox. Its exercised rollback restored the old release before the corrected
+non-editable package was accepted. Root-only evidence is retained at
+`/data/security-backups/lnmbot-breakout-rollout-20260922T133100Z`,
+`/data/security-backups/lnmbot-dashboard-multistrategy-20260922T134900Z` and
+`/data/security-backups/lnmbot-credential-redaction-20260922T135824Z`.
 
-Switch only `lnmbot.service`, retaining `--allow-orders --confirm-mainnet` and
-the protected environment. Startup must map every legacy open trade to MA,
-restore the MA snapshot, reconstruct breakout historical occupancy and create
-no startup order. Acceptance requires an active service, one funded executor,
-unchanged pre-existing remote trade IDs/count, a current portfolio run and both
-strategy snapshots, fresh account/candle writes, zero unknown trades, no
-duplicate order and an unchanged Core/LND process baseline.
-
-Rollback before any breakout fill is to restore the prior unit and environment
-and restart it; the additive schema is backward-compatible. After a breakout
-trade exists, the prior MA-only runtime cannot manage it. Keep the integrated
-executor active or deliberately drain every breakout unit before reverting.
-Never restore the database merely to undo an additive schema migration.
-
-After trader acceptance, deploy the dashboard from its own immutable release,
-then update the system topology, operator handbook, monitor expectations and
-LNMarkets backup restore evidence to cover the added table and seed/config
-files.
+The old MA-only runtime cannot manage K-slot positions. After any breakout
+fill, keep the integrated executor active or deliberately drain every breakout
+unit before reverting. Never restore the database merely to undo the additive
+schema.
