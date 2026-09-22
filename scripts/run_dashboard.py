@@ -28,6 +28,8 @@ from lnmarkets_bot.portfolio.store import read_overview
 
 TIMEFRAMES = ("1d", "4h")
 MA_STRATEGY_NAME = "lnmarkets_bot.strategy.ma_cross.MaCross"
+BREAKOUT_STRATEGY_NAME = "lnmarkets_bot.strategy.close_range_live.CloseRangeLive"
+BREAKOUT_INSTANCE_ID = "btc_close_range_v1"
 CONSTANT_NOTIONAL_USD = 100.0
 BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1h_4y.parquet"
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
@@ -466,7 +468,7 @@ def _position_card(
         )
     if position is None:
         return (
-            f'<article class="card position-card flat"><p>{timeframe} position</p>'
+            f'<article class="card position-card flat"><p>MA {timeframe} position</p>'
             f"<strong>{'Cool-off active' if remaining else 'Flat'}</strong>"
             f"<small>{cooldown_detail or 'Ready for the next verdict transition'}</small></article>"
         )
@@ -474,7 +476,7 @@ def _position_card(
     estimate = _signed_amount_html(position["estimated_unrealized_sats"], denomination, btc_price)
     move_display = _signed_percent_html(position.get("position_change_pct"))
     return (
-        f'<article class="card position-card {side}"><p>{timeframe} position</p>'
+        f'<article class="card position-card {side}"><p>MA {timeframe} position</p>'
         "<div class=position-card-body><div class=position-static>"
         f"<strong>{side.title()}</strong><small>${position['contracts']:,} · {position['leverage']}x"
         f"{' · ' + cooldown_detail if cooldown_detail else ''}</small>"
@@ -543,7 +545,12 @@ def _signals(
         item = dict(row)
         meta = _metadata(item.pop("metadata_json"))
         trigger_tf = str(meta.get("trigger_tf") or "")
-        if tf and trigger_tf != tf:
+        strategy = item.get("strategy_instance_id") or "legacy_ma"
+        if tf == "breakout" and strategy != BREAKOUT_INSTANCE_ID:
+            continue
+        if tf in TIMEFRAMES and (
+            trigger_tf != tf or strategy not in {"legacy_ma", "ma_cross_primary"}
+        ):
             continue
         item["timeframe"] = trigger_tf or "-"
         item["strategy"] = item.get("strategy_instance_id") or "legacy_ma"
@@ -586,7 +593,12 @@ def _orders(
     result: list[dict[str, object]] = []
     for row in rows:
         item = dict(row)
-        if tf and item["trigger_tf"] != tf:
+        strategy = item.get("strategy_instance_id") or "legacy_ma"
+        if tf == "breakout" and strategy != BREAKOUT_INSTANCE_ID:
+            continue
+        if tf in TIMEFRAMES and (
+            item["trigger_tf"] != tf or strategy not in {"legacy_ma", "ma_cross_primary"}
+        ):
             continue
         meta = _metadata(item.pop("metadata_json"))
         signal_meta = _metadata(item.pop("signal_metadata_json"))
@@ -610,6 +622,14 @@ def _funding_by_trade(db_path: Path) -> dict[str, int]:
         "SELECT trade_id, SUM(fee_sats) AS fee_sats FROM funding_fees GROUP BY trade_id",
     )
     return {str(row["trade_id"]): int(row["fee_sats"] or 0) for row in rows}
+
+
+def _trade_owners(orders: list[dict[str, object]]) -> dict[str, tuple[str, str]]:
+    return {
+        str(row["trade_id"]): (str(row["strategy"]), str(row["slot"]))
+        for row in orders
+        if row.get("action") == "open" and row.get("trade_id")
+    }
 
 
 def _open_positions(
@@ -910,6 +930,121 @@ def _persisted_cooldowns(db_path: Path) -> dict[str, dict[str, int]]:
     return empty
 
 
+def _persisted_breakout_state(db_path: Path) -> dict[str, object] | None:
+    """Read the funded breakout machine's own snapshot, if it exists."""
+    try:
+        rows = _query(
+            db_path,
+            "SELECT ts, state_json FROM strategy_state_snapshots "
+            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
+            (BREAKOUT_STRATEGY_NAME,),
+        )
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    state = _metadata(rows[0]["state_json"])
+    state["snapshot_ts"] = rows[0]["ts"]
+    return state
+
+
+def _breakout_context(
+    state: dict[str, object] | None, positions: list[dict[str, object]]
+) -> dict[str, object]:
+    owned = [position for position in positions if position.get("strategy") == BREAKOUT_INSTANCE_ID]
+    machine = state.get("machine") if state else None
+    machine = machine if isinstance(machine, dict) else {}
+    campaign = machine.get("campaign")
+    campaign = campaign if isinstance(campaign, dict) else None
+    return {
+        "owned": owned,
+        "campaign": campaign,
+        "last_daily_bar": machine.get("last_bar_ts"),
+        "snapshot_ts": state.get("snapshot_ts") if state else None,
+        "closing_slots": state.get("closing_slots", []) if state else [],
+        "available": state is not None,
+    }
+
+
+def _breakout_card(context: dict[str, object], denomination: str, btc_price: float | None) -> str:
+    campaign = context["campaign"]
+    owned = context["owned"]
+    assert isinstance(owned, list)
+    if not context["available"]:
+        status = "Awaiting state"
+        detail = "No breakout strategy snapshot yet"
+        extra = ""
+        card_class = "flat"
+    elif not isinstance(campaign, dict):
+        status = "State mismatch" if owned else "Flat"
+        detail = (
+            "Funded units exist without a campaign snapshot"
+            if owned
+            else "Watching completed daily candles"
+        )
+        extra = ""
+        card_class = "flat"
+    else:
+        origin = str(campaign.get("origin") or "")
+        side = "Long" if campaign.get("side") == 1 else "Short"
+        campaign_id = html.escape(str(campaign.get("campaign_id") or "—"))
+        boundary = _format_price(campaign.get("boundary"))
+        if origin == "historical":
+            status = "State mismatch" if owned else "Historical campaign"
+            detail = (
+                "Historical state has funded units"
+                if owned
+                else f"{side} {campaign_id} · no funded units · new parent blocked"
+            )
+            card_class = "flat"
+        else:
+            status = f"{side} · {len(owned)}/4 units" if owned else "Closing campaign"
+            notional = sum(int(position.get("contracts") or 0) for position in owned)
+            detail = f"{campaign_id} · ${notional:,} notional"
+            card_class = side.lower() if owned else "flat"
+        extra = (
+            f"<small>Original range {boundary} · "
+            f"{int(campaign.get('lifetime_units') or 0)}/4 lifetime entries</small>"
+        )
+    last_daily = context.get("last_daily_bar")
+    updated = (
+        f"<small>Latest daily candle {html.escape(str(last_daily)[:10])}</small>"
+        if last_daily
+        else ""
+    )
+    pnl = ""
+    if owned:
+        values = [position.get("estimated_unrealized_sats") for position in owned]
+        if all(isinstance(value, int) for value in values):
+            pnl = (
+                "<small>Open P&amp;L "
+                + _signed_amount_html(sum(values), denomination, btc_price)
+                + "</small>"
+            )
+    return (
+        f'<article class="card position-card breakout-card {card_class}">'
+        "<p>Close-range breakout</p>"
+        f"<strong>{html.escape(status)}</strong>"
+        f"<small>{detail}</small>{extra}{pnl}{updated}</article>"
+    )
+
+
+def _breakout_decisions(state: dict[str, object] | None) -> list[dict[str, object]]:
+    decisions = state.get("recent_decisions", []) if state else []
+    if not isinstance(decisions, list):
+        return []
+    return [
+        {
+            "ts": decision.get("ts", "-"),
+            "kind": decision.get("kind", "-"),
+            "slot": f"k{decision['k']}" if decision.get("k") is not None else "-",
+            "reason": decision.get("reason", "-"),
+        }
+        for decision in reversed(decisions[-5:])
+        if isinstance(decision, dict)
+    ]
+
+
 def _ma_levels(db_path: Path, tolerance_pct: float) -> dict[str, dict[str, object]]:
     """Return strategy MA levels, preferring the state used for execution."""
     persisted = _persisted_strategy_levels(db_path, tolerance_pct)
@@ -952,6 +1087,7 @@ def _position_status_rows(
     levels: dict[str, dict[str, object]],
     denomination: str,
     btc_price: float | None,
+    breakout: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     by_timeframe = {
         str(position["timeframe"]): position
@@ -968,6 +1104,7 @@ def _position_status_rows(
                 "strategy": position.get("strategy", "ma_cross_primary")
                 if position
                 else "ma_cross_primary",
+                "status": "Open" if position else "Flat",
                 "slot": position.get("slot", timeframe) if position else timeframe,
                 "timeframe": timeframe,
                 "side": side,
@@ -1017,12 +1154,59 @@ def _position_status_rows(
                 ),
             }
         )
+    if breakout is not None:
+        campaign = breakout["campaign"]
+        owned = breakout["owned"]
+        assert isinstance(owned, list)
+        side = (
+            "long"
+            if isinstance(campaign, dict) and campaign.get("side") == 1
+            else "short"
+            if isinstance(campaign, dict)
+            else str(owned[0]["side"])
+            if owned and len({position["side"] for position in owned}) == 1
+            else "mixed"
+            if owned
+            else "flat"
+        )
+        if not breakout["available"]:
+            status = "State mismatch" if owned else "Awaiting state"
+        elif isinstance(campaign, dict) and campaign.get("origin") == "historical":
+            status = "State mismatch" if owned else "Historical · no funded trade"
+        elif isinstance(campaign, dict):
+            status = f"Funded · {len(owned)}/4 units" if owned else "Closing"
+        else:
+            status = "State mismatch" if owned else "Flat"
+        rows.append(
+            {
+                "strategy": BREAKOUT_INSTANCE_ID,
+                "status": status,
+                "slot": "campaign",
+                "timeframe": "1d",
+                "side": side,
+                "contracts": f"${sum(int(p['contracts']) for p in owned):,}" if owned else "-",
+                "leverage": "-",
+                "entry_ts": campaign.get("entry_ts", "-") if isinstance(campaign, dict) else "-",
+                "entry_price": "-",
+                "mark_pnl": "-",
+                "margin": "-",
+                "funding": "-",
+                "long_trigger": "-",
+                "short_trigger": "-",
+                "exit_trigger": (
+                    f"range {_format_price(campaign.get('boundary'))} / recovery / 120d"
+                    if isinstance(campaign, dict)
+                    else "-"
+                ),
+            }
+        )
     for position in positions:
-        if position.get("strategy") != "btc_close_range_v1":
+        if position.get("strategy") != BREAKOUT_INSTANCE_ID:
             continue
         rows.append(
             {
-                "strategy": "btc_close_range_v1",
+                "strategy": BREAKOUT_INSTANCE_ID,
+                "status": "Open",
                 "slot": position.get("slot", "-"),
                 "timeframe": position.get("timeframe", "1d"),
                 "side": position.get("side", "-"),
@@ -1047,7 +1231,12 @@ def _position_status_rows(
         )
     active = [position for position in positions if isinstance(position.get("contracts"), int)]
     if active:
-        unrealized = sum(int(position["estimated_unrealized_sats"]) for position in active)
+        unrealized_values = [position.get("estimated_unrealized_sats") for position in active]
+        unrealized = (
+            sum(unrealized_values)
+            if all(isinstance(value, int) for value in unrealized_values)
+            else "-"
+        )
         funding = sum(int(position["accumulated_funding_sats"]) for position in active)
         margins = [position.get("margin_sats") for position in active]
         margin = (
@@ -1059,6 +1248,7 @@ def _position_status_rows(
         rows.append(
             {
                 "strategy": "portfolio",
+                "status": "Open",
                 "slot": "all",
                 "timeframe": "Combined",
                 "side": "mixed"
@@ -1119,6 +1309,8 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
                 "closed_at": closed_ts,
                 "opened_at": opened_ts,
                 "timeframe": opened.get("trigger_tf", "-"),
+                "strategy": opened.get("strategy", "legacy_ma"),
+                "slot": opened.get("slot", opened.get("trigger_tf", "-")),
                 "gross": gross,
                 "trading_fees": trading_fees,
                 "funding": funding_pnl,
@@ -1243,7 +1435,6 @@ def _constant_notional_pnl_summary(
                 "trading_fees": trading_fees,
                 "funding": funding,
                 "net": net,
-                "portfolio_return_pct": net / (nominal_usd * len(TIMEFRAMES)) * 100,
             }
         )
     return result
@@ -1367,7 +1558,16 @@ def _strategy_performance_rows(
     nominal_usd: float | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     events = sorted(_closed_trade_components(db_path), key=lambda event: event["closed_at"])
-    open_started: dict[str, list[datetime]] = {timeframe: [] for timeframe in TIMEFRAMES}
+
+    def group(strategy: object, timeframe: object) -> str:
+        if strategy == BREAKOUT_INSTANCE_ID:
+            return "Breakout units"
+        if strategy in {"ma_cross_primary", "legacy_ma"} and timeframe in TIMEFRAMES:
+            return f"MA {timeframe}"
+        return str(strategy or "Other")
+
+    labels = ("MA 1d", "MA 4h", "Breakout units", "Combined")
+    open_started: dict[str, list[datetime]] = {label: [] for label in labels}
     grouped: dict[str, dict[str, dict[str, object]]] = {}
     for order in reversed(_orders(db_path)):
         trade_id = str(order.get("trade_id") or "")
@@ -1379,18 +1579,22 @@ def _strategy_performance_rows(
         if not opened or trade.get("close"):
             continue
         opened_at = _parse_ts(opened.get("ts"))
-        timeframe = str(opened.get("trigger_tf") or "")
-        if opened_at and timeframe in open_started:
-            open_started[timeframe].append(opened_at)
+        label = group(opened.get("strategy"), opened.get("trigger_tf"))
+        if opened_at and label in open_started:
+            open_started[label].append(opened_at)
 
     quality_rows: list[dict[str, object]] = []
     risk_rows: list[dict[str, object]] = []
     now = datetime.now(UTC)
-    for timeframe in (*TIMEFRAMES, "Combined"):
+    for timeframe in labels:
         selected = (
             events
             if timeframe == "Combined"
-            else [event for event in events if event["timeframe"] == timeframe]
+            else [
+                event
+                for event in events
+                if group(event["strategy"], event["timeframe"]) == timeframe
+            ]
         )
         if not selected:
             continue
@@ -1425,9 +1629,6 @@ def _strategy_performance_rows(
             "payoff_ratio": f"{payoff_ratio:.2f}" if payoff_ratio is not None else "-",
             "profit_factor": f"{profit_factor:.2f}" if profit_factor is not None else "-",
         }
-        if nominal_usd is not None:
-            return_basis = nominal_usd * (len(TIMEFRAMES) if timeframe == "Combined" else 1)
-            quality_row["cumulative_return"] = _signed_percent_html(sum(nets) / return_basis * 100)
         quality_rows.append(quality_row)
 
         equity = 0
@@ -1615,7 +1816,9 @@ def _portfolio_panel() -> str:
     )
 
 
-def _strategy_accounting_panel(db_path: Path, denomination: str, btc_price: float | None) -> str:
+def _strategy_accounting_panel(
+    db_path: Path, denomination: str, btc_price: float | None, *, breakout_enabled: bool = False
+) -> str:
     """Integrated live attribution from the shared funded execution path."""
     try:
         rows = _query(
@@ -1630,18 +1833,32 @@ def _strategy_accounting_panel(db_path: Path, denomination: str, btc_price: floa
         )
     except sqlite3.Error:
         return ""
-    if not rows:
+    if not rows and not breakout_enabled:
         return ""
+    by_strategy = {str(row["strategy_instance_id"]): row for row in rows}
     display = []
-    for row in rows:
+    strategy_ids = (
+        ["ma_cross_primary", BREAKOUT_INSTANCE_ID]
+        + [name for name in by_strategy if name not in {"ma_cross_primary", BREAKOUT_INSTANCE_ID}]
+        if breakout_enabled
+        else list(by_strategy)
+    )
+    for strategy_id in strategy_ids:
+        row = by_strategy.get(strategy_id)
         display.append(
             {
-                "strategy": row["strategy_instance_id"] or "legacy_ma",
-                "trades": row["trades"],
-                "opening_fees": _format_signed_amount(row["opening_fees"], denomination, btc_price),
-                "funding": _format_signed_amount(row["funding"], denomination, btc_price),
-                "closed_pl": _format_signed_amount(row["closed_pl"], denomination, btc_price),
-                "net": _format_signed_amount(row["net"], denomination, btc_price),
+                "strategy": strategy_id or "legacy_ma",
+                "trades": row["trades"] if row else 0,
+                "opening_fees": _format_signed_amount(
+                    row["opening_fees"] if row else 0, denomination, btc_price
+                ),
+                "funding": _format_signed_amount(
+                    row["funding"] if row else 0, denomination, btc_price
+                ),
+                "closed_pl": _format_signed_amount(
+                    row["closed_pl"] if row else 0, denomination, btc_price
+                ),
+                "net": _format_signed_amount(row["net"] if row else 0, denomination, btc_price),
             }
         )
     return (
@@ -1668,6 +1885,13 @@ def _overview(
     orders = _orders(db_path)
     positions = _open_positions(db_path, orders, price, exchange)
     levels = _ma_levels(db_path, _strategy_tolerance(run))
+    breakout_state = _persisted_breakout_state(db_path)
+    breakout = _breakout_context(breakout_state, positions)
+    breakout_enabled = (
+        bool(_metadata(run.get("config_json")).get("strategy_breakout_enabled"))
+        or breakout_state is not None
+        or bool(breakout["owned"])
+    )
     pnl = _pnl_summary(db_path, positions)
     by_timeframe = {
         str(position["timeframe"]): position
@@ -1683,19 +1907,24 @@ def _overview(
             _position_card(
                 "4h", by_timeframe.get("4h"), denomination, price, levels.get("4h"), cooldowns["4h"]
             ),
+            _breakout_card(breakout, denomination, price) if breakout_enabled else "",
             _pnl_card(pnl, denomination, pnl_window, price),
         )
     )
     signal_rows_by_tf = {timeframe: _signals(db_path, tf=timeframe)[:5] for timeframe in TIMEFRAMES}
+    breakout_signals = _signals(db_path, tf="breakout")[:5]
     funding_rows = [
         dict(row)
         for row in _query(
             db_path, "SELECT ts, trade_id, fee_sats FROM funding_fees ORDER BY id DESC LIMIT 5"
         )
     ]
+    owners = _trade_owners(orders)
     funding_display = [
         {
             "ts": row["ts"],
+            "strategy": owners.get(str(row["trade_id"]), ("unknown", "-"))[0],
+            "slot": owners.get(str(row["trade_id"]), ("unknown", "-"))[1],
             "funding": _format_signed_amount(row["fee_sats"], denomination, price, invert=True),
         }
         for row in funding_rows
@@ -1707,9 +1936,12 @@ def _overview(
             "</div><div class=overview-grid><div class=full-width>",
             _table(
                 "Active positions",
-                _position_status_rows(positions, levels, denomination, price),
+                _position_status_rows(
+                    positions, levels, denomination, price, breakout if breakout_enabled else None
+                ),
                 (
                     "strategy",
+                    "status",
                     "slot",
                     "timeframe",
                     "side",
@@ -1725,19 +1957,31 @@ def _overview(
             ),
             "</div><div class=activity-grid>",
             _table(
-                "Latest 1d signals",
+                "Latest MA 1d signals",
                 signal_rows_by_tf["1d"],
                 ("ts", "kind", "reason"),
             ),
             _table(
-                "Latest 4h signals",
+                "Latest MA 4h signals",
                 signal_rows_by_tf["4h"],
                 ("ts", "kind", "reason"),
             ),
-            _table("Latest funding", funding_display, ("ts", "funding")),
+            _table(
+                "Latest breakout signals",
+                breakout_signals,
+                ("ts", "slot", "kind", "reason"),
+            ),
+            _table(
+                "Recent breakout decisions",
+                _breakout_decisions(breakout_state),
+                ("ts", "slot", "kind", "reason"),
+            ),
+            _table("Latest funding", funding_display, ("ts", "strategy", "slot", "funding")),
             "</div></div>",
             _portfolio_panel(),
-            _strategy_accounting_panel(db_path, denomination, price),
+            _strategy_accounting_panel(
+                db_path, denomination, price, breakout_enabled=breakout_enabled
+            ),
         )
     )
 
@@ -1942,8 +2186,9 @@ def _strategy_explainer(run: dict[str, object]) -> str:
             f"{float(params.get('leverage', 0)):g}x.</p>"
         )
     return (
-        "<section class=strategy-explainer><h2>How the active strategy behaves</h2>"
-        "<p>The 1d and 4h timeframes operate independently, each with at most one isolated position. "
+        "<section class=strategy-explainer><h2>How the active strategies behave</h2>"
+        "<p><b>MA strategy:</b> the 1d and 4h timeframes operate independently, "
+        "each with at most one isolated position. "
         f"After a completed candle, the bot is bullish only when the close is more than {tolerance:.2%} above both the 20-period SMA and 21-period EMA; "
         "it is bearish only when it is more than that tolerance below both. Otherwise its verdict is Flat.</p>"
         "<p>A change to bullish opens or holds a long; a change to bearish opens or holds a short. "
@@ -2026,9 +2271,12 @@ def _detail_page(
         )
     if page == "funding":
         price, _, _ = _market_context(db_path)
+        owners = _trade_owners(_orders(db_path))
         rows = [
             {
                 **dict(row),
+                "strategy": owners.get(str(row["trade_id"]), ("unknown", "-"))[0],
+                "slot": owners.get(str(row["trade_id"]), ("unknown", "-"))[1],
                 "funding_pnl": _format_signed_amount(
                     row["fee_sats"], denomination, price, invert=True
                 ),
@@ -2046,7 +2294,9 @@ def _detail_page(
                 else ""
             )
         return f'<p class="muted funding-rate">{html.escape(rate_detail)}</p>' + _table(
-            "Funding settlements", rows, ("ts", "trade_id", "settlement_id", "funding_pnl")
+            "Funding settlements",
+            rows,
+            ("ts", "strategy", "slot", "trade_id", "settlement_id", "funding_pnl"),
         )
     if page == "pnl":
         price, _, _ = _market_context(db_path)
@@ -2081,9 +2331,6 @@ def _detail_page(
                     if constant
                     else _format_signed_amount(row["net"], denomination, price)
                 ),
-                "portfolio_return": (
-                    _signed_percent_html(row["portfolio_return_pct"]) if constant else None
-                ),
             }
             for row in raw_summary
         ]
@@ -2113,36 +2360,25 @@ def _detail_page(
         strategy_quality, strategy_risk = _strategy_performance_rows(
             db_path, denomination, price, nominal_usd if constant else None
         )
-        summary_columns = (
-            ("period", "gross_pnl", "trading_fees", "funding_pnl", "net", "portfolio_return")
-            if constant
-            else ("period", "gross_pnl", "trading_fees", "funding_pnl", "net")
-        )
+        summary_columns = ("period", "gross_pnl", "trading_fees", "funding_pnl", "net")
         quality_columns = (
-            (
-                "timeframe",
-                "closed_trades",
-                "win_rate",
-                "avg_winner",
-                "avg_loser",
-                "payoff_ratio",
-                "profit_factor",
-                "cumulative_return",
-            )
-            if constant
-            else (
-                "timeframe",
-                "closed_trades",
-                "win_rate",
-                "avg_winner",
-                "avg_loser",
-                "payoff_ratio",
-                "profit_factor",
-            )
+            "timeframe",
+            "closed_trades",
+            "win_rate",
+            "avg_winner",
+            "avg_loser",
+            "payoff_ratio",
+            "profit_factor",
         )
         replay_label = f" · ${nominal_usd:g} per trade" if constant else ""
         return (
-            '<div class="pnl-grid">'
+            (
+                "<p class=muted>Constant notional scales each isolated trade to $100. "
+                "It is a trade comparison, not a return on shared wallet capital.</p>"
+                if constant
+                else ""
+            )
+            + '<div class="pnl-grid">'
             + _table(
                 "Rolling P&L" + replay_label,
                 summary,
@@ -2330,18 +2566,17 @@ def _render(
         f'<a class="scope-link{" active" if tf is None else ""}" '
         f'href="{href(page, target_tf=None)}">All</a>'
     ]
-    for timeframe in TIMEFRAMES:
+    for timeframe, label in (("1d", "MA 1d"), ("4h", "MA 4h"), ("breakout", "Breakout")):
         target = page if page in filterable_pages else "signals"
         active = " active" if tf == timeframe else ""
         scope_links.append(
-            f'<a class="scope-link{active}" href="{href(target, target_tf=timeframe)}">'
-            f"{timeframe}</a>"
+            f'<a class="scope-link{active}" href="{href(target, target_tf=timeframe)}">{label}</a>'
         )
     scope_links_html = "".join(scope_links)
     template = """<!doctype html>
 <html><head><meta charset="utf-8"><title>LN Markets Bot</title><script src="https://kit.fontawesome.com/090ca49637.js" crossorigin="anonymous"></script><style>
 :root{{--bg:#0d1117;--surface:#161b22;--surface-2:#1c2128;--surface-3:#21262d;--border:#21262d;--border-hover:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#34d399;--accent-dim:rgba(52,211,153,.08);--sidebar-width:220px}}*{{box-sizing:border-box;margin:0;padding:0}}html,body{{min-height:100%;background:var(--bg);color:var(--text);font-family:ui-monospace,'Cascadia Code','JetBrains Mono','Fira Code',monospace;font-size:13px;line-height:1.5;color-scheme:dark}}.layout{{display:flex;min-height:100vh}}.sidebar{{width:var(--sidebar-width);flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;inset:0 auto 0 0;padding:1.5rem 0}}.sidebar-top{{padding:0 1.25rem 1.5rem;border-bottom:1px solid var(--border);margin-bottom:1.25rem}}.brand{{color:var(--accent);font-size:1.05rem;font-weight:700;letter-spacing:.02em}}.brand-sub,.nav-label,.muted,.scope-note{{color:var(--muted)}}.brand-sub,.nav-label{{font-size:.65rem;letter-spacing:.1em;text-transform:uppercase}}.nav-section{{padding:0 .75rem;display:flex;flex-direction:column;gap:2px}}.nav-label{{font-weight:600;padding:0 .5rem;margin:.6rem 0 .35rem}}.nav-link{{display:flex;align-items:center;gap:.55rem;padding:.45rem .5rem;border-radius:5px;color:var(--text);text-decoration:none;font-size:.82rem}}.nav-link:hover,.nav-link.active{{background:var(--surface-2);color:var(--accent)}}.nav-link.active{{box-shadow:inset 2px 0 var(--accent)}}.nav-icon{{color:var(--muted);width:1rem;text-align:center}}.sidebar-bottom{{padding:1rem .75rem 0;border-top:1px solid var(--border);margin-top:auto}}.scope-links{{display:flex;gap:.35rem;padding:0 .5rem;flex-wrap:wrap}}.scope-link{{border:1px solid var(--border-hover);border-radius:4px;color:var(--muted);padding:.2rem .42rem;text-decoration:none;font-size:.72rem}}.scope-link:hover,.scope-link.active{{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}}.scope-note{{display:block;font-size:.68rem;padding:.65rem .5rem 0}}.content{{margin-left:var(--sidebar-width);flex:1;padding:2rem 2.5rem;max-width:1700px}}.page-header{{display:flex;justify-content:space-between;gap:1rem;align-items:end;border-bottom:1px solid var(--border);padding-bottom:1rem;margin-bottom:1.6rem}}.eyebrow{{color:var(--accent);font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase}}.page-header p{{color:var(--muted);font-size:.78rem;max-width:38rem;text-align:right}}h1{{font-size:1.45rem;line-height:1.2;margin-bottom:1.25rem}}h2{{font-size:.85rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin:2rem 0 .65rem}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.8rem}}.card{{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:1rem}}.card:hover{{border-color:var(--border-hover)}}.card p,.card small{{display:block;color:var(--muted)}}.card p{{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}}.card strong{{display:block;font-size:1.3rem;margin:.4rem 0;font-weight:600}}.card small{{font-size:.72rem;min-height:1.1em}}.table-wrap{{overflow-x:auto;border:1px solid var(--border);border-radius:7px;background:var(--surface)}}table{{border-collapse:collapse;width:100%;font-size:.8rem}}th,td{{padding:.6rem .7rem;border-bottom:1px solid var(--border);vertical-align:top;text-align:left;white-space:nowrap}}td:last-child{{white-space:normal}}th{{color:var(--muted);font-size:.67rem;text-transform:uppercase;letter-spacing:.06em;background:var(--surface-2)}}tbody tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:var(--surface-2)}}::-webkit-scrollbar{{width:5px}}::-webkit-scrollbar-track{{background:transparent}}::-webkit-scrollbar-thumb{{background:var(--border);border-radius:3px}}@media(max-width:700px){{.sidebar{{position:static;width:100%;height:auto;padding:1rem;flex-direction:row;flex-wrap:wrap;gap:.5rem;border-right:0;border-bottom:1px solid var(--border)}}.sidebar-top{{padding:0;border:0;margin:0}.nav-section{{flex-direction:row;flex-wrap:wrap;padding:0}.nav-label{{display:none}.sidebar-bottom{{border:0;padding:0;margin:0}.scope-note{{display:none}.content{{margin-left:0;padding:1.25rem}}.page-header{{display:block}}.page-header p{{text-align:left;margin-top:.4rem}}}}
-</style></head><body><div class=layout><aside class=sidebar><div class=sidebar-top><div class=brand>LN Markets Bot</div><div class=brand-sub>read-only operations</div></div><div class=sidebar-status data-refresh-region=status>{sidebar_status}</div><nav class=nav-section><span class=nav-label>Monitor</span>{nav_link('overview', 'Overview', '◉')}<span class=nav-label>Activity</span>{nav_link('trades', 'Trades', '⇄')}{nav_link('signals', 'Signals', '↯')}{nav_link('pnl', 'P&L', '±')}{nav_link('funding', 'Funding', '₿')}<span class=nav-label>System</span>{nav_link('runs', 'Runs', '◌')}{nav_link('health', 'Health', '✓')}</nav><div class=sidebar-bottom><div class=sidebar-controls><div class=sidebar-control-group><span class=nav-label>Display</span><div class=denom-controls>{denomination_links}</div></div><div class=sidebar-control-group><span class=nav-label>Timeframe</span><div class=scope-links>{scope_links_html}</div></div></div></div></aside><main class=content data-refresh-region=content><header class=topbar>{topbar}</header>{content}</main></div>{refresh_script}</body></html>"""
+</style></head><body><div class=layout><aside class=sidebar><div class=sidebar-top><div class=brand>LN Markets Bot</div><div class=brand-sub>read-only operations</div></div><div class=sidebar-status data-refresh-region=status>{sidebar_status}</div><nav class=nav-section><span class=nav-label>Monitor</span>{nav_link('overview', 'Overview', '◉')}<span class=nav-label>Activity</span>{nav_link('trades', 'Trades', '⇄')}{nav_link('signals', 'Signals', '↯')}{nav_link('pnl', 'P&L', '±')}{nav_link('funding', 'Funding', '₿')}<span class=nav-label>System</span>{nav_link('runs', 'Runs', '◌')}{nav_link('health', 'Health', '✓')}</nav><div class=sidebar-bottom><div class=sidebar-controls><div class=sidebar-control-group><span class=nav-label>Display</span><div class=denom-controls>{denomination_links}</div></div><div class=sidebar-control-group><span class=nav-label>Strategy</span><div class=scope-links>{scope_links_html}</div></div></div></div></aside><main class=content data-refresh-region=content><header class=topbar>{topbar}</header>{content}</main></div>{refresh_script}</body></html>"""
     # The stylesheet originated in an f-string, where CSS braces were doubled.
     # It is now a plain template so the browser needs ordinary CSS braces.
     template = template.replace("{{", "{").replace("}}", "}")
@@ -2470,7 +2705,7 @@ def main() -> None:
                 query = parse_qs(parsed.query)
                 tf = (
                     requested_tf
-                    if page in {"signals", "trades"} and requested_tf in TIMEFRAMES
+                    if page in {"signals", "trades"} and requested_tf in (*TIMEFRAMES, "breakout")
                     else None
                 )
                 denomination = query.get("denom", ["sats"])[0]

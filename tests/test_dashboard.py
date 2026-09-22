@@ -546,7 +546,244 @@ def test_constant_notional_replay_normalizes_by_entry_size_and_includes_costs(tm
     )
     all_time = next(row for row in summary if row["key"] == "alltime")
     assert all_time["net"] == pytest.approx(expected_return_pct / 100 * 100 * 2)
-    assert all_time["portfolio_return_pct"] == pytest.approx(expected_return_pct)
+    assert "portfolio_return_pct" not in all_time
+
+
+def _create_multistrategy_dashboard_db(db_path, *, funded: bool) -> None:
+    from lnmarkets_bot.persistence.db import init_schema, make_engine
+
+    init_schema(make_engine(db_path))
+    campaign = {
+        "campaign_id": "20260822L" if not funded else "20260923L",
+        "side": 1,
+        "origin": "historical" if not funded else "live",
+        "boundary": 72_968.0,
+        "entry_ts": "2026-08-22T00:00:00+00:00",
+        "lifetime_units": 4 if not funded else 2,
+        "units": (
+            [{"k": 0, "entry_price": 78_330.0}, {"k": 1, "entry_price": 79_000.0}]
+            if funded
+            else [{"k": 0, "entry_price": 78_330.0}]
+        ),
+    }
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO runs (id,mode,strategy_name,strategy_params_json,config_json,started_at,status) "
+            "VALUES (1,'live','portfolio',?,?,?, 'running')",
+            (
+                json.dumps({"ma_cross_primary": {"params": {"tolerance_pct": 0.005}}}),
+                json.dumps({"strategy_breakout_enabled": True}),
+                "2026-09-22 00:00:00",
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO strategy_state_snapshots "
+            "(run_id,mode,strategy_name,ts,state_json) VALUES (1,'live',?,?,?)",
+            (
+                (
+                    "lnmarkets_bot.strategy.ma_cross.MaCross",
+                    "2026-09-22 12:00:00",
+                    json.dumps(
+                        {
+                            "timeframes": {
+                                "1d": {
+                                    "sma": 79_000,
+                                    "ema": 78_900,
+                                    "last_bar_ts": "2026-09-22T00:00:00+00:00",
+                                },
+                                "4h": {
+                                    "sma": 79_100,
+                                    "ema": 79_050,
+                                    "last_bar_ts": "2026-09-22T12:00:00+00:00",
+                                },
+                            },
+                            "winner_suppressed_signals": {"1d": 11, "4h": 0},
+                            "loss_suppressed_signals": {"1d": 0, "4h": 0},
+                        }
+                    ),
+                ),
+                (
+                    "lnmarkets_bot.strategy.close_range_live.CloseRangeLive",
+                    "2026-09-22 12:00:00",
+                    json.dumps(
+                        {
+                            "machine": {
+                                "last_bar_ts": "2026-09-21T00:00:00+00:00",
+                                "campaign": campaign,
+                            },
+                            "recent_decisions": [
+                                {
+                                    "ts": "2026-09-22T00:00:00+00:00",
+                                    "kind": "reject",
+                                    "k": None,
+                                    "reason": "addon_cap",
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO signals "
+            "(id,run_id,ts,kind,side,target_size_usd,target_leverage,reason,metadata_json,"
+            "strategy_instance_id,position_key) VALUES (?,?,?,'entry','buy',100,5,?,?,?,?)",
+            (
+                (
+                    1,
+                    1,
+                    "2026-09-22 00:00:00",
+                    "ma daily",
+                    json.dumps({"trigger_tf": "1d"}),
+                    "ma_cross_primary",
+                    "1d",
+                ),
+                (
+                    2,
+                    1,
+                    "2026-09-22 00:01:00",
+                    "breakout parent",
+                    json.dumps({"trigger_tf": "1d"}),
+                    "btc_close_range_v1",
+                    "k0",
+                ),
+            ),
+        )
+        if funded:
+            connection.executemany(
+                "INSERT INTO orders "
+                "(run_id,ts,trigger_tf,side,qty_sats,leverage,price_usd,status,"
+                "lnm_order_id,metadata_json,strategy_instance_id,position_key) "
+                "VALUES (1,?,'1d','buy',100,5,80000,'filled',?,?,'btc_close_range_v1',?)",
+                (
+                    (
+                        "2026-09-23 00:00:00",
+                        "breakout-k0",
+                        json.dumps({"isolated_action": "open"}),
+                        "k0",
+                    ),
+                    (
+                        "2026-09-24 00:00:00",
+                        "breakout-k1",
+                        json.dumps({"isolated_action": "open"}),
+                        "k1",
+                    ),
+                ),
+            )
+
+
+def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_path):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=False)
+    dashboard = _dashboard_module()
+    run = dashboard._active_run(db_path)
+
+    overview = dashboard._overview(db_path, run, "sats", "7days", None)
+
+    assert overview.count("position-card") == 3
+    assert "Cool-off active" in overview
+    assert "11 verdict changes left" in overview
+    assert "Historical campaign" in overview
+    assert "20260822L" in overview
+    assert "no funded units" in overview
+    assert "Historical · no funded trade" in overview
+    assert "Recent breakout decisions" in overview
+    assert "addon_cap" in overview
+    assert "Latest MA 1d signals" in overview
+    assert "Latest breakout signals" in overview
+    assert "breakout parent" in overview
+    assert "ma daily" in overview
+    assert "Live strategy attribution" in overview
+    assert "MA 1d position" in overview
+    assert "MA 4h position" in overview
+    assert "btc_close_range_v1" in overview
+
+    assert [row["reason"] for row in dashboard._signals(db_path, tf="1d")] == ["ma daily"]
+    assert [row["reason"] for row in dashboard._signals(db_path, tf="breakout")] == [
+        "breakout parent"
+    ]
+    nav = dashboard._render(db_path, "signals", "breakout")
+    assert "tf=breakout" in nav
+    assert ">MA 1d</a>" in nav
+    assert ">MA 4h</a>" in nav
+    assert ">Breakout</a>" in nav
+
+
+def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=True)
+    dashboard = _dashboard_module()
+    run = dashboard._active_run(db_path)
+
+    overview = dashboard._overview(db_path, run, "sats", "7days", None)
+    positions = dashboard._open_positions(db_path, dashboard._orders(db_path), None)
+    status_rows = dashboard._position_status_rows(
+        positions,
+        dashboard._persisted_strategy_levels(db_path, 0.005),
+        "sats",
+        None,
+        dashboard._breakout_context(dashboard._persisted_breakout_state(db_path), positions),
+    )
+
+    assert "Long · 2/4 units" in overview
+    assert "20260923L · $200 notional" in overview
+    assert "Funded · 2/4 units" in overview
+    assert {row["slot"] for row in status_rows if row["strategy"] == "btc_close_range_v1"} == {
+        "campaign",
+        "k0",
+        "k1",
+    }
+    assert [row["contracts"] for row in status_rows if row["strategy"] == "portfolio"] == ["$200"]
+    assert len(dashboard._orders(db_path, tf="breakout")) == 2
+    assert dashboard._orders(db_path, tf="1d") == []
+    assert dashboard._trade_owners(dashboard._orders(db_path)) == {
+        "breakout-k0": ("btc_close_range_v1", "k0"),
+        "breakout-k1": ("btc_close_range_v1", "k1"),
+    }
+
+
+def test_trade_quality_groups_breakout_units_by_strategy_not_daily_timeframe(tmp_path):
+    db_path = tmp_path / "normalized.sqlite"
+    _create_normalized_pnl_db(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("ALTER TABLE orders ADD COLUMN strategy_instance_id TEXT DEFAULT ''")
+        connection.execute("ALTER TABLE orders ADD COLUMN position_key TEXT DEFAULT ''")
+        connection.execute(
+            "UPDATE orders SET strategy_instance_id='ma_cross_primary',position_key='4h' "
+            "WHERE lnm_order_id='trade-1'"
+        )
+        connection.execute(
+            "UPDATE orders SET strategy_instance_id='btc_close_range_v1',"
+            "position_key='k0',trigger_tf='1d' WHERE lnm_order_id='trade-2'"
+        )
+    dashboard = _dashboard_module()
+
+    quality, risk = dashboard._strategy_performance_rows(
+        db_path,
+        "sats",
+        None,
+        nominal_usd=dashboard.CONSTANT_NOTIONAL_USD,
+    )
+
+    assert [(row["timeframe"], row["closed_trades"]) for row in quality] == [
+        ("MA 4h", 1),
+        ("Breakout units", 1),
+        ("Combined", 2),
+    ]
+    assert [row["timeframe"] for row in risk] == ["MA 4h", "Breakout units", "Combined"]
+    assert all("cumulative_return" not in row for row in quality)
+    assert (
+        len(
+            dashboard._trade_history_rows(
+                db_path, tf="breakout", denomination="sats", btc_price=None
+            )
+        )
+        == 1
+    )
+    assert (
+        len(dashboard._trade_history_rows(db_path, tf="1d", denomination="sats", btc_price=None))
+        == 0
+    )
 
 
 def test_trade_ledger_and_fixed_pnl_controls(tmp_path):
