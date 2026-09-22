@@ -85,7 +85,7 @@ cases; they are not counted as successful evidence.
 
 The sole funded executor now runs from
 `/usr/local/lib/lnmbot/prod-20260922.3-g12d9baac7b2a`. The dashboard runs from
-`/usr/local/lib/lnmbot-dashboard/prod-20260922.2-g70b2486cdc66`. Both retain
+`/usr/local/lib/lnmbot-dashboard/prod-20260922.3-g8df824e73760`. Both retain
 their locked identities, protected environments and shared database boundary.
 
 Acceptance proved that both services are active with zero restarts; the
@@ -102,6 +102,13 @@ non-editable package was accepted. Root-only evidence is retained at
 `/data/security-backups/lnmbot-breakout-rollout-20260922T133100Z`,
 `/data/security-backups/lnmbot-dashboard-multistrategy-20260922T134900Z` and
 `/data/security-backups/lnmbot-credential-redaction-20260922T135824Z`.
+
+A post-rollout dashboard correction scopes MA levels and cool-off state to the
+MA snapshot instead of whichever strategy snapshot has the newest timestamp.
+Production strategy state always retained the 1d winner cool-off with 11
+verdict changes remaining; only its presentation was wrong. The accepted
+dashboard-only checkpoint is
+`/data/security-backups/lnmbot-dashboard-cooldown-fix-20260922T222211Z`.
 
 The old MA-only runtime cannot manage K-slot positions. After any breakout
 fill, keep the integrated executor active or deliberately drain every breakout
