@@ -110,6 +110,24 @@ verdict changes remaining; only its presentation was wrong. The accepted
 dashboard-only checkpoint is
 `/data/security-backups/lnmbot-dashboard-cooldown-fix-20260922T222211Z`.
 
+The dashboard now runs from
+`/usr/local/lib/lnmbot-dashboard/prod-20260922.4-ga4f678874592`.
+Its overview presents three separate position cards: MA 1d, MA 4h and the
+close-range campaign. The historical `20260822L` campaign is shown as occupied
+but unfunded, so it cannot be mistaken for a live venue position. Future funded
+K units appear separately with their slot, notional and open P&L. Signals,
+trades, funding and P&L are attributed to the owning strategy; MA timeframe
+filters exclude breakout rows. The constant-notional comparison uses USD 100
+per isolated trade and no longer reports a misleading two-MA-slot portfolio
+return for the combined system.
+
+The dashboard-only cutover retained `lnmbot.service` PID 3246389 with zero
+restarts and 39 order rows. All dashboard routes returned HTTP 200, the MA 1d
+card showed 11 verdict changes of winner cool-off remaining, both strategy
+snapshots were present and SQLite `quick_check` passed. The accepted release
+has a root-only rollback checkpoint at
+`/data/security-backups/lnmbot-dashboard-three-position-20260922T230545Z`.
+
 The old MA-only runtime cannot manage K-slot positions. After any breakout
 fill, keep the integrated executor active or deliberately drain every breakout
 unit before reverting. Never restore the database merely to undo the additive
