@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -27,10 +28,12 @@ from lnmarkets_bot.data.multitimeframe import MultiTimeframeDataSource
 from lnmarkets_bot.engine.live import run_paper
 from lnmarkets_bot.engine.live_account import LiveAccountBalanceProvider
 from lnmarkets_bot.engine.live_executor import LiveExecutor
+from lnmarkets_bot.engine.portfolio_live import StrategyBinding, run_portfolio_live
 from lnmarkets_bot.logging import configure_logging, get_logger
 from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
 from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
+from lnmarkets_bot.strategy.close_range_live import CloseRangeLive, load_seed_machine
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
 
@@ -79,6 +82,8 @@ async def main() -> int:
         parser.error("--test-5m-cooldown-probe requires --test-5m")
 
     cfg = BotConfig(_env_file=str(args.env) if args.env.exists() else None)
+    if args.test_5m and cfg.strategy_breakout_enabled:
+        parser.error("--test-5m cannot run while STRATEGY_BREAKOUT_ENABLED=true")
     configure_logging(cfg.storage_log_level, cfg.storage_log_path)
     log = get_logger("live")
     log.info(
@@ -166,7 +171,10 @@ async def main() -> int:
         else "production"
     )
     log.info("live.strategy_profile", profile=profile)
-    ds = MultiTimeframeDataSource(base_stream, higher_timeframes=strat.tfs)
+    higher_timeframes = (
+        tuple(dict.fromkeys((*strat.tfs, "1d"))) if cfg.strategy_breakout_enabled else strat.tfs
+    )
+    ds = MultiTimeframeDataSource(base_stream, higher_timeframes=higher_timeframes)
 
     # Wire LiveExecutor via factory. run_paper creates a Recorder against the
     # same database, so using this recorder keeps order writes on that DB.
@@ -178,6 +186,9 @@ async def main() -> int:
             recorder=recorder,
             run_id=-1,
             symbol="BTCUSD",
+            legacy_strategy_instance_id=(
+                "ma_cross_primary" if cfg.strategy_breakout_enabled else None
+            ),
         )
         account_balance_provider = LiveAccountBalanceProvider(
             account_api=AccountApi(client), isolated_trades_api=trades_api, recorder=recorder
@@ -187,23 +198,54 @@ async def main() -> int:
     try:
         if executor is not None:
             await executor.reconcile()
-        run_id = await run_paper(
-            cfg=cfg,
-            data_source=ds,
-            strategy=strat,
-            duration_seconds=args.max_runtime,
-            install_signal_handlers=True,
-            executor_factory=(lambda: executor) if executor is not None else None,
-            recorder_override=recorder if executor is not None else None,
-            sizing_policy=SizingPolicy(
-                mode=cfg.sizing_mode,
-                total_margin_fraction=cfg.sizing_total_margin_fraction,
-                timeframe_weights=cfg.sizing_timeframe_weights,
-                equity_haircut=cfg.sizing_equity_haircut,
-            ),
-            account_balance_provider=account_balance_provider,
-            run_mode="live" if executor is not None else "paper",
+        sizing_policy = SizingPolicy(
+            mode=cfg.sizing_mode,
+            total_margin_fraction=cfg.sizing_total_margin_fraction,
+            timeframe_weights=cfg.sizing_timeframe_weights,
+            equity_haircut=cfg.sizing_equity_haircut,
+            fixed_notional_strategy_ids=frozenset({"btc_close_range_v1"}),
         )
+        if cfg.strategy_breakout_enabled:
+            if executor is None or account_balance_provider is None:
+                raise RuntimeError("integrated breakout currently requires funded live execution")
+            breakout = CloseRangeLive(
+                {
+                    "unit_notional_usd": cfg.strategy_breakout_unit_notional_usd,
+                    "leverage": cfg.strategy_breakout_leverage,
+                    "activation_ts": datetime.now(UTC).isoformat(),
+                },
+                machine=load_seed_machine(
+                    cfg.strategy_breakout_seed_daily_path,
+                    cfg.strategy_breakout_seed_campaign_path,
+                ),
+            )
+            run_id = await run_portfolio_live(
+                cfg=cfg,
+                data_source=ds,
+                bindings=(
+                    StrategyBinding("ma_cross_primary", strat),
+                    StrategyBinding("btc_close_range_v1", breakout),
+                ),
+                executor=executor,
+                recorder=recorder,
+                sizing_policy=sizing_policy,
+                account_balance_provider=account_balance_provider,
+                duration_seconds=args.max_runtime,
+                install_signal_handlers=True,
+            )
+        else:
+            run_id = await run_paper(
+                cfg=cfg,
+                data_source=ds,
+                strategy=strat,
+                duration_seconds=args.max_runtime,
+                install_signal_handlers=True,
+                executor_factory=(lambda: executor) if executor is not None else None,
+                recorder_override=recorder if executor is not None else None,
+                sizing_policy=sizing_policy,
+                account_balance_provider=account_balance_provider,
+                run_mode="live" if executor is not None else "paper",
+            )
         log.info("live.complete", run_id=run_id)
         return 0
     except Exception as exc:

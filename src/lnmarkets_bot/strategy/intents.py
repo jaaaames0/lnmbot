@@ -10,19 +10,20 @@ position. `trigger_tf` records which TF's signal produced this intent — the
 risk guard and executor use it to route the intent to the correct per-TF
 position slot.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class Side(str, Enum):
+class Side(StrEnum):
     LONG = "long"
     SHORT = "short"
 
 
-class SignalKind(str, Enum):
+class SignalKind(StrEnum):
     NOOP = "noop"
     ENTRY = "entry"
     EXIT = "exit"
@@ -51,6 +52,18 @@ class OrderIntent:
     leverage: float = 1.0
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Filled by a portfolio dispatcher before execution. Strategies retain
+    # local timeframe names while the executor receives a globally unique
+    # strategy/position address.
+    strategy_instance_id: str = ""
+    position_key: str = ""
+
+    @property
+    def execution_key(self) -> str:
+        local_key = self.position_key or self.trigger_tf or "default"
+        return (
+            f"{self.strategy_instance_id}:{local_key}" if self.strategy_instance_id else local_key
+        )
 
     @classmethod
     def noop(
@@ -58,7 +71,7 @@ class OrderIntent:
         trigger_tf: str,
         reason: str = "no_signal",
         metadata: dict[str, Any] | None = None,
-    ) -> "OrderIntent":
+    ) -> OrderIntent:
         return cls(
             kind=SignalKind.NOOP,
             trigger_tf=trigger_tf,
@@ -74,7 +87,7 @@ class OrderIntent:
         leverage: float,
         reason: str = "",
         metadata: dict[str, Any] | None = None,
-    ) -> "OrderIntent":
+    ) -> OrderIntent:
         return cls(
             kind=SignalKind.ENTRY,
             trigger_tf=trigger_tf,
@@ -93,7 +106,7 @@ class OrderIntent:
         leverage: float,
         reason: str = "",
         metadata: dict[str, Any] | None = None,
-    ) -> "OrderIntent":
+    ) -> OrderIntent:
         return cls(
             kind=SignalKind.ENTRY,
             trigger_tf=trigger_tf,
@@ -110,7 +123,7 @@ class OrderIntent:
         trigger_tf: str,
         reason: str = "exit",
         metadata: dict[str, Any] | None = None,
-    ) -> "OrderIntent":
+    ) -> OrderIntent:
         return cls(
             kind=SignalKind.EXIT,
             trigger_tf=trigger_tf,
@@ -127,7 +140,7 @@ class OrderIntent:
         leverage: float,
         reason: str = "resize",
         metadata: dict[str, Any] | None = None,
-    ) -> "OrderIntent":
+    ) -> OrderIntent:
         return cls(
             kind=SignalKind.RESIZE,
             trigger_tf=trigger_tf,

@@ -64,6 +64,8 @@ signals = Table(
     Column("target_size_usd", Float, nullable=True),
     Column("target_leverage", Float, nullable=True),
     Column("reason", String, nullable=False),
+    Column("strategy_instance_id", String, nullable=False, default=""),
+    Column("position_key", String, nullable=False, default=""),
     Column("metadata_json", JSON, nullable=False, default=dict),
 )
 
@@ -75,6 +77,8 @@ orders = Table(
     Column("signal_id", Integer, ForeignKey("signals.id"), nullable=True),
     Column("ts", DateTime, nullable=False),
     Column("trigger_tf", String, nullable=False, default=""),
+    Column("strategy_instance_id", String, nullable=False, default=""),
+    Column("position_key", String, nullable=False, default=""),
     Column("side", String, nullable=False),  # buy | sell
     Column("qty_sats", Integer, nullable=False),
     Column("leverage", Float, nullable=False),
@@ -131,6 +135,22 @@ funding_fees = Table(
     Column("fee_sats", Integer, nullable=False),
     Column("raw_json", JSON, nullable=False, default=dict),
     UniqueConstraint("trade_id", "settlement_id", name="uq_funding_trade_settlement"),
+)
+
+strategy_pnl_events = Table(
+    "strategy_pnl_events",
+    Base.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", Integer, ForeignKey("runs.id"), nullable=False, index=True),
+    Column("event_key", String, nullable=False, unique=True),
+    Column("strategy_instance_id", String, nullable=False, index=True),
+    Column("position_key", String, nullable=False),
+    Column("trade_id", String, nullable=True, index=True),
+    Column("ts", DateTime, nullable=False),
+    Column("kind", String, nullable=False),
+    # Signed contribution to strategy P&L: costs negative, receipts positive.
+    Column("amount_sats", Integer, nullable=False),
+    Column("metadata_json", JSON, nullable=False, default=dict),
 )
 
 risk_events = Table(

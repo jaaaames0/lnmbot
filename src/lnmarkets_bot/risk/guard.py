@@ -88,6 +88,10 @@ class SizingPolicy:
     total_margin_fraction: float = 0.50
     timeframe_weights: dict[str, float] | None = None
     equity_haircut: float = 0.95
+    # These strategy instances use the notional explicitly requested by their
+    # audited strategy configuration even when the incumbent MA strategy uses
+    # equity-fraction sizing.
+    fixed_notional_strategy_ids: frozenset[str] = frozenset()
 
 
 class RiskGuard:
@@ -156,6 +160,8 @@ class RiskGuard:
     ) -> float | None:
         if intent.kind == SignalKind.EXIT:
             return 0.0
+        if intent.strategy_instance_id in self.sizing_policy.fixed_notional_strategy_ids:
+            return intent.size_usd
         if self.sizing_policy.mode == "fixed_notional":
             return intent.size_usd
         if self.sizing_policy.mode != "equity_fraction":
@@ -164,8 +170,9 @@ class RiskGuard:
             return None
         if self.account_balance_provider is None:
             return None
-        tf = intent.trigger_tf or "default"
-        weight = (self.sizing_policy.timeframe_weights or {}).get(tf, 0.0)
+        local_tf = intent.trigger_tf or "default"
+        execution_key = intent.execution_key
+        weight = (self.sizing_policy.timeframe_weights or {}).get(local_tf, 0.0)
         if weight <= 0:
             return None
         try:
@@ -173,7 +180,7 @@ class RiskGuard:
                 run_id=run_id,
                 ts=ts,
                 price_usd=self.current_price_usd,
-                margin_used_usd=self._open_margin_usd(exclude_tf=tf),
+                margin_used_usd=self._open_margin_usd(exclude_tf=execution_key),
             )
         except Exception as exc:
             _log.warning("risk.equity_sizing_unavailable", error=str(exc))
@@ -289,7 +296,7 @@ class RiskGuard:
             )
 
         if intent.kind.value != "exit":
-            tf = intent.trigger_tf or "default"
+            tf = intent.execution_key
             open_notional_usd = self._open_notional_usd(exclude_tf=tf)
             open_margin_usd = self._open_margin_usd(exclude_tf=tf)
             if self.limits.max_total_notional_usd is not None:

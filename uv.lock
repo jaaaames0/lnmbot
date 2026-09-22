@@ -384,6 +384,8 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
+    { name = "pandas" },
+    { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy" },
@@ -393,14 +395,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-backfill = [
-    { name = "pandas" },
-    { name = "pyarrow" },
-]
-dashboard = [
-    { name = "pandas" },
-    { name = "pyarrow" },
-]
 dev = [
     { name = "freezegun" },
     { name = "import-linter" },
@@ -417,10 +411,8 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
-    { name = "pandas", marker = "extra == 'backfill'", specifier = ">=2.2" },
-    { name = "pandas", marker = "extra == 'dashboard'", specifier = ">=2.2" },
-    { name = "pyarrow", marker = "extra == 'backfill'", specifier = ">=15" },
-    { name = "pyarrow", marker = "extra == 'dashboard'", specifier = ">=15" },
+    { name = "pandas", specifier = ">=2.2" },
+    { name = "pyarrow", specifier = ">=15" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pydantic-settings", specifier = ">=2.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },

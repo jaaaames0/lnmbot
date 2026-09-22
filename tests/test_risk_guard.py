@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -356,6 +357,53 @@ async def test_equity_fraction_sizing_uses_balance_and_timeframe_weight(recorder
     assert decision.decision == Decision.SUBMITTED
     # $100 x 50% total margin x 50% 1d allocation x 80% haircut x 2 leverage.
     assert executor.last_size_usd == 40.0
+
+
+async def test_equity_sizing_excludes_namespaced_position_but_uses_local_tf_weight(
+    recorder, limits
+) -> None:
+    observed: dict[str, object] = {}
+
+    class BalanceProvider:
+        async def balance_usd(self, **kwargs) -> float:
+            observed.update(kwargs)
+            return 100.0
+
+    class NamespacedExecutor(StubExecutor):
+        def open_margin_usd(self, *, exclude_tf=None):
+            observed["exclude_tf"] = exclude_tf
+            return 0.0
+
+    executor = NamespacedExecutor(recorder, [])
+    guard = RiskGuard(
+        limits=limits,
+        recorder=recorder,
+        executor=executor,  # type: ignore[arg-type]
+        sizing_policy=SizingPolicy(
+            mode="equity_fraction",
+            total_margin_fraction=0.50,
+            timeframe_weights={"1d": 0.5},
+            equity_haircut=0.80,
+        ),
+        account_balance_provider=BalanceProvider(),
+    )
+    guard.current_price_usd = 60_000.0
+    ts = datetime.now(UTC)
+    run_id = recorder.start_run(
+        mode="live", strategy_name="portfolio", strategy_params={}, config={}, started_at=ts
+    )
+    signal_id = recorder.record_signal(run_id, ts=ts, kind="entry", side="long", reason="entry")
+    intent = replace(
+        OrderIntent.enter_long("1d", 1.0, 2.0),
+        strategy_instance_id="ma_cross_primary",
+        position_key="1d",
+    )
+
+    decision = await guard.submit(intent=intent, signal_id=signal_id, run_id=run_id, ts=ts)
+
+    assert decision.decision == Decision.SUBMITTED
+    assert executor.last_size_usd == 40.0
+    assert observed["exclude_tf"] == "ma_cross_primary:1d"
 
 
 async def test_equity_fraction_balance_failure_rejects_only_that_entry(recorder, limits) -> None:

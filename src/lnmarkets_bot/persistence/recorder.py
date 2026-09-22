@@ -27,6 +27,7 @@ from .models import (
     risk_events,
     runs,
     signals,
+    strategy_pnl_events,
     strategy_state_snapshots,
 )
 
@@ -122,6 +123,8 @@ class Recorder:
         side: str | None = None,
         target_size_usd: float | None = None,
         target_leverage: float | None = None,
+        strategy_instance_id: str = "",
+        position_key: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> int:
         with self._factory() as session, session.begin():
@@ -134,6 +137,8 @@ class Recorder:
                     target_size_usd=target_size_usd,
                     target_leverage=target_leverage,
                     reason=reason,
+                    strategy_instance_id=strategy_instance_id,
+                    position_key=position_key,
                     metadata_json=metadata or {},
                 )
             )
@@ -198,6 +203,8 @@ class Recorder:
         leverage: float,
         status: str,
         trigger_tf: str = "",
+        strategy_instance_id: str = "",
+        position_key: str = "",
         price_usd: float | None = None,
         lnm_order_id: str | None = None,
         rejection_reason: str | None = None,
@@ -210,6 +217,8 @@ class Recorder:
                     signal_id=signal_id,
                     ts=ts,
                     trigger_tf=trigger_tf,
+                    strategy_instance_id=strategy_instance_id,
+                    position_key=position_key,
                     side=side,
                     qty_sats=qty_sats,
                     leverage=leverage,
@@ -274,6 +283,8 @@ class Recorder:
                     orders.c.ts,
                     orders.c.lnm_order_id,
                     orders.c.trigger_tf,
+                    orders.c.strategy_instance_id,
+                    orders.c.position_key,
                     orders.c.side,
                     orders.c.qty_sats,
                     orders.c.leverage,
@@ -288,6 +299,8 @@ class Recorder:
                 latest[row.lnm_order_id] = {
                     "ts": row.ts,
                     "trigger_tf": row.trigger_tf,
+                    "strategy_instance_id": row.strategy_instance_id,
+                    "position_key": row.position_key,
                     "side": row.side,
                     "qty_sats": row.qty_sats,
                     "leverage": row.leverage,
@@ -295,6 +308,48 @@ class Recorder:
                     "metadata": row.metadata_json if isinstance(row.metadata_json, dict) else {},
                 }
         return latest
+
+    def latest_locally_open_lnm_trades(self) -> dict[str, dict[str, Any]]:
+        """Return trades whose latest recorded action is still an open."""
+        latest: dict[str, dict[str, Any]] = {}
+        with self._factory() as session:
+            rows = session.execute(
+                select(
+                    orders.c.id,
+                    orders.c.ts,
+                    orders.c.lnm_order_id,
+                    orders.c.trigger_tf,
+                    orders.c.strategy_instance_id,
+                    orders.c.position_key,
+                    orders.c.side,
+                    orders.c.qty_sats,
+                    orders.c.leverage,
+                    orders.c.price_usd,
+                    orders.c.metadata_json,
+                )
+                .where(orders.c.lnm_order_id.is_not(None))
+                .order_by(orders.c.id.asc())
+            ).all()
+        for row in rows:
+            if not row.lnm_order_id:
+                continue
+            metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            latest[row.lnm_order_id] = {
+                "ts": row.ts,
+                "trigger_tf": row.trigger_tf,
+                "strategy_instance_id": row.strategy_instance_id,
+                "position_key": row.position_key,
+                "side": row.side,
+                "qty_sats": row.qty_sats,
+                "leverage": row.leverage,
+                "price_usd": row.price_usd,
+                "metadata": metadata,
+            }
+        return {
+            trade_id: row
+            for trade_id, row in latest.items()
+            if row["metadata"].get("isolated_action") == "open"
+        }
 
     # ---- Account / risk ----
 
@@ -414,4 +469,35 @@ class Recorder:
             result = session.execute(
                 stmt.on_conflict_do_nothing(index_elements=["trade_id", "settlement_id"])
             )
+            return bool(result.rowcount)
+
+    def record_strategy_pnl_event(
+        self,
+        run_id: int,
+        *,
+        event_key: str,
+        strategy_instance_id: str,
+        position_key: str,
+        trade_id: str | None,
+        ts: datetime,
+        kind: str,
+        amount_sats: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Append one idempotent, strategy-attributed P&L contribution."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        with self._factory() as session, session.begin():
+            stmt = sqlite_insert(strategy_pnl_events).values(
+                run_id=run_id,
+                event_key=event_key,
+                strategy_instance_id=strategy_instance_id,
+                position_key=position_key,
+                trade_id=trade_id,
+                ts=ts,
+                kind=kind,
+                amount_sats=amount_sats,
+                metadata_json=metadata or {},
+            )
+            result = session.execute(stmt.on_conflict_do_nothing(index_elements=["event_key"]))
             return bool(result.rowcount)

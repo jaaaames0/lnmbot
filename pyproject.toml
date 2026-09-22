@@ -18,20 +18,19 @@ dependencies = [
     "sqlalchemy>=2.0",
     # Logging
     "structlog>=24.1",
+    # Seeded daily strategy state (Parquet)
+    "pandas>=2.2",
+    "pyarrow>=15",
     # CLI
     "typer>=0.12",
 ]
 
 [project.optional-dependencies]
 dashboard = [
-    # The dashboard reads cached Parquet history for market context and MA warmup.
-    "pandas>=2.2",
-    "pyarrow>=15",
+    # Reserved for dashboard-specific dependencies.
 ]
 backfill = [
-    # Used by scripts/backfill_binance.py
-    "pandas>=2.2",
-    "pyarrow>=15",
+    # Reserved for backfill-specific dependencies.
 ]
 dev = [
     "pytest>=8",

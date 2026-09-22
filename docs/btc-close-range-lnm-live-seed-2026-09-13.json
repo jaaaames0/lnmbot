@@ -1,0 +1,17 @@
+{
+  "source": "lnmarkets_btcusd_daily",
+  "as_of_close": "2026-09-12T00:00:00+00:00",
+  "purpose": "Initial historical occupancy for the integrated funded-capable runtime; no historical unit is owned or executable.",
+  "ohlc_normalization": "Expand high/low only when needed to contain the venue-reported open and close.",
+  "active_hypothetical_stack": {
+    "parent_id": "20260822L",
+    "side": "long",
+    "entry_ts": "2026-08-22T00:00:00+00:00",
+    "entry_price": 78330.64575,
+    "boundary": 72968.0,
+    "held_days": 22,
+    "peak_favorable_pct": 0.05021475582562785,
+    "active_units": 4,
+    "pending_exit": null
+  }
+}

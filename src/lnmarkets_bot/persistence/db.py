@@ -31,11 +31,34 @@ def init_schema(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     if engine.dialect.name != "sqlite":
         return
-    columns = {column["name"] for column in inspect(engine).get_columns("orders")}
-    if "trigger_tf" not in columns:
-        with engine.begin() as connection:
+    inspector = inspect(engine)
+    order_columns = {column["name"] for column in inspector.get_columns("orders")}
+    signal_columns = {column["name"] for column in inspector.get_columns("signals")}
+    with engine.begin() as connection:
+        if "trigger_tf" not in order_columns:
             connection.execute(
                 text("ALTER TABLE orders ADD COLUMN trigger_tf VARCHAR NOT NULL DEFAULT ''")
+            )
+        if "strategy_instance_id" not in order_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE orders ADD COLUMN strategy_instance_id VARCHAR NOT NULL DEFAULT ''"
+                )
+            )
+        if "position_key" not in order_columns:
+            connection.execute(
+                text("ALTER TABLE orders ADD COLUMN position_key VARCHAR NOT NULL DEFAULT ''")
+            )
+        if "strategy_instance_id" not in signal_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE signals ADD COLUMN strategy_instance_id "
+                    "VARCHAR NOT NULL DEFAULT ''"
+                )
+            )
+        if "position_key" not in signal_columns:
+            connection.execute(
+                text("ALTER TABLE signals ADD COLUMN position_key VARCHAR NOT NULL DEFAULT ''")
             )
 
 

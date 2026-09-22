@@ -93,6 +93,17 @@ class BotConfig(BaseSettings):
     strategy_chop_high_threshold: float = 61.8
     strategy_chop_high_size_multiplier: float = 0.5
 
+    # --- Optional close-range strategy in the shared live process ---
+    strategy_breakout_enabled: bool = False
+    strategy_breakout_unit_notional_usd: float = 100.0
+    strategy_breakout_leverage: float = 5.0
+    strategy_breakout_seed_daily_path: Path = Path(
+        "./data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+    )
+    strategy_breakout_seed_campaign_path: Path = Path(
+        "./docs/btc-close-range-lnm-live-seed-2026-09-13.json"
+    )
+
     # --- Kill switch ---
     halted: str = ""  # "1" to halt
     halt_file: Path | None = None

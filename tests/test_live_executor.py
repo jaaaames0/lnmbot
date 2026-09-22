@@ -23,6 +23,7 @@ class FakeIsolatedTradesApi:
         self.trades: list[dict] = []
         self.closes: list[str] = []
         self.running: dict[str, IsolatedTrade] = {}
+        self.closed: dict[str, IsolatedTrade] = {}
         self.next_id = 1
         self.close_pl_sats = 0
         self.opening_fee_sats = 0
@@ -67,6 +68,9 @@ class FakeIsolatedTradesApi:
 
     async def get_running_trades(self):
         return list(self.running.values())
+
+    async def get_closed_trades(self):
+        return list(self.closed.values())
 
     async def iter_funding_fees(self, _from_ts, _to_ts):
         for row in self.funding_rows:
@@ -620,6 +624,111 @@ async def test_live_executor_reconciles_recorded_running_trade(recorder, tmp_pat
         leverage=2.0,
     )
     assert exit_order_id > 0
+
+
+async def test_live_executor_persists_and_attributes_venue_liquidation(recorder):
+    api = FakeIsolatedTradesApi()
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="live",
+        strategy_name="portfolio",
+        strategy_params={},
+        config={},
+        started_at=datetime.now(UTC),
+    )
+    executor.run_id = run_id
+    executor.update_price(50_000)
+    signal_id = recorder.record_signal(
+        run_id, ts=datetime.now(UTC), kind="entry", side="long", reason="entry"
+    )
+    intent = OrderIntent.enter_long("1d", 100, 5)
+    intent = OrderIntent(
+        **{
+            **intent.__dict__,
+            "strategy_instance_id": "btc_close_range_v1",
+            "position_key": "k0",
+        }
+    )
+    await executor.submit(
+        intent=intent,
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        size_usd=100,
+        leverage=5,
+    )
+    trade = api.running.pop("iso-1")
+    trade.status = "liquidated"
+    trade.price = 41_500
+    trade.pl = -20_000
+    trade.closing_fee = 200
+    trade.raw = {"exitPrice": 41_500, "closeReason": "liquidation"}
+    api.closed[trade.id] = trade
+
+    events = await executor.reconcile_external_closures(
+        run_id=run_id, ts=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    assert len(events) == 1
+    assert events[0].execution_key == "btc_close_range_v1:k0"
+    assert events[0].liquidated is True
+    assert executor.position_qty_sats("btc_close_range_v1:k0") == 0
+
+    with recorder._factory() as session:  # type: ignore[attr-defined]
+        row = session.execute(
+            select(orders_t)
+            .where(orders_t.c.run_id == run_id)
+            .where(orders_t.c.metadata_json["isolated_action"].as_string() == "external_close")
+        ).one()
+    assert row.strategy_instance_id == "btc_close_range_v1"
+    assert row.position_key == "k0"
+
+
+async def test_restart_retains_locally_open_trade_until_missing_remote_is_accounted(recorder):
+    api = FakeIsolatedTradesApi()
+    original = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    run_id = recorder.start_run(
+        mode="live",
+        strategy_name="portfolio",
+        strategy_params={},
+        config={},
+        started_at=datetime.now(UTC),
+    )
+    original.run_id = run_id
+    original.update_price(50_000)
+    signal_id = recorder.record_signal(
+        run_id, ts=datetime.now(UTC), kind="entry", side="long", reason="entry"
+    )
+    intent = OrderIntent.enter_long("1d", 100, 5)
+    intent = OrderIntent(
+        **{
+            **intent.__dict__,
+            "strategy_instance_id": "btc_close_range_v1",
+            "position_key": "k0",
+        }
+    )
+    await original.submit(
+        intent=intent,
+        signal_id=signal_id,
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        size_usd=100,
+        leverage=5,
+    )
+    trade = api.running.pop("iso-1")
+    trade.status = "liquidated"
+    trade.price = 41_500
+    trade.pl = -20_000
+    trade.raw = {"exitPrice": 41_500, "closeReason": "liquidation"}
+    api.closed[trade.id] = trade
+
+    restarted = LiveExecutor(trades_api=api, recorder=recorder, run_id=-1)
+    await restarted.reconcile()
+    assert restarted.position_qty_sats("btc_close_range_v1:k0") == 100
+    events = await restarted.reconcile_external_closures(
+        run_id=run_id, ts=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    assert events[0].liquidated is True
+    assert restarted.position_qty_sats("btc_close_range_v1:k0") == 0
 
 
 async def test_live_executor_records_each_funding_settlement_once(recorder):
