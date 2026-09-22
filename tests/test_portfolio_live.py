@@ -9,7 +9,7 @@ from sqlalchemy import select
 from lnmarkets_bot.data.source import DataSource
 from lnmarkets_bot.engine.portfolio_live import StrategyBinding, run_portfolio_live
 from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
-from lnmarkets_bot.persistence.models import signals
+from lnmarkets_bot.persistence.models import signals, strategy_state_snapshots
 from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
 from lnmarkets_bot.strategy import Bar, OrderIntent, Strategy, StrategyState
@@ -31,6 +31,9 @@ class _Entry(Strategy):
 
     def on_bar(self, bar: Bar, state: StrategyState):
         return [OrderIntent.enter_long("1m", 10, 2, reason="test")]
+
+    def persistent_state(self):
+        return {"saved": True}
 
 
 class _Executor:
@@ -116,4 +119,17 @@ async def test_portfolio_routes_same_timeframe_to_distinct_strategy_positions(cf
             .where(signals.c.run_id == run_id)
             .order_by(signals.c.id)
         ).all()
+        snapshots = (
+            session.execute(
+                select(strategy_state_snapshots.c.strategy_name).order_by(
+                    strategy_state_snapshots.c.strategy_name
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert rows == [("first", "1m"), ("second", "1m")]
+    # The two test instances intentionally share a class identity, so the
+    # durable snapshot key is replaced rather than duplicated. The assertion
+    # proves first-live-bar persistence occurs before a higher-TF boundary.
+    assert snapshots == [f"{_Entry.__module__}.{_Entry.__name__}"]

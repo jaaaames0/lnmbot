@@ -141,6 +141,7 @@ async def run_portfolio_live(
         if duration_seconds is not None:
             deadline = asyncio.get_running_loop().time() + duration_seconds
         last_account_snapshot_ts = None
+        strategy_snapshot_saved = {binding.instance_id: False for binding in bindings}
         try:
             async for bar in data_source.stream():
                 if deadline is not None and asyncio.get_running_loop().time() >= deadline:
@@ -238,7 +239,9 @@ async def run_portfolio_live(
                     state = states[binding.instance_id]
                     intents = intents_to_list(strategy.on_bar(bar, state))
                     snapshot_due = not bar.warmup and (
-                        bar.timeframe in binding.subscribed_timeframes or bool(intents)
+                        bar.timeframe in binding.subscribed_timeframes
+                        or bool(intents)
+                        or not strategy_snapshot_saved[binding.instance_id]
                     )
                     # Persist the decision state before any remote submission.
                     # A restart must never rediscover the same transition from
@@ -253,6 +256,7 @@ async def run_portfolio_live(
                                 ts=bar.ts,
                                 state=persistent,
                             )
+                            strategy_snapshot_saved[binding.instance_id] = True
 
                     for original in intents:
                         local_key = original.position_key or original.trigger_tf
@@ -322,6 +326,7 @@ async def run_portfolio_live(
                                 ts=bar.ts,
                                 state=persistent,
                             )
+                            strategy_snapshot_saved[binding.instance_id] = True
         finally:
             with suppress(Exception):
                 await data_source.close()
