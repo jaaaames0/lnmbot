@@ -27,6 +27,7 @@ from lnmarkets_bot.api.isolated import IsolatedTradesApi
 from lnmarkets_bot.portfolio.store import read_overview
 
 TIMEFRAMES = ("1d", "4h")
+MA_STRATEGY_NAME = "lnmarkets_bot.strategy.ma_cross.MaCross"
 CONSTANT_NOTIONAL_USD = 100.0
 BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1h_4y.parquet"
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
@@ -846,7 +847,8 @@ def _persisted_strategy_levels(db_path: Path, tolerance_pct: float) -> dict[str,
         rows = _query(
             db_path,
             "SELECT ts, state_json FROM strategy_state_snapshots "
-            "WHERE mode = 'live' ORDER BY ts DESC LIMIT 1",
+            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
+            (MA_STRATEGY_NAME,),
         )
     except sqlite3.Error:
         return {}
@@ -885,7 +887,8 @@ def _persisted_cooldowns(db_path: Path) -> dict[str, dict[str, int]]:
         rows = _query(
             db_path,
             "SELECT state_json FROM strategy_state_snapshots "
-            "WHERE mode = 'live' ORDER BY ts DESC LIMIT 1",
+            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
+            (MA_STRATEGY_NAME,),
         )
     except sqlite3.Error:
         return empty

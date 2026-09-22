@@ -151,6 +151,17 @@ def test_ma_levels_prefer_the_persisted_live_strategy_state(tmp_path):
                 ),
             ),
         )
+        connection.execute(
+            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                2,
+                1,
+                "live",
+                "lnmarkets_bot.strategy.close_range_live.CloseRangeLive",
+                "2026-07-28 08:00:00",
+                json.dumps({"campaign": {"id": "later-breakout-state"}}),
+            ),
+        )
 
     dashboard = _dashboard_module()
     levels = dashboard._ma_levels(db_path, tolerance_pct=0.005)
@@ -165,13 +176,14 @@ def test_persisted_cooldowns_and_position_card_explain_remaining_verdict_changes
     with sqlite3.connect(db_path) as connection:
         connection.execute(
             "CREATE TABLE strategy_state_snapshots ("
-            "id INTEGER PRIMARY KEY, mode TEXT, ts TEXT, state_json TEXT)"
+            "id INTEGER PRIMARY KEY, mode TEXT, strategy_name TEXT, ts TEXT, state_json TEXT)"
         )
         connection.execute(
-            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?)",
+            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?, ?)",
             (
                 1,
                 "live",
+                "lnmarkets_bot.strategy.ma_cross.MaCross",
                 "2026-07-30 12:00:00",
                 json.dumps(
                     {
@@ -179,6 +191,16 @@ def test_persisted_cooldowns_and_position_card_explain_remaining_verdict_changes
                         "loss_suppressed_signals": {"1d": 2, "4h": 0},
                     }
                 ),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO strategy_state_snapshots VALUES (?, ?, ?, ?, ?)",
+            (
+                2,
+                "live",
+                "lnmarkets_bot.strategy.close_range_live.CloseRangeLive",
+                "2026-07-30 16:00:00",
+                json.dumps({"campaign": {"id": "later-breakout-state"}}),
             ),
         )
 
