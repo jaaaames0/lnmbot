@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
+
 from lnmarkets_bot.config import BotConfig, Network, load_config
+from lnmarkets_bot.control.lifecycle import run_session
+from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
+from lnmarkets_bot.persistence.models import runs
+from lnmarkets_bot.persistence.recorder import Recorder
 
 
 def test_signet_endpoints_are_the_testnet_defaults():
@@ -46,3 +52,33 @@ def test_blank_optional_paths_are_disabled_not_current_directory(tmp_path):
 
     assert cfg.storage_log_path is None
     assert cfg.halt_file is None
+
+
+def test_run_audit_metadata_excludes_api_credentials(tmp_path):
+    db_path = tmp_path / "audit.sqlite"
+    engine = make_engine(db_path)
+    init_schema(engine)
+    factory = make_session_factory(engine)
+    recorder = Recorder(factory)
+    cfg = BotConfig(
+        lnm_access_key="key",
+        lnm_access_secret="secret",
+        lnm_access_passphrase="passphrase",
+        storage_db_path=db_path,
+    )
+
+    with run_session(
+        recorder,
+        cfg=cfg,
+        mode="live",
+        strategy_name="test",
+        install_signal_handlers=False,
+    ):
+        pass
+
+    with factory() as session:
+        config = session.execute(select(runs.c.config_json)).scalar_one()
+    assert "lnm_access_key" not in config
+    assert "lnm_access_secret" not in config
+    assert "lnm_access_passphrase" not in config
+    assert config["storage_db_path"] == str(db_path)

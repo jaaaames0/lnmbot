@@ -28,6 +28,12 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger("lnmarkets_bot.lifecycle")
 
+_AUDIT_CONFIG_EXCLUDES = {
+    "lnm_access_key",
+    "lnm_access_secret",
+    "lnm_access_passphrase",
+}
+
 
 @dataclass
 class RunHandle:
@@ -63,7 +69,10 @@ def run_session(
         mode=mode,
         strategy_name=strategy_name,
         strategy_params=strategy_params,
-        config=cfg.model_dump(mode="json"),
+        # Run metadata is readable by the dashboard identity. Keep operational
+        # settings for audit, but do not copy credentials out of the protected
+        # environment and into SQLite.
+        config=cfg.model_dump(mode="json", exclude=_AUDIT_CONFIG_EXCLUDES),
         started_at=now_utc(),
         notes=notes,
     )
