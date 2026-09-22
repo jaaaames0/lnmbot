@@ -24,6 +24,7 @@ import websockets
 from lnmarkets_bot.api.account import AccountApi
 from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTradesApi
+from lnmarkets_bot.portfolio.store import read_overview
 
 TIMEFRAMES = ("1d", "4h")
 CONSTANT_NOTIONAL_USD = 100.0
@@ -246,6 +247,12 @@ def _query(db_path: Path, sql: str, params: tuple[object, ...] = ()) -> list[sql
     with sqlite3.connect(uri, uri=True) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(sql, params).fetchall()
+
+
+def _table_columns(db_path: Path, table: str) -> set[str]:
+    if not table.replace("_", "").isalnum():
+        raise ValueError("invalid table name")
+    return {str(row["name"]) for row in _query(db_path, f"PRAGMA table_info({table})")}
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -516,9 +523,17 @@ def _signals(
 ) -> list[dict[str, object]]:
     where = "WHERE run_id = ?" if run_id is not None else ""
     params: tuple[object, ...] = (run_id,) if run_id is not None else ()
+    columns = _table_columns(db_path, "signals")
+    strategy_column = (
+        "strategy_instance_id"
+        if "strategy_instance_id" in columns
+        else "'' AS strategy_instance_id"
+    )
+    position_column = "position_key" if "position_key" in columns else "'' AS position_key"
     rows = _query(
         db_path,
-        "SELECT id, ts, kind, side, target_size_usd, target_leverage, reason, metadata_json "
+        "SELECT id, ts, kind, side, target_size_usd, target_leverage, reason, "
+        f"{strategy_column}, {position_column}, metadata_json "
         f"FROM signals {where} ORDER BY id DESC LIMIT 500",
         params,
     )
@@ -530,6 +545,8 @@ def _signals(
         if tf and trigger_tf != tf:
             continue
         item["timeframe"] = trigger_tf or "-"
+        item["strategy"] = item.get("strategy_instance_id") or "legacy_ma"
+        item["slot"] = item.get("position_key") or trigger_tf or "-"
         item["chop_regime"] = str(meta.get("chop_regime") or "-")
         chop_value = meta.get("chop_value")
         item["chop_value"] = f"{float(chop_value):.2f}" if chop_value is not None else "-"
@@ -548,9 +565,17 @@ def _orders(
 ) -> list[dict[str, object]]:
     where = "WHERE orders.run_id = ?" if run_id is not None else ""
     params: tuple[object, ...] = (run_id,) if run_id is not None else ()
+    columns = _table_columns(db_path, "orders")
+    strategy_column = (
+        "orders.strategy_instance_id"
+        if "strategy_instance_id" in columns
+        else "'' AS strategy_instance_id"
+    )
+    position_column = "orders.position_key" if "position_key" in columns else "'' AS position_key"
     rows = _query(
         db_path,
-        "SELECT orders.id, orders.ts, orders.trigger_tf, orders.side, orders.qty_sats, "
+        f"SELECT orders.id, orders.ts, orders.trigger_tf, {strategy_column}, "
+        f"{position_column}, orders.side, orders.qty_sats, "
         "orders.leverage, orders.price_usd, orders.status, orders.lnm_order_id, "
         "orders.rejection_reason, orders.metadata_json, signals.metadata_json AS signal_metadata_json "
         "FROM orders LEFT JOIN signals ON signals.id = orders.signal_id "
@@ -565,6 +590,8 @@ def _orders(
         meta = _metadata(item.pop("metadata_json"))
         signal_meta = _metadata(item.pop("signal_metadata_json"))
         item["action"] = str(meta.get("isolated_action") or "-")
+        item["strategy"] = item.get("strategy_instance_id") or "legacy_ma"
+        item["slot"] = item.get("position_key") or item.get("trigger_tf") or "-"
         item["fee_sats"] = meta.get("opening_fee_sats", meta.get("closing_fee_sats", ""))
         item["trade_id"] = str(meta.get("lnm_trade_id") or item.get("lnm_order_id") or "")
         item["opening_fee_sats"] = int(meta.get("opening_fee_sats") or 0)
@@ -619,6 +646,8 @@ def _open_positions(
         positions.append(
             {
                 "timeframe": row.get("trigger_tf"),
+                "strategy": row.get("strategy"),
+                "slot": row.get("slot"),
                 "side": side,
                 "contracts": quantity,
                 "leverage": row.get("leverage"),
@@ -638,7 +667,7 @@ def _open_positions(
                 "trade_id": trade_id,
             }
         )
-    return sorted(positions, key=lambda row: str(row["timeframe"]))
+    return sorted(positions, key=lambda row: (str(row["strategy"]), str(row["slot"])))
 
 
 def _trade_history_rows(
@@ -653,7 +682,7 @@ def _trade_history_rows(
         trade = grouped.setdefault(trade_id, {"trade_id": trade_id})
         if order["action"] == "open":
             trade["open"] = order
-        elif order["action"] == "close":
+        elif order["action"] in {"close", "external_close"}:
             trade["close"] = order
     funding = _funding_by_trade(db_path)
     rows: list[dict[str, object]] = []
@@ -680,6 +709,8 @@ def _trade_history_rows(
                 "trade_id": f"{trade_id[:8]}…{trade_id[-4:]}",
                 "trade_id_copy": trade_id,
                 "timeframe": opened.get("trigger_tf", "-"),
+                "strategy": opened.get("strategy", "legacy_ma"),
+                "slot": opened.get("slot", opened.get("trigger_tf", "-")),
                 "position": (
                     f"{'Long' if opened.get('side') == 'buy' else 'Short'} · "
                     f"${int(opened.get('qty_sats') or 0):,} · {opened.get('leverage', '-')}x"
@@ -755,8 +786,16 @@ def _market_context(db_path: Path) -> tuple[float | None, list[dict[str, object]
     return price, changes, last_bar_ts
 
 
-def _strategy_tolerance(run: dict[str, object]) -> float:
+def _strategy_params(run: dict[str, object], instance_id: str = "ma_cross_primary") -> dict:
     params = _metadata(run.get("strategy_params_json"))
+    nested = params.get(instance_id)
+    if isinstance(nested, dict) and isinstance(nested.get("params"), dict):
+        return nested["params"]
+    return params
+
+
+def _strategy_tolerance(run: dict[str, object]) -> float:
+    params = _strategy_params(run)
     try:
         return float(params.get("tolerance_pct", 0.005))
     except (TypeError, ValueError):
@@ -911,7 +950,11 @@ def _position_status_rows(
     denomination: str,
     btc_price: float | None,
 ) -> list[dict[str, object]]:
-    by_timeframe = {str(position["timeframe"]): position for position in positions}
+    by_timeframe = {
+        str(position["timeframe"]): position
+        for position in positions
+        if position.get("strategy") in {"legacy_ma", "ma_cross_primary"}
+    }
     rows: list[dict[str, object]] = []
     for timeframe in TIMEFRAMES:
         position = by_timeframe.get(timeframe)
@@ -919,6 +962,10 @@ def _position_status_rows(
         side = str(position["side"]) if position else "flat"
         rows.append(
             {
+                "strategy": position.get("strategy", "ma_cross_primary")
+                if position
+                else "ma_cross_primary",
+                "slot": position.get("slot", timeframe) if position else timeframe,
                 "timeframe": timeframe,
                 "side": side,
                 "contracts": (
@@ -967,6 +1014,34 @@ def _position_status_rows(
                 ),
             }
         )
+    for position in positions:
+        if position.get("strategy") != "btc_close_range_v1":
+            continue
+        rows.append(
+            {
+                "strategy": "btc_close_range_v1",
+                "slot": position.get("slot", "-"),
+                "timeframe": position.get("timeframe", "1d"),
+                "side": position.get("side", "-"),
+                "contracts": f"${int(position['contracts']):,}",
+                "leverage": position.get("leverage", "-"),
+                "entry_ts": position.get("entry_ts", "-"),
+                "entry_price": _format_price(position.get("entry_price")),
+                "mark_pnl": _format_signed_amount(
+                    position.get("estimated_unrealized_sats"), denomination, btc_price
+                ),
+                "margin": _format_amount(position.get("margin_sats"), denomination, btc_price),
+                "funding": _format_signed_amount(
+                    position.get("accumulated_funding_sats"),
+                    denomination,
+                    btc_price,
+                    invert=True,
+                ),
+                "long_trigger": "campaign rule",
+                "short_trigger": "campaign rule",
+                "exit_trigger": "range / recovery / 120d / liquidation",
+            }
+        )
     active = [position for position in positions if isinstance(position.get("contracts"), int)]
     if active:
         unrealized = sum(int(position["estimated_unrealized_sats"]) for position in active)
@@ -980,6 +1055,8 @@ def _position_status_rows(
         leverage_values = {position.get("leverage") for position in active}
         rows.append(
             {
+                "strategy": "portfolio",
+                "slot": "all",
                 "timeframe": "Combined",
                 "side": "mixed"
                 if len({position["side"] for position in active}) > 1
@@ -1007,8 +1084,10 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
         if not trade_id:
             continue
         trade = grouped.setdefault(trade_id, {})
-        if order["action"] in {"open", "close"}:
-            trade[str(order["action"])] = order
+        if order["action"] == "open":
+            trade["open"] = order
+        elif order["action"] in {"close", "external_close"}:
+            trade["close"] = order
     funding = _funding_by_trade(db_path)
     events: list[dict[str, object]] = []
     for trade_id, trade in grouped.items():
@@ -1438,6 +1517,143 @@ def _pnl_basis_controls(denomination: str, granularity: str, pnl_basis: str) -> 
     )
 
 
+def _portfolio_panel() -> str:
+    """Optional read-only development book; never mixed into live account totals."""
+    configured = os.environ.get("LNMBOT_PORTFOLIO_SHADOW_DB")
+    if not configured:
+        return ""
+    try:
+        overview = read_overview(Path(configured))
+    except (sqlite3.Error, ValueError, OSError):
+        return "<section><h2>Breakout shadow</h2><p>Shadow book unavailable.</p></section>"
+    occupancy = []
+    for seed in overview["seeds"]:
+        campaign = seed["observation"].get("active_hypothetical_stack") or {}
+        observed = _parse_ts(seed["close_ts"])
+        fresh = observed is not None and datetime.now(UTC) - observed <= timedelta(hours=36)
+        occupancy.append(
+            {
+                "strategy": seed["instance_id"],
+                "campaign": campaign.get("parent_id", "None"),
+                "side": campaign.get("side", "—"),
+                "parent_entry": campaign.get("entry_ts", "—"),
+                "boundary": _format_price(campaign.get("boundary")),
+                "new_parent": "Blocked by historical campaign"
+                if seed["parent_occupied"]
+                else "Requires runtime admission",
+                "observed_through": seed["close_ts"],
+                "freshness": "Recent snapshot" if fresh else "Stale snapshot",
+            }
+        )
+    runtimes = []
+    for runtime in overview["runtimes"]:
+        campaign = runtime["state"].get("campaign") or {}
+        observed = _parse_ts(runtime["last_candle_ts"])
+        fresh = observed is not None and datetime.now(UTC) - observed <= timedelta(hours=36)
+        runtimes.append(
+            {
+                "strategy": runtime["instance_id"],
+                "last_candle": runtime["last_candle_ts"],
+                "campaign": campaign.get("campaign_id", "None"),
+                "origin": campaign.get("origin", "—"),
+                "lifetime_units": campaign.get("lifetime_units", 0),
+                "known_fills": len(campaign.get("units", [])),
+                "pending_exit": runtime["state"].get("pending_exit") or "—",
+                "freshness": "Recent state" if fresh else "Stale state",
+            }
+        )
+    return (
+        "<section><h2>Breakout shadow — no orders</h2>"
+        "<p>Historical occupancy is hypothetical. It has no owned trades, collateral "
+        "or live profit. Forward accounting below is separate from MA and live account totals.</p>"
+        + _table(
+            "Historical campaign context",
+            occupancy,
+            (
+                "strategy",
+                "campaign",
+                "side",
+                "parent_entry",
+                "boundary",
+                "new_parent",
+                "observed_through",
+                "freshness",
+            ),
+        )
+        + _table(
+            "Forward machine",
+            runtimes,
+            (
+                "strategy",
+                "last_candle",
+                "campaign",
+                "origin",
+                "lifetime_units",
+                "known_fills",
+                "pending_exit",
+                "freshness",
+            ),
+        )
+        + _table(
+            "Attributed book accounting (sats)",
+            overview["strategies"],
+            (
+                "id",
+                "mode",
+                "realized_sats",
+                "fee_sats",
+                "funding_sats",
+                "net_sats",
+                "closed_trades",
+                "winning_trades",
+            ),
+        )
+        + "</section>"
+    )
+
+
+def _strategy_accounting_panel(db_path: Path, denomination: str, btc_price: float | None) -> str:
+    """Integrated live attribution from the shared funded execution path."""
+    try:
+        rows = _query(
+            db_path,
+            "SELECT strategy_instance_id, COUNT(DISTINCT trade_id) AS trades, "
+            "SUM(CASE WHEN kind='opening_fee' THEN amount_sats ELSE 0 END) AS opening_fees, "
+            "SUM(CASE WHEN kind='funding' THEN amount_sats ELSE 0 END) AS funding, "
+            "SUM(CASE WHEN kind IN ('close_net_pl','liquidation','external_close_net_pl') "
+            "THEN amount_sats ELSE 0 END) AS closed_pl, SUM(amount_sats) AS net "
+            "FROM strategy_pnl_events GROUP BY strategy_instance_id "
+            "ORDER BY strategy_instance_id",
+        )
+    except sqlite3.Error:
+        return ""
+    if not rows:
+        return ""
+    display = []
+    for row in rows:
+        display.append(
+            {
+                "strategy": row["strategy_instance_id"] or "legacy_ma",
+                "trades": row["trades"],
+                "opening_fees": _format_signed_amount(row["opening_fees"], denomination, btc_price),
+                "funding": _format_signed_amount(row["funding"], denomination, btc_price),
+                "closed_pl": _format_signed_amount(row["closed_pl"], denomination, btc_price),
+                "net": _format_signed_amount(row["net"], denomination, btc_price),
+            }
+        )
+    return (
+        "<section><h2>Live strategy attribution</h2>"
+        "<p>Signed results recorded since the integrated executor was enabled. "
+        "The strategies share wallet cash; these rows attribute trading outcomes.</p>"
+        + _table(
+            "Strategy P&L",
+            display,
+            ("strategy", "trades", "opening_fees", "funding", "closed_pl", "net"),
+        )
+        + "</section>"
+    )
+
+
 def _overview(
     db_path: Path,
     run: dict[str, object],
@@ -1450,7 +1666,11 @@ def _overview(
     positions = _open_positions(db_path, orders, price, exchange)
     levels = _ma_levels(db_path, _strategy_tolerance(run))
     pnl = _pnl_summary(db_path, positions)
-    by_timeframe = {str(position["timeframe"]): position for position in positions}
+    by_timeframe = {
+        str(position["timeframe"]): position
+        for position in positions
+        if position.get("strategy") in {"legacy_ma", "ma_cross_primary"}
+    }
     cooldowns = _persisted_cooldowns(db_path)
     cards = "".join(
         (
@@ -1486,6 +1706,8 @@ def _overview(
                 "Active positions",
                 _position_status_rows(positions, levels, denomination, price),
                 (
+                    "strategy",
+                    "slot",
                     "timeframe",
                     "side",
                     "entry_ts",
@@ -1511,6 +1733,8 @@ def _overview(
             ),
             _table("Latest funding", funding_display, ("ts", "funding")),
             "</div></div>",
+            _portfolio_panel(),
+            _strategy_accounting_panel(db_path, denomination, price),
         )
     )
 
@@ -1568,7 +1792,7 @@ def _topbar(
 
 def _active_config(run: dict[str, object]) -> str:
     config = _metadata(run.get("config_json"))
-    strategy = _metadata(run.get("strategy_params_json"))
+    strategy = _strategy_params(run)
     if not config:
         return "<section><h2>Active run configuration</h2><p class=muted>Configuration unavailable.</p></section>"
 
@@ -1664,8 +1888,9 @@ def _active_config(run: dict[str, object]) -> str:
 
 
 def _strategy_explainer(run: dict[str, object]) -> str:
-    """Describe the active MA-cross rules without exposing implementation jargon."""
-    strategy = _metadata(run.get("strategy_params_json"))
+    """Describe all active strategy rules without exposing implementation jargon."""
+    all_strategies = _metadata(run.get("strategy_params_json"))
+    strategy = _strategy_params(run)
     config = _metadata(run.get("config_json"))
     try:
         tolerance = float(strategy.get("tolerance_pct", 0.005))
@@ -1700,6 +1925,19 @@ def _strategy_explainer(run: dict[str, object]) -> str:
         if config.get("strategy_4h_chop_reduce_enabled")
         else ""
     )
+    breakout = all_strategies.get("btc_close_range_v1")
+    breakout_note = ""
+    if isinstance(breakout, dict) and isinstance(breakout.get("params"), dict):
+        params = breakout["params"]
+        breakout_note = (
+            "<p><b>Close-range breakout:</b> completed LN Markets daily candles define "
+            "a prior-20-close breakout. Parents require the frozen EMA/ATR and candle-overlap "
+            "structure filter; qualifying same-side add-ons use K0-K3 and the 15% parent-entry "
+            "distance cap. Campaign exits are the original range close, day-85 peak recovery, "
+            "day-120 cap, or isolated liquidation. The configured unit is "
+            f"${float(params.get('unit_notional_usd', 0)):,.0f} at "
+            f"{float(params.get('leverage', 0)):g}x.</p>"
+        )
     return (
         "<section class=strategy-explainer><h2>How the active strategy behaves</h2>"
         "<p>The 1d and 4h timeframes operate independently, each with at most one isolated position. "
@@ -1715,6 +1953,7 @@ def _strategy_explainer(run: dict[str, object]) -> str:
         f"{count('cooldown_signal_count', '1d')} winner or {count('loss_cooldown_signal_count', '1d')} loss changes on 1d, and "
         f"{count('cooldown_signal_count', '4h')} winner or {count('loss_cooldown_signal_count', '4h')} loss changes on 4h. "
         f"A slot is spent by {consumption}. An exposure-reducing close is still allowed during cool-off; only its replacement entry is suppressed.{chop_note}</p>"
+        f"{breakout_note}"
         "</section>"
     )
 
@@ -1747,6 +1986,8 @@ def _detail_page(
             (
                 "id",
                 "ts",
+                "strategy",
+                "slot",
                 "timeframe",
                 "kind",
                 "side",
@@ -1765,6 +2006,8 @@ def _detail_page(
             _trade_history_rows(db_path, tf=tf, denomination=denomination, btc_price=price),
             (
                 "trade_id",
+                "strategy",
+                "slot",
                 "timeframe",
                 "position",
                 "opened_ts",

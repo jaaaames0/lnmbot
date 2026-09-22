@@ -21,6 +21,49 @@ def _dashboard_module():
     return module
 
 
+def test_optional_portfolio_panel_is_read_only_and_separates_seed_profit(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from lnmarkets_bot.portfolio.store import PortfolioStore
+
+    dashboard = _dashboard_module()
+    monkeypatch.delenv("LNMBOT_PORTFOLIO_SHADOW_DB", raising=False)
+    assert dashboard._portfolio_panel() == ""
+    path = tmp_path / "shadow.sqlite"
+    monkeypatch.setenv("LNMBOT_PORTFOLIO_SHADOW_DB", str(path))
+    assert "unavailable" in dashboard._portfolio_panel()
+    assert not path.exists()
+    store = PortfolioStore(path)
+    store.register("breakout", "paper", "rules")
+    store.import_shadow_observation(
+        "breakout",
+        {
+            "mode": "shadow_no_orders",
+            "order_capability": False,
+            "strategy": "structure_parent_addons_raw",
+            "rules_sha256": "rules",
+            "as_of_close": "2026-09-21T00:00:00+00:00",
+            "next_open": "2026-09-22T00:00:00+00:00",
+            "generated_at": "2026-09-22T01:00:00+00:00",
+            "active_hypothetical_stack": {
+                "parent_id": "20260822L<script>",
+                "entry_ts": "2026-08-22T00:00:00+00:00",
+                "side": "long",
+                "boundary": 72998.7,
+                "active_units": 4,
+            },
+        },
+        now=datetime(2026, 9, 22, 2, tzinfo=UTC),
+    )
+    before = path.read_bytes()
+    panel = dashboard._portfolio_panel()
+    assert "Blocked by historical campaign" in panel
+    assert "no owned trades" in panel
+    assert "20260822L&lt;script&gt;" in panel
+    assert "20260822L<script>" not in panel
+    assert path.read_bytes() == before
+
+
 def test_signals_span_restart_runs_by_default(tmp_path):
     db_path = tmp_path / "dashboard.sqlite"
     with sqlite3.connect(db_path) as connection:
@@ -171,6 +214,61 @@ def test_strategy_explainer_says_triggering_exit_does_not_spend_a_slot():
     assert "does <b>not</b> spend a slot" in explainer
     assert "including a move to or from Flat" in explainer
     assert "high, new 4h entries use the configured reduced size" in explainer
+
+
+def test_strategy_explainer_handles_portfolio_params_and_describes_breakout():
+    dashboard = _dashboard_module()
+    explainer = dashboard._strategy_explainer(
+        {
+            "strategy_params_json": json.dumps(
+                {
+                    "ma_cross_primary": {
+                        "strategy": "lnmarkets_bot.strategy.ma_cross.MaCross",
+                        "params": {
+                            "tolerance_pct": 0.005,
+                            "cooldown_threshold_pct": {"1d": 0.03, "4h": 0.05},
+                            "loss_cooldown_threshold_pct": {"1d": 0.05, "4h": 0.02},
+                            "cooldown_signal_count": {"1d": 12, "4h": 11},
+                            "loss_cooldown_signal_count": {"1d": 3, "4h": 4},
+                        },
+                    },
+                    "btc_close_range_v1": {
+                        "strategy": "lnmarkets_bot.strategy.close_range_live.CloseRangeLive",
+                        "params": {"unit_notional_usd": 100, "leverage": 5},
+                    },
+                }
+            ),
+            "config_json": "{}",
+        }
+    )
+    assert "0.50% above" in explainer
+    assert "Close-range breakout" in explainer
+    assert "$100 at 5x" in explainer
+
+
+def test_strategy_accounting_panel_separates_shared_wallet_results(tmp_path):
+    db_path = tmp_path / "accounting.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_pnl_events ("
+            "strategy_instance_id TEXT, trade_id TEXT, kind TEXT, amount_sats INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO strategy_pnl_events VALUES (?, ?, ?, ?)",
+            (
+                ("ma_cross_primary", "ma-1", "close_net_pl", 100),
+                ("btc_close_range_v1", "bo-1", "opening_fee", -5),
+                ("btc_close_range_v1", "bo-1", "funding", 2),
+            ),
+        )
+
+    dashboard = _dashboard_module()
+    panel = dashboard._strategy_accounting_panel(db_path, "sats", None)
+
+    assert "ma_cross_primary" in panel
+    assert "btc_close_range_v1" in panel
+    assert "class=positive>+100 " in panel
+    assert "class=negative>-3 " in panel
 
 
 def test_active_run_ignores_newer_manual_recovery_rows(tmp_path):
