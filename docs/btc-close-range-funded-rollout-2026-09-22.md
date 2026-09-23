@@ -248,3 +248,36 @@ switch, all eight HTTP routes returned 200, the trader stayed at PID 3385478
 with zero restarts, SQLite `quick_check` passed and the order count stayed 39.
 The rollback timer was disarmed; its root-only checkpoint is
 `/data/security-backups/lnmbot-dashboard-stack-layout-20260923T011828Z`.
+
+## Compact positions and signal timeline — 2026-09-23
+
+Dashboard commit `f3e00db1e25c` is deployed at
+`/usr/local/lib/lnmbot-dashboard/prod-20260923.4-gf3e00db1e25c`.
+Active positions has no Status or redundant Timeframe column. The Slot cell
+opens the breakout campaign into K0–K3 rows in the same table, with the same
+columns as the MA rows. Only existing units appear. Numeric paper values no
+longer carry a repeated qualifier; the breakout card and campaign-row tooltip
+still identify the historical simulation. Funded child rows use actual order
+notional, margin, funding and marked P&L.
+
+The campaign exit cell now shows the range boundary as a daily-close trigger
+before day 85. From day 85 it also shows the 97%-of-peak recovery close level
+and days left until the day-120 cap. Venue liquidation is independent and
+specific to each funded isolated unit; there is no campaign-wide liquidation
+price in the dashboard. The rules do not guarantee a unit's liquidation level
+is beyond the range boundary.
+
+The overview shows only the latest five breakout events with their time,
+slot, source and reason. The Signals page combines MA and breakout events in
+one timeline; its Metrics column carries MA sizing/chop details or breakout
+close, range, EMA/ATR distance and overlap. The breakout view includes the
+verified historical signal trail, recent live decisions and recorded signals.
+
+Thirty-three focused dashboard, breakout and portfolio tests passed, as did
+Ruff. A read-only render against the live database verified one positions
+table, four K child rows, the current range-only exit display and detailed
+breakout signals. After the dashboard-only switch, all eight HTTP routes
+returned 200, the funded trader kept PID 3512167, no orders were added (39),
+SQLite `quick_check` passed and the dashboard had zero restarts. The timed
+rollback was disarmed; its root-only checkpoint is
+`/data/security-backups/lnmbot-dashboard-layout-20260923T143522Z`.
