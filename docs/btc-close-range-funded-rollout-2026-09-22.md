@@ -170,3 +170,21 @@ The old MA-only runtime cannot manage K-slot positions. After any breakout
 fill, keep the integrated executor active or deliberately drain every breakout
 unit before reverting. Never restore the database merely to undo the additive
 schema.
+
+## Historical campaign paper view — 2026-09-23
+
+Dashboard commit `bc5d43d1edba` is deployed at
+`/usr/local/lib/lnmbot-dashboard/prod-20260923.1-gbc5d43d1edba`. The
+expandable `20260822L` row shows reconstructed K0–K3 entries, signal dates,
+the blocked August 19–20 signals and a current gross paper mark. The
+reconstruction is a versioned artifact checked against the seed and candle
+hashes; the live campaign must also match its parent, boundary and unit count.
+The dashboard keeps the synthetic values out of funded positions, wallet
+balance and P&L statistics. Its 160 MB memory cap accommodates the full
+overview rendering while remaining bounded.
+
+The dashboard-only switch passed all seven routes, the live paper view, zero
+dashboard restarts and SQLite `quick_check`. The trader retained PID 3385478
+with zero restarts and 39 order rows. The timed rollback was disarmed after
+acceptance; its root-only checkpoint is
+`/data/security-backups/lnmbot-dashboard-paper-campaign-20260923T004951Z`.
