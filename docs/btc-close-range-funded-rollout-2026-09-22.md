@@ -83,7 +83,7 @@ cases; they are not counted as successful evidence.
 
 ## Accepted deployment
 
-The sole funded executor now runs from
+The initial sole funded executor ran from
 `/usr/local/lib/lnmbot/prod-20260922.3-g12d9baac7b2a`. The dashboard runs from
 `/usr/local/lib/lnmbot-dashboard/prod-20260922.3-g8df824e73760`. Both retain
 their locked identities, protected environments and shared database boundary.
@@ -127,6 +127,33 @@ card showed 11 verdict changes of winner cool-off remaining, both strategy
 snapshots were present and SQLite `quick_check` passed. The accepted release
 has a root-only rollback checkpoint at
 `/data/security-backups/lnmbot-dashboard-three-position-20260922T230545Z`.
+
+## Funded reversal execution correction — 2026-09-23
+
+The August 19 and 20 long breakout signals passed the structure test, but the
+historical `20260602S` short still occupied the sole campaign. Its range-close
+exit and the August 21 long signal coincided at the August 22 open. The pure
+state machine closed the short and modeled `20260822L` correctly, while the
+live adapter would have suppressed a new funded parent while old funded slots
+were marked as closing, leaving modeled occupancy without a venue position.
+
+The adapter now durably retains a same-open parent signal, submits exits for all
+old funded slots first, and proposes the new `k0` entry on a later 1-minute bar
+only when every old slot is confirmed flat. It discards the signal if that
+handoff takes more than five minutes, rather than entering late. Rejected or
+failed parent entries clear unfunded modeled occupancy. Restart recovery
+resumes pending closes and recognizes a parent fill completed before its final
+strategy snapshot, without submitting a duplicate.
+
+The tested code is commit `59bbe62a20ff`, deployed only to `lnmbot.service` at
+`/usr/local/lib/lnmbot/prod-20260923.1-g59bbe62a20ff`. The dashboard service
+was not restarted. Focused strategy, machine, portfolio and executor checks
+passed (45 tests), as did Ruff and strict mypy. A disposable copy of the live
+database restored both strategies and reconciled the one venue trade to
+`ma_cross_primary:4h` before and after the switch. The accepted trader has
+zero restarts, SQLite `quick_check` passes, the order journal remains at 39,
+and a fresh encrypted backup succeeded. The root-only checkpoint is
+`/data/security-backups/lnmbot-breakout-reversal-20260923T002615Z`.
 
 The old MA-only runtime cannot manage K-slot positions. After any breakout
 fill, keep the integrated executor active or deliberately drain every breakout
