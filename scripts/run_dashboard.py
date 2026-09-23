@@ -397,6 +397,12 @@ def _table(
     headers = "".join(f"<th>{html.escape(column.replace('_', ' '))}</th>" for column in columns)
 
     def cell(row: dict[str, object], column: str) -> str:
+        if column == "slot" and isinstance(row.get("_children"), list):
+            label = html.escape(str(row.get("_summary_label") or row.get("slot") or "campaign"))
+            return SafeHtml(
+                '<details data-preserve-open class="stack-toggle">'
+                f'<summary>{label}</summary></details>'
+            )
         if column == "trade_id" and row.get("trade_id_copy"):
             trade_id = str(row["trade_id_copy"])
             short_id = str(row.get("trade_id") or trade_id)
@@ -412,13 +418,26 @@ def _table(
             return _format_timestamp(value)
         return str(value if value is not None else "")
 
-    body = "".join(
-        "<tr>"
-        + "".join(
-            f"<td>{cell(row, column) if column == 'trade_id' and row.get('trade_id_copy') else _render_cell_value(cell(row, column))}</td>"
-            for column in columns
+    def render_row(row: dict[str, object], *, child: bool = False) -> str:
+        css_class = ' class="stack-unit-row"' if child else (
+            ' class="stack-summary-row"' if isinstance(row.get("_children"), list) else ""
         )
-        + "</tr>"
+        title = (
+            f' title="{html.escape(str(row["_row_title"]), quote=True)}"'
+            if row.get("_row_title") else ""
+        )
+        return (
+            f"<tr{css_class}{title}>"
+            + "".join(
+                f"<td>{cell(row, column) if column == 'trade_id' and row.get('trade_id_copy') else _render_cell_value(cell(row, column))}</td>"
+                for column in columns
+            )
+            + "</tr>"
+        )
+
+    body = "".join(
+        render_row(row)
+        + "".join(render_row(child, child=True) for child in row.get("_children", []))
         + (
             f'<tr class="stack-detail-row"><td colspan="{len(columns)}">{row["_details_html"]}</td></tr>'
             if isinstance(row.get("_details_html"), SafeHtml)
@@ -1089,26 +1108,25 @@ def _historical_paper_position(
     }
 
 
-def _breakout_unit_details(rows: list[dict[str, object]], *, paper: bool = False) -> SafeHtml:
-    """Keep the breakout stack's K slots below its single summary row."""
-    label = "paper" if paper else "funded"
-    note = (
-        "<p class=muted>Paper gross estimates exclude fees, funding and liquidation. "
-        "No venue trades or wallet P&amp;L are recorded for this historical campaign.</p>"
-        if paper else ""
-    )
-    return SafeHtml(
-        '<details data-preserve-open class="stack-drilldown">'
-        f'<summary>Show {len(rows)} {label} K units</summary>'
-        + _table(
-            "Breakout K units",
-            rows,
-            ("slot", "status", "entry_ts", "contracts", "leverage", "entry_price", "margin", "funding", "mark_pnl"),
-            compact=True,
-        )
-        + note
-        + "</details>"
-    )
+def _breakout_exit_trigger(campaign: dict[str, object] | None) -> SafeHtml | str:
+    """Show only exit levels that can currently act on a daily close."""
+    if not isinstance(campaign, dict):
+        return "-"
+    boundary = _format_price(campaign.get("boundary"))
+    held_days = int(campaign.get("held_days") or 0)
+    lines = [f"range close {boundary}"]
+    if held_days >= 85:
+        units = campaign.get("units")
+        parent = units[0] if isinstance(units, list) and units else None
+        peak = float(campaign.get("peak_favorable") or 0)
+        if isinstance(parent, dict) and peak > 0:
+            entry = float(parent.get("entry_price") or 0)
+            if entry > 0:
+                side = 1 if campaign.get("side") == 1 else -1
+                recovery = entry * (1 + side * 0.97 * peak)
+                lines.append(f"recovery close {_format_price(recovery)}")
+        lines.append(f"cap {max(0, 120 - held_days)}d")
+    return SafeHtml("<br>".join(html.escape(line) for line in lines))
 
 
 def _breakout_card(context: dict[str, object], denomination: str, btc_price: float | None) -> str:
@@ -1186,7 +1204,8 @@ def _breakout_card(context: dict[str, object], denomination: str, btc_price: flo
 
 
 def _breakout_activity_rows(
-    db_path: Path, state: dict[str, object] | None, paper: dict[str, object] | None
+    db_path: Path, state: dict[str, object] | None, paper: dict[str, object] | None,
+    *, recorded_limit: int = 5, decision_limit: int = 8,
 ) -> list[dict[str, object]]:
     """Put emitted signals, recent decisions and the active seed trail in one timeline."""
     rows: list[dict[str, object]] = []
@@ -1202,6 +1221,7 @@ def _breakout_activity_rows(
         *, source: str, signal_ts: object, action_ts: object, slot: object,
         kind: object, reason: object, signal_close: object = None,
         boundary: object = None, distance: object = None, overlap: object = None,
+        side: object = None, size_usd: object = None, leverage: object = None,
     ) -> None:
         rows.append(
             {
@@ -1211,6 +1231,9 @@ def _breakout_activity_rows(
                 "slot": slot or "-",
                 "kind": kind or "-",
                 "reason": reason or "-",
+                "side": side or "-",
+                "size_usd": size_usd,
+                "leverage": leverage,
                 "signal_close": _format_price(signal_close),
                 "range_boundary": _format_price(boundary),
                 "ema_distance_atr": metric(distance, 2),
@@ -1218,18 +1241,20 @@ def _breakout_activity_rows(
             }
         )
 
-    emitted = _signals(db_path, tf="breakout")[:5]
+    emitted = _signals(db_path, tf="breakout")[:recorded_limit]
     for signal in emitted:
         add(
             source="Recorded signal", signal_ts=signal["signal_ts"], action_ts=signal["ts"],
             slot=signal["slot"], kind=signal["kind"], reason=signal["reason"],
             signal_close=signal["signal_close"], boundary=signal["range_boundary"],
             distance=signal["distance_ema_atr"], overlap=signal["average_overlap10"],
+            side=signal["side"], size_usd=signal["target_size_usd"],
+            leverage=signal["target_leverage"],
         )
     emitted_actions = {(str(row["ts"]), str(row["slot"])) for row in emitted}
     decisions = state.get("recent_decisions", []) if state else []
     if isinstance(decisions, list):
-        for decision in decisions[-8:]:
+        for decision in decisions[-decision_limit:]:
             if not isinstance(decision, dict):
                 continue
             slot = f"k{decision['k']}" if decision.get("k") is not None else "-"
@@ -1244,6 +1269,7 @@ def _breakout_activity_rows(
                 reason=decision.get("reason"), signal_close=meta.get("signal_close"),
                 boundary=meta.get("boundary"), distance=meta.get("distance_ema_atr"),
                 overlap=meta.get("average_overlap10"),
+                side="long" if decision.get("side") == 1 else "short" if decision.get("side") == -1 else None,
             )
     if paper is not None:
         for event in paper["signal_trail"]:
@@ -1252,10 +1278,70 @@ def _breakout_activity_rows(
                 source="Historical replay", signal_ts=event["signal_ts"],
                 action_ts=event["action_ts"],
                 slot=result[:2].lower() if result.startswith("K") else "-",
-                kind="paper entry" if result.startswith("K") else "paper decision",
-                reason=result, signal_close=event["signal_close"],
+                kind="entry" if result.startswith("K") else "decision",
+                reason=result.replace(" paper entry", " entry"), signal_close=event["signal_close"],
                 boundary=event["range_boundary"], distance=event["distance_ema_atr"],
                 overlap=event["average_overlap10"],
+                side="long" if result.startswith("K") and paper["side"] == 1 else "short" if result.startswith("K") else None,
+            )
+    rows.sort(
+        key=lambda row: _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    return rows
+
+
+def _signal_timeline_rows(
+    db_path: Path, tf: str | None, breakout_state: dict[str, object] | None,
+    paper: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    """Give MA records and breakout decisions one readable event vocabulary."""
+    rows: list[dict[str, object]] = []
+    if tf != "breakout":
+        for signal in _signals(db_path, tf=tf):
+            if signal["strategy"] == BREAKOUT_INSTANCE_ID:
+                continue
+            metrics = []
+            if signal["kind"] == "entry":
+                metrics.append(f"${float(signal['target_size_usd'] or 0):,.0f}")
+                if signal["target_leverage"] != "-":
+                    metrics.append(f"{float(signal['target_leverage'] or 0):g}x")
+            if signal["chop_regime"] != "-":
+                metrics.append(f"chop {signal['chop_regime']} ({signal['chop_value']})")
+            if signal["entry_size_multiplier"] != "-":
+                metrics.append(f"size {signal['entry_size_multiplier']}")
+            rows.append(
+                {
+                    "signal_ts": signal["signal_ts"], "action_ts": signal["ts"],
+                    "source": "Recorded signal",
+                    "strategy": signal["strategy"], "slot": signal["slot"],
+                    "kind": signal["kind"], "side": signal["side"] or "-",
+                    "reason": signal["reason"], "metrics": " · ".join(metrics) or "-",
+                }
+            )
+    if tf in {None, "breakout"}:
+        for event in _breakout_activity_rows(
+            db_path, breakout_state, paper, recorded_limit=500, decision_limit=256
+        ):
+            metrics = []
+            if event["kind"] == "entry" and event["size_usd"] is not None:
+                metrics.append(f"${float(event['size_usd']):,.0f}")
+                if event["leverage"] not in {None, "-"}:
+                    metrics.append(f"{float(event['leverage']):g}x")
+            for key, label in (
+                ("signal_close", "close"), ("range_boundary", "range"),
+                ("ema_distance_atr", "EMA ATR"), ("overlap_10", "overlap"),
+            ):
+                if event[key] != "-":
+                    metrics.append(f"{label} {event[key]}")
+            rows.append(
+                {
+                    "signal_ts": event["signal_ts"], "action_ts": event["action_ts"],
+                    "source": event["source"],
+                    "strategy": BREAKOUT_INSTANCE_ID, "slot": event["slot"],
+                    "kind": event["kind"], "side": event["side"],
+                    "reason": event["reason"], "metrics": " · ".join(metrics) or "-",
+                }
             )
     rows.sort(
         key=lambda row: _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
@@ -1320,10 +1406,10 @@ def _position_status_rows(
         side = str(position["side"]) if position else "flat"
         rows.append(
             {
-                "strategy": position.get("strategy", "ma_cross_primary")
-                if position
-                else "ma_cross_primary",
-                "status": "Open" if position else "Flat",
+                "strategy": (
+                    "Legacy MA" if position and position.get("strategy") == "legacy_ma"
+                    else "MA cross"
+                ),
                 "slot": position.get("slot", timeframe) if position else timeframe,
                 "timeframe": timeframe,
                 "side": side,
@@ -1389,20 +1475,6 @@ def _position_status_rows(
             if owned
             else "flat"
         )
-        if not breakout["available"]:
-            status = "State mismatch" if owned else "Awaiting state"
-        elif isinstance(campaign, dict) and campaign.get("origin") == "historical":
-            status = "State mismatch" if owned else "Historical · no funded trade"
-            if paper is not None:
-                status += (
-                    f" · {len(paper['units'])} paper units · day {paper['held_days']}/120"
-                    f" · peak +{paper['peak_favorable_pct']:.2f}%"
-                )
-        elif isinstance(campaign, dict):
-            status = f"Funded · {len(owned)}/4 units" if owned else "Closing"
-        else:
-            status = "State mismatch" if owned else "Flat"
-
         funded_notional = sum(int(position.get("contracts") or 0) for position in owned)
         funded_prices = [
             (int(position.get("contracts") or 0), float(position.get("entry_price") or 0))
@@ -1417,17 +1489,24 @@ def _position_status_rows(
         funded_pnl = [position.get("estimated_unrealized_sats") for position in owned]
         funded_margins = [position.get("margin_sats") for position in owned]
         campaign_row = {
-            "strategy": BREAKOUT_INSTANCE_ID,
-            "status": status,
+            "strategy": "Breakout",
             "slot": "campaign",
+            "_summary_label": (
+                f"campaign · {len(paper['units'])}/4" if paper is not None
+                else f"campaign · {len(owned)}/4" if owned else "campaign"
+            ),
+            "_row_title": (
+                "Historical model; no funded venue trades or wallet P&L"
+                if paper is not None else None
+            ),
             "timeframe": "1d",
             "side": side,
             "contracts": (
-                f"${paper['total_notional_usd']:,.0f} paper"
+                f"${paper['total_notional_usd']:,.0f}"
                 if paper is not None else f"${funded_notional:,}" if owned else "-"
             ),
             "leverage": (
-                f"{paper['leverage']:g}x paper"
+                f"{paper['leverage']:g}x"
                 if paper is not None else next(iter(funded_leverages))
                 if len(funded_leverages) == 1 else "mixed" if owned else "-"
             ),
@@ -1436,31 +1515,28 @@ def _position_status_rows(
                 paper["weighted_entry"] if paper is not None else funded_entry
             ),
             "mark_pnl": (
-                f"{_format_signed_amount(paper['gross_sats'], denomination, btc_price)} paper gross"
+                _format_signed_amount(paper['gross_sats'], denomination, btc_price)
                 if paper is not None else _format_signed_amount(
                     sum(funded_pnl) if all(isinstance(value, int) for value in funded_pnl) else None,
                     denomination, btc_price,
                 ) if owned else "-"
             ),
             "margin": (
-                f"${paper['initial_margin_usd']:,.0f} paper"
+                f"${paper['initial_margin_usd']:,.0f}"
                 if paper is not None else _format_amount(
                     sum(funded_margins) if all(isinstance(value, int) for value in funded_margins) else None,
                     denomination, btc_price,
                 ) if owned else "-"
             ),
             "funding": (
-                "not modeled" if paper is not None else _format_signed_amount(
+                "-" if paper is not None else _format_signed_amount(
                     sum(int(position.get("accumulated_funding_sats") or 0) for position in owned),
                     denomination, btc_price, invert=True,
                 ) if owned else "-"
             ),
             "long_trigger": "-",
             "short_trigger": "-",
-            "exit_trigger": (
-                f"range {_format_price(campaign.get('boundary'))} / recovery d85 / 120d / liquidation"
-                if isinstance(campaign, dict) else "-"
-            ),
+            "exit_trigger": _breakout_exit_trigger(campaign),
         }
         if paper is not None:
             mark = paper["mark"]
@@ -1475,25 +1551,29 @@ def _position_status_rows(
                 unit_rows.append(
                     {
                         "slot": f"k{unit['k']}",
-                        "status": "Paper parent" if unit["k"] == 0 else "Paper add-on",
+                        "strategy": "",
+                        "side": side,
+                        "exit_trigger": "-",
                         "entry_ts": unit["entry_ts"],
-                        "contracts": f"${notional:,.0f} paper",
-                        "leverage": f"{paper['leverage']:g}x paper",
+                        "contracts": f"${notional:,.0f}",
+                        "leverage": f"{paper['leverage']:g}x",
                         "entry_price": _format_price(entry),
-                        "margin": f"${notional / paper['leverage']:,.0f} paper",
-                        "funding": "not modeled",
+                        "margin": f"${notional / paper['leverage']:,.0f}",
+                        "funding": "-",
                         "mark_pnl": (
-                            f"{_format_signed_amount(gross_sats, denomination, btc_price)} paper gross"
+                            _format_signed_amount(gross_sats, denomination, btc_price)
                             if mark else "-"
                         ),
                     }
                 )
-            campaign_row["_details_html"] = _breakout_unit_details(unit_rows, paper=True)
+            campaign_row["_children"] = unit_rows
         elif owned:
             unit_rows = [
                 {
                     "slot": position.get("slot", "-"),
-                    "status": "Open",
+                    "strategy": "",
+                    "side": side,
+                    "exit_trigger": "venue liq.",
                     "entry_ts": position.get("entry_ts", "-"),
                     "contracts": f"${int(position['contracts']):,}",
                     "leverage": position.get("leverage", "-"),
@@ -1509,7 +1589,7 @@ def _position_status_rows(
                 }
                 for position in sorted(owned, key=lambda position: str(position.get("slot")))
             ]
-            campaign_row["_details_html"] = _breakout_unit_details(unit_rows)
+            campaign_row["_children"] = unit_rows
         rows.append(campaign_row)
     return rows
 
@@ -2158,7 +2238,7 @@ def _overview(
     )
     signal_rows_by_tf = {timeframe: _signals(db_path, tf=timeframe)[:5] for timeframe in TIMEFRAMES}
     paper = _historical_paper_position(breakout, price) if breakout_enabled else None
-    breakout_signals = _breakout_activity_rows(db_path, breakout_state, paper)
+    breakout_signals = _breakout_activity_rows(db_path, breakout_state, paper)[:5]
     funding_rows = [
         dict(row)
         for row in _query(
@@ -2187,9 +2267,7 @@ def _overview(
                 ),
                 (
                     "strategy",
-                    "status",
                     "slot",
-                    "timeframe",
                     "side",
                     "entry_ts",
                     "contracts",
@@ -2217,10 +2295,10 @@ def _overview(
                 "Latest breakout signals",
                 breakout_signals,
                 (
-                    "signal_ts", "action_ts", "slot", "source", "kind", "reason",
-                    "signal_close", "range_boundary", "ema_distance_atr", "overlap_10",
+                    "action_ts", "slot", "source", "reason",
                 ),
             ),
+            '<a class="activity-more" href="/signals?tf=breakout">All breakout signals →</a>',
             "</div>",
             _table("Latest funding", funding_display, ("ts", "strategy", "slot", "funding")),
             "</div></div>",
@@ -2474,23 +2552,24 @@ def _detail_page(
     run_id = int(run["id"])
     suffix = f" · {tf}" if tf else ""
     if page == "signals":
+        breakout_state = _persisted_breakout_state(db_path)
+        btc_price, _, _ = _market_context(db_path)
+        positions = _open_positions(db_path, _orders(db_path), btc_price, exchange)
+        context = _breakout_context(breakout_state, positions)
+        paper = _historical_paper_position(context, btc_price)
         return _table(
             "Signals" + suffix,
-            _signals(db_path, tf=tf),
+            _signal_timeline_rows(db_path, tf, breakout_state, paper),
             (
-                "id",
-                "ts",
+                "signal_ts",
+                "action_ts",
+                "source",
                 "strategy",
                 "slot",
-                "timeframe",
                 "kind",
                 "side",
-                "target_size_usd",
-                "target_leverage",
-                "chop_regime",
-                "chop_value",
-                "entry_size_multiplier",
                 "reason",
+                "metrics",
             ),
         )
     if page == "trades":
@@ -2832,17 +2911,19 @@ def _render(
     )
     template = template.replace(
         "</style>",
-        ".stack-detail-row>td{padding:0;white-space:normal;background:var(--surface)}"
-        ".stack-drilldown{padding:.55rem .75rem}"
-        ".stack-drilldown summary{cursor:pointer;color:var(--accent);font-weight:600}"
-        ".stack-drilldown p{margin:.8rem 0;color:var(--muted);white-space:normal}"
-        ".stack-drilldown .table-section h2{margin:1rem 0 .4rem}"
-        ".stack-drilldown .table-wrap{max-width:100%}</style>",
+        ".stack-summary-row{cursor:pointer}"
+        ".stack-summary-row summary{cursor:pointer;color:var(--accent);font-weight:600}"
+        ".stack-summary-row summary::marker{font-size:.8em}"
+        ".stack-unit-row{display:none;background:var(--surface-2)}"
+        ".stack-unit-row.stack-visible{display:table-row}"
+        ".stack-unit-row td:nth-child(2){padding-left:1.5rem;color:var(--muted)}"
+        ".stack-summary-row td:nth-child(8){white-space:normal;min-width:11rem}</style>",
     )
     template = template.replace(
         "</style>",
         ".activity-grid .breakout-activity{grid-column:1/-1;min-width:0}"
-        ".activity-grid .breakout-activity .table-wrap{max-width:100%}</style>",
+        ".activity-grid .breakout-activity .table-wrap{max-width:100%}"
+        ".activity-more{display:inline-block;margin:.45rem 0;color:var(--accent);font-size:.75rem;text-decoration:none}</style>",
     )
     refresh_script = """<script>
 (()=>{
@@ -2870,8 +2951,29 @@ def _render(
         const updated=fresh.querySelector(`[data-refresh-region="${region.dataset.refreshRegion}"]`)
         if(updated)sync(region,updated)
       }
+      syncStackRows()
     }catch(_error){}
   }
+  const syncStackRows=()=>{
+    for(const row of document.querySelectorAll('tr.stack-summary-row')){
+      const open=Boolean(row.querySelector('details.stack-toggle')?.open)
+      let child=row.nextElementSibling
+      while(child?.classList.contains('stack-unit-row')){
+        child.classList.toggle('stack-visible',open)
+        child=child.nextElementSibling
+      }
+    }
+  }
+  document.addEventListener('toggle',event=>{
+    if(event.target.matches?.('details.stack-toggle'))syncStackRows()
+  },true)
+  document.addEventListener('click',event=>{
+    const row=event.target.closest?.('tr.stack-summary-row')
+    if(!row||event.target.closest('summary'))return
+    const details=row.querySelector('details.stack-toggle')
+    if(details)details.open=!details.open
+  })
+  syncStackRows()
   const refreshPrice=async()=>{
     try{
       const response=await fetch('/api/live-price',{cache:'no-store'})

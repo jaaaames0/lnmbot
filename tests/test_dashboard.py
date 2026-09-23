@@ -686,18 +686,8 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "Historical campaign" in overview
     assert "20260822L" in overview
     assert "no funded units" in overview
-    assert "Historical · no funded trade" in overview
-    assert "Show 4 paper K units" in overview
-    assert "Breakout K units" in overview
-    assert "Blocked by prior short" in overview
-    assert "2026-08-19" in overview
-    assert "2026-08-21" in overview
-    assert "2026-08-24" in overview
-    assert "2026-08-26" in overview
-    assert "2026-08-27" in overview
-    assert "$400 paper" in overview
-    assert "$80 paper" in overview
-    assert "No venue trades or wallet P&amp;L" in overview
+    assert "campaign · 4/4" in overview
+    assert "stack-toggle" in overview
     assert "Recent breakout decisions" not in overview
     assert "addon_cap" in overview
     assert "Latest MA 1d signals" in overview
@@ -715,9 +705,15 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
         "<h2>Latest funding</h2>", 1
     )[0]
     assert "Blocked by prior short" not in active_positions
-    assert "Blocked by prior short" in breakout_activity
     assert "addon_cap" in breakout_activity
-    assert active_positions.count("<tr>") == 9  # 2 headers, 3 summaries and 4 K rows
+    assert "All breakout signals →" in breakout_activity
+    assert active_positions.count("<table>") == 1
+    assert active_positions.count('class="stack-unit-row"') == 4
+    assert "<th>Status</th>" not in active_positions
+    assert "paper" not in active_positions.lower()
+    assert "range close $72,968.00" in active_positions
+    assert "recovery close" not in active_positions
+    assert "<th>Signal close</th>" not in breakout_activity
 
     rows = dashboard._position_status_rows(
         [], {}, "sats", 85_000.0,
@@ -749,6 +745,13 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert ">MA 1d</a>" in nav
     assert ">MA 4h</a>" in nav
     assert ">Breakout</a>" in nav
+    assert "Blocked by prior short" in nav
+    assert "2026-08-19" in nav
+    assert "K0 entry" in nav
+    assert "EMA ATR" in nav
+    assert "overlap" in nav
+    assert "breakout parent" in nav
+    assert "ma daily" in dashboard._render(db_path, "signals", None)
 
 
 def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_path):
@@ -769,8 +772,11 @@ def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_pat
     assert paper["gross_sats"] == expected_sats
     rows = dashboard._position_status_rows([], {}, "sats", 85_000.0, context)
     campaign = next(row for row in rows if row["slot"] == "campaign")
-    assert "paper gross" in campaign["mark_pnl"]
-    assert "data-preserve-open" in campaign["_details_html"]
+    assert campaign["mark_pnl"] == dashboard._format_signed_amount(
+        expected_sats, "sats", 85_000.0
+    )
+    assert [row["slot"] for row in campaign["_children"]] == ["k0", "k1", "k2", "k3"]
+    assert all("paper" not in str(row).lower() for row in campaign["_children"])
     assert not any(row["strategy"] == "portfolio" for row in rows)
     assert dashboard._orders(db_path) == []
 
@@ -786,6 +792,27 @@ def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_pat
     # A changed live parent must suppress the reconstruction instead of showing stale prices.
     context["campaign"]["units"][0]["entry_price"] = 78_000.0
     assert dashboard._historical_paper_position(context, 85_000.0) is None
+
+
+def test_breakout_exit_display_follows_close_based_campaign_lifecycle():
+    dashboard = _dashboard_module()
+    campaign = {
+        "side": 1, "boundary": 90, "held_days": 84,
+        "peak_favorable": 0.2, "units": [{"k": 0, "entry_price": 100}],
+    }
+    assert dashboard._breakout_exit_trigger(campaign) == "range close $90.00"
+
+    campaign["held_days"] = 85
+    trigger = dashboard._breakout_exit_trigger(campaign)
+    assert "range close $90.00" in trigger
+    assert "recovery close $119.40" in trigger
+    assert "cap 35d" in trigger
+
+    campaign.update(side=-1, boundary=110, held_days=120)
+    trigger = dashboard._breakout_exit_trigger(campaign)
+    assert "range close $110.00" in trigger
+    assert "recovery close $80.60" in trigger
+    assert "cap 0d" in trigger
 
 
 def test_historical_paper_reference_matches_independent_seed_replay():
@@ -841,13 +868,12 @@ def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):
 
     assert "Long · 2/4 units" in overview
     assert "20260923L · $200 notional" in overview
-    assert "Funded · 2/4 units" in overview
+    assert "campaign · 2/4" in overview
     assert len(status_rows) == 3
     campaign = next(row for row in status_rows if row["slot"] == "campaign")
     assert campaign["contracts"] == "$200"
-    assert "Show 2 funded K units" in campaign["_details_html"]
-    assert "k0" in campaign["_details_html"]
-    assert "k1" in campaign["_details_html"]
+    assert [row["slot"] for row in campaign["_children"]] == ["k0", "k1"]
+    assert all(row["exit_trigger"] == "venue liq." for row in campaign["_children"])
     assert not any(row["strategy"] == "portfolio" for row in status_rows)
     marked_positions = dashboard._open_positions(
         db_path, dashboard._orders(db_path), 85_000.0
