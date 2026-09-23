@@ -188,3 +188,27 @@ dashboard restarts and SQLite `quick_check`. The trader retained PID 3385478
 with zero restarts and 39 order rows. The timed rollback was disarmed after
 acceptance; its root-only checkpoint is
 `/data/security-backups/lnmbot-dashboard-paper-campaign-20260923T004951Z`.
+
+## Breakout overview layout — 2026-09-23
+
+Dashboard commit `9d1809b88465` is deployed at
+`/usr/local/lib/lnmbot-dashboard/prod-20260923.2-g9d1809b88465`. The
+Active positions table now has one row for each MA timeframe and one combined
+breakout campaign row. Its expansion contains only the K0–K3 unit rows, with
+paper values for the historical stack and actual venue values for funded
+units. The redundant portfolio row and standalone funded K rows are removed
+from that table; account and strategy P&L panels still use only real trades.
+
+Latest breakout signals now contains the active historical campaign's signal
+trail, recent live decisions and recorded order signals in timestamp order.
+The former separate Recent breakout decisions table is removed. The table
+keeps signal and action times, slot, origin, result and available structure
+metrics together.
+
+All 35 focused dashboard and breakout tests passed. A private live database
+copy rendered three top-level position rows, seven historical replay events,
+11 combined breakout events and 39 real orders. After the dashboard-only
+switch, all eight HTTP routes returned 200, the trader stayed at PID 3385478
+with zero restarts, SQLite `quick_check` passed and the order count stayed 39.
+The rollback timer was disarmed; its root-only checkpoint is
+`/data/security-backups/lnmbot-dashboard-stack-layout-20260923T011828Z`.
