@@ -687,7 +687,8 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "20260822L" in overview
     assert "no funded units" in overview
     assert "Historical · no funded trade" in overview
-    assert "Show paper units and signal trail" in overview
+    assert "Show 4 paper K units" in overview
+    assert "Breakout K units" in overview
     assert "Blocked by prior short" in overview
     assert "2026-08-19" in overview
     assert "2026-08-21" in overview
@@ -697,7 +698,7 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "$400 paper" in overview
     assert "$80 paper" in overview
     assert "No venue trades or wallet P&amp;L" in overview
-    assert "Recent breakout decisions" in overview
+    assert "Recent breakout decisions" not in overview
     assert "addon_cap" in overview
     assert "Latest MA 1d signals" in overview
     assert "Latest breakout signals" in overview
@@ -707,6 +708,37 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "MA 1d position" in overview
     assert "MA 4h position" in overview
     assert "btc_close_range_v1" in overview
+    active_positions = overview.split("<h2>Active positions</h2>", 1)[1].split(
+        "</div><div class=activity-grid>", 1
+    )[0]
+    breakout_activity = overview.split("<h2>Latest breakout signals</h2>", 1)[1].split(
+        "<h2>Latest funding</h2>", 1
+    )[0]
+    assert "Blocked by prior short" not in active_positions
+    assert "Blocked by prior short" in breakout_activity
+    assert "addon_cap" in breakout_activity
+    assert active_positions.count("<tr>") == 9  # 2 headers, 3 summaries and 4 K rows
+
+    rows = dashboard._position_status_rows(
+        [], {}, "sats", 85_000.0,
+        dashboard._breakout_context(dashboard._persisted_breakout_state(db_path), []),
+    )
+    assert len(rows) == 3
+    assert [row["slot"] for row in rows] == ["1d", "4h", "campaign"]
+    activity = dashboard._breakout_activity_rows(
+        db_path,
+        dashboard._persisted_breakout_state(db_path),
+        dashboard._historical_paper_position(
+            dashboard._breakout_context(dashboard._persisted_breakout_state(db_path), []),
+            85_000.0,
+        ),
+    )
+    assert len([row for row in activity if row["source"] == "Historical replay"]) == 7
+    assert any(row["reason"] == "addon_cap" for row in activity)
+    assert any(row["reason"] == "breakout parent" for row in activity)
+    assert [dashboard._parse_ts(row["action_ts"]) for row in activity] == sorted(
+        [dashboard._parse_ts(row["action_ts"]) for row in activity], reverse=True
+    )
 
     assert [row["reason"] for row in dashboard._signals(db_path, tf="1d")] == ["ma daily"]
     assert [row["reason"] for row in dashboard._signals(db_path, tf="breakout")] == [
@@ -801,12 +833,27 @@ def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):
     assert "Long · 2/4 units" in overview
     assert "20260923L · $200 notional" in overview
     assert "Funded · 2/4 units" in overview
-    assert {row["slot"] for row in status_rows if row["strategy"] == "btc_close_range_v1"} == {
-        "campaign",
-        "k0",
-        "k1",
-    }
-    assert [row["contracts"] for row in status_rows if row["strategy"] == "portfolio"] == ["$200"]
+    assert len(status_rows) == 3
+    campaign = next(row for row in status_rows if row["slot"] == "campaign")
+    assert campaign["contracts"] == "$200"
+    assert "Show 2 funded K units" in campaign["_details_html"]
+    assert "k0" in campaign["_details_html"]
+    assert "k1" in campaign["_details_html"]
+    assert not any(row["strategy"] == "portfolio" for row in status_rows)
+    marked_positions = dashboard._open_positions(
+        db_path, dashboard._orders(db_path), 85_000.0
+    )
+    marked_context = dashboard._breakout_context(
+        dashboard._persisted_breakout_state(db_path), marked_positions
+    )
+    marked_campaign = dashboard._position_status_rows(
+        marked_positions, {}, "sats", 85_000.0, marked_context
+    )[-1]
+    assert marked_campaign["entry_price"] == "$80,000.00"
+    assert marked_campaign["mark_pnl"] == dashboard._format_signed_amount(
+        sum(position["estimated_unrealized_sats"] for position in marked_positions),
+        "sats", 85_000.0,
+    )
     assert len(dashboard._orders(db_path, tf="breakout")) == 2
     assert dashboard._orders(db_path, tf="1d") == []
     assert dashboard._trade_owners(dashboard._orders(db_path)) == {
