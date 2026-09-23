@@ -13,6 +13,8 @@ from lnmarkets_bot.persistence.models import signals, strategy_state_snapshots
 from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
 from lnmarkets_bot.strategy import Bar, OrderIntent, Strategy, StrategyState
+from lnmarkets_bot.strategy.close_range_live import CloseRangeLive
+from lnmarkets_bot.strategy.intents import SignalKind
 
 
 class _OneBar(DataSource):
@@ -21,6 +23,15 @@ class _OneBar(DataSource):
 
     async def stream(self):
         yield self.bar
+
+
+class _Bars(DataSource):
+    def __init__(self, bars: list[Bar]) -> None:
+        self.bars = bars
+
+    async def stream(self):
+        for bar in self.bars:
+            yield bar
 
 
 class _Entry(Strategy):
@@ -83,6 +94,30 @@ class _Executor:
         )
 
 
+class _ReversalExecutor(_Executor):
+    def __init__(self, ts: datetime) -> None:
+        super().__init__()
+        self.positions["breakout:k0"] = SimpleNamespace(
+            side="short", qty_sats=-100, entry_price_usd=71_355.8, entry_ts=ts, leverage=5
+        )
+        self.actions: list[str] = []
+
+    async def submit(self, *, intent, **kwargs):
+        self.actions.append(intent.kind.value)
+        self.keys.append(intent.execution_key)
+        if intent.kind == SignalKind.EXIT:
+            self.positions.pop(intent.execution_key)
+        else:
+            self.positions[intent.execution_key] = SimpleNamespace(
+                side="long",
+                qty_sats=100,
+                entry_price_usd=78_301,
+                entry_ts=kwargs["ts"],
+                leverage=5,
+            )
+        return len(self.actions), {"price_usd": 78_301}
+
+
 @pytest.mark.asyncio
 async def test_portfolio_routes_same_timeframe_to_distinct_strategy_positions(cfg):
     engine = make_engine(cfg.storage_db_path)
@@ -133,3 +168,55 @@ async def test_portfolio_routes_same_timeframe_to_distinct_strategy_positions(cf
     # durable snapshot key is replaced rather than duplicated. The assertion
     # proves first-live-bar persistence occurs before a higher-TF boundary.
     assert snapshots == [f"{_Entry.__module__}.{_Entry.__name__}"]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_closes_funded_campaign_before_deferred_reversal_entry(cfg):
+    engine = make_engine(cfg.storage_db_path)
+    init_schema(engine)
+    recorder = Recorder(make_session_factory(engine))
+    ts = datetime(2026, 8, 22, tzinfo=UTC)
+    strategy = CloseRangeLive(
+        {"unit_notional_usd": 100, "leverage": 5, "activation_ts": ts.isoformat()}
+    )
+    strategy._closing_campaign_id = "20260602S"
+    strategy._closing_slots = {"k0"}
+    strategy._pending_reversal = {
+        "ts": ts.isoformat(),
+        "kind": "paper_parent",
+        "reason": "structure_parent",
+        "campaign_id": "20260822L",
+        "k": 0,
+        "side": 1,
+        "price": 78_330.64575,
+        "metadata": {
+            "signal_ts": "2026-08-21T00:00:00+00:00",
+            "boundary": 72_968.0,
+        },
+    }
+    executor = _ReversalExecutor(ts)
+    bars = [
+        Bar(ts=ts, open=78_300, high=78_300, low=78_300, close=78_300, volume=1),
+        Bar(
+            ts=ts.replace(minute=1),
+            open=78_301,
+            high=78_301,
+            low=78_301,
+            close=78_301,
+            volume=1,
+        ),
+    ]
+    await run_portfolio_live(
+        cfg=cfg,
+        data_source=_Bars(bars),
+        bindings=(StrategyBinding("breakout", strategy),),
+        executor=executor,
+        recorder=recorder,
+        sizing_policy=SizingPolicy(),
+        account_balance_provider=None,
+        install_signal_handlers=False,
+    )
+    assert executor.actions == ["exit", "entry"]
+    assert strategy.machine.campaign is not None
+    assert strategy.machine.campaign.origin == "live"
+    assert strategy.machine.campaign.campaign_id == "20260822L"

@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd  # type: ignore[import-untyped]
 
 from .base import Bar, Strategy, StrategyState
-from .close_range import BreakoutDecision, CloseRangeMachine, DailyCandle
+from .close_range import (
+    BreakoutDecision,
+    CampaignState,
+    CampaignUnit,
+    CloseRangeMachine,
+    DailyCandle,
+)
 from .intents import OrderIntent, Side, SignalKind
 
 if TYPE_CHECKING:
@@ -23,6 +29,7 @@ class CloseRangeLive(Strategy):
     tfs = ("1d",)
     position_slots = ("k0", "k1", "k2", "k3")
     VERSION = 1
+    REVERSAL_ENTRY_WINDOW = timedelta(minutes=5)
 
     def __init__(
         self,
@@ -46,9 +53,20 @@ class CloseRangeLive(Strategy):
         self._urgent_intents: deque[OrderIntent] = deque()
         self._closing_campaign_id: str | None = None
         self._closing_slots: set[str] = set()
+        self._pending_reversal: dict[str, Any] | None = None
 
     def on_startup(self, state: StrategyState) -> None:
         owned = [slot for slot, pos in state.positions.items() if pos.qty_sats]
+        if self._pending_reversal and owned == ["k0"] and not self._closing_slots:
+            campaign = self.machine.campaign
+            if campaign is None or campaign.campaign_id != self._pending_reversal["campaign_id"]:
+                raise RuntimeError("pending reversal does not match owned parent")
+            price = state.position("k0").entry_price_usd
+            if price is None:
+                raise RuntimeError("owned reversal parent has no entry price")
+            self.machine.confirm_owned_fill(k=0, ts=campaign.entry_ts, price=price)
+            self._pending_reversal = None
+            return
         if owned and self.machine.campaign is None and set(owned) <= self._closing_slots:
             for slot in owned:
                 self._urgent_intents.append(
@@ -70,8 +88,23 @@ class CloseRangeLive(Strategy):
                 raise RuntimeError("owned breakout slot is absent from campaign state")
 
     def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
-        urgent = list(self._urgent_intents)
-        self._urgent_intents.clear()
+        urgent = [] if bar.warmup else list(self._urgent_intents)
+        if not bar.warmup:
+            self._urgent_intents.clear()
+        if self._pending_reversal and not bar.warmup:
+            entry_ts = datetime.fromisoformat(self._pending_reversal["ts"]).astimezone(UTC)
+            if bar.ts.astimezone(UTC) > entry_ts + self.REVERSAL_ENTRY_WINDOW:
+                self._record_reversal_status(
+                    bar.ts.astimezone(UTC), "reject", "reversal_entry_expired"
+                )
+                self._abandon_pending_reversal()
+            elif not self._closing_slots and not any(
+                state.position(slot).qty_sats for slot in self.position_slots
+            ):
+                if self.machine.campaign is None:
+                    self._restore_pending_reversal_campaign()
+                if bar.timeframe == "1m":
+                    return [*urgent, self._pending_reversal_intent()]
         if bar.timeframe != "1d":
             return urgent
         candle_ts = bar.ts.astimezone(UTC) - timedelta(days=1)
@@ -106,6 +139,15 @@ class CloseRangeLive(Strategy):
             }
             if decision.kind in {"paper_parent", "paper_addon"} and decision.k is not None:
                 if self._closing_slots:
+                    if decision.kind == "paper_parent" and self._closing_campaign_id:
+                        self._pending_reversal = self._decision_dict(decision)
+                        self._record_reversal_status(
+                            decision.ts, "deferred_parent", "awaiting_campaign_close"
+                        )
+                    # The machine models the new parent before live closes are
+                    # confirmed. Keep it flat until the funded old stack is gone.
+                    if decision.kind == "paper_parent":
+                        self.machine.campaign = None
                     continue
                 # Never adopt an add-on without an owned parent.  Historical
                 # occupancy still blocks late parent entry in the pure machine.
@@ -149,7 +191,11 @@ class CloseRangeLive(Strategy):
                 if not self._closing_slots:
                     self._closing_campaign_id = None
             return
-        if intent.kind != SignalKind.ENTRY or not decision.order_id or decision.order_id <= 0:
+        if intent.kind != SignalKind.ENTRY:
+            return
+        if not decision.order_id or decision.order_id <= 0:
+            if intent.position_key == "k0":
+                self._abandon_unfunded_parent(intent.metadata.get("campaign_id"))
             return
         price = decision.detail.get("price_usd")
         if price is None:
@@ -162,6 +208,8 @@ class CloseRangeLive(Strategy):
             ts=unit.entry_ts,
             price=float(price),
         )
+        if k == 0:
+            self._pending_reversal = None
 
     def on_external_position_closed(self, event: Any, state: StrategyState) -> None:
         """Fold venue liquidation into campaign state and close surviving children."""
@@ -214,6 +262,7 @@ class CloseRangeLive(Strategy):
             "recent_decisions": list(self._recent_decisions),
             "closing_campaign_id": self._closing_campaign_id,
             "closing_slots": sorted(self._closing_slots),
+            "pending_reversal": self._pending_reversal,
         }
 
     def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
@@ -228,7 +277,77 @@ class CloseRangeLive(Strategy):
         self._recent_decisions = deque(snapshot.get("recent_decisions", []), maxlen=256)
         self._closing_campaign_id = snapshot.get("closing_campaign_id")
         self._closing_slots = set(snapshot.get("closing_slots", []))
+        pending = snapshot.get("pending_reversal")
+        self._pending_reversal = dict(pending) if pending else None
         return self._closing_slots <= set(self.position_slots)
+
+    def _pending_reversal_intent(self) -> OrderIntent:
+        assert self._pending_reversal is not None
+        pending = self._pending_reversal
+        side = Side.LONG if pending["side"] == 1 else Side.SHORT
+        return OrderIntent(
+            kind=SignalKind.ENTRY,
+            trigger_tf="1d",
+            position_key="k0",
+            side=side,
+            size_usd=self.unit_notional_usd,
+            leverage=self.leverage,
+            reason=pending["reason"],
+            metadata={
+                **pending["metadata"],
+                "campaign_id": pending["campaign_id"],
+                "k": 0,
+                "decision_kind": pending["kind"],
+                "deferred_reversal": True,
+            },
+        )
+
+    def _restore_pending_reversal_campaign(self) -> None:
+        assert self._pending_reversal is not None
+        pending = self._pending_reversal
+        ts = datetime.fromisoformat(pending["ts"]).astimezone(UTC)
+        price = float(pending["price"])
+        side = int(pending["side"])
+        self.machine.campaign = CampaignState(
+            campaign_id=str(pending["campaign_id"]),
+            side=side,
+            boundary=float(pending["metadata"]["boundary"]),
+            entry_ts=ts,
+            held_days=0,
+            peak_favorable=0.0,
+            origin="paper",
+            lifetime_units=1,
+            units=[CampaignUnit(k=0, entry_ts=ts, entry_price=price, origin="paper")],
+        )
+
+    def _abandon_unfunded_parent(self, campaign_id: str | None) -> None:
+        campaign = self.machine.campaign
+        if campaign and campaign.campaign_id == campaign_id and campaign.origin == "paper":
+            self.machine.campaign = None
+        if self._pending_reversal and self._pending_reversal["campaign_id"] == campaign_id:
+            self._pending_reversal = None
+
+    def _abandon_pending_reversal(self) -> None:
+        if self._pending_reversal:
+            self._abandon_unfunded_parent(self._pending_reversal["campaign_id"])
+
+    def _record_reversal_status(self, ts: datetime, kind: str, reason: str) -> None:
+        assert self._pending_reversal is not None
+        pending = self._pending_reversal
+        self._recent_decisions.append(
+            self._decision_dict(
+                BreakoutDecision(
+                    ts=ts,
+                    kind=kind,
+                    reason=reason,
+                    campaign_id=pending["campaign_id"],
+                    k=0,
+                    side=pending["side"],
+                    price=None,
+                    metadata={"signal_ts": pending["metadata"]["signal_ts"]},
+                )
+            )
+        )
 
     @staticmethod
     def _exit_intent(
