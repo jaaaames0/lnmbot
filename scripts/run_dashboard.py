@@ -1015,6 +1015,10 @@ def _breakout_context(
         "snapshot_ts": state.get("snapshot_ts") if state else None,
         "closing_slots": state.get("closing_slots", []) if state else [],
         "unit_notional_usd": state.get("unit_notional_usd", 100) if state else 100,
+        "historical_unit_notional_usd": (
+            state.get("historical_unit_notional_usd", state.get("unit_notional_usd", 100))
+            if state else 100
+        ),
         "leverage": state.get("leverage", 5) if state else 5,
         "pending_exit": machine.get("pending_exit"),
         "available": state is not None,
@@ -1051,7 +1055,7 @@ def _historical_paper_position(
         or int(campaign.get("lifetime_units") or 0) != len(units)
     ):
         return None
-    notional = float(context["unit_notional_usd"])
+    notional = float(context["historical_unit_notional_usd"])
     leverage = float(context["leverage"])
     if notional <= 0 or leverage <= 0:
         return None

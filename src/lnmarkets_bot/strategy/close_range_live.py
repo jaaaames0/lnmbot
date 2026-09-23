@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,10 @@ class CloseRangeLive(Strategy):
     ) -> None:
         super().__init__(params)
         self.unit_notional_usd = float(self.params.get("unit_notional_usd", 100.0))
+        # The seeded, unowned campaign is marked at the size used when it was
+        # first modeled. Changing the size of future funded entries must not
+        # retroactively revalue that paper history.
+        self.historical_unit_notional_usd = self.unit_notional_usd
         self.leverage = float(self.params.get("leverage", 5.0))
         activation = self.params.get("activation_ts")
         self.activation_ts = (
@@ -46,7 +51,10 @@ class CloseRangeLive(Strategy):
             if activation
             else datetime.now(UTC)
         )
-        if self.unit_notional_usd <= 0 or self.leverage <= 0:
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (self.unit_notional_usd, self.leverage)
+        ):
             raise ValueError("breakout size and leverage must be positive")
         self.machine = machine or CloseRangeMachine()
         self._recent_decisions: deque[dict[str, Any]] = deque(maxlen=256)
@@ -257,6 +265,7 @@ class CloseRangeLive(Strategy):
             "version": self.VERSION,
             "activation_ts": self.activation_ts.isoformat(),
             "unit_notional_usd": self.unit_notional_usd,
+            "historical_unit_notional_usd": self.historical_unit_notional_usd,
             "leverage": self.leverage,
             "machine": self.machine.persistent_state(),
             "recent_decisions": list(self._recent_decisions),
@@ -268,10 +277,19 @@ class CloseRangeLive(Strategy):
     def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
         if snapshot.get("version") != self.VERSION:
             return False
-        if float(snapshot.get("unit_notional_usd", -1)) != self.unit_notional_usd:
+        try:
+            previous_unit = float(snapshot["unit_notional_usd"])
+            historical_unit = float(
+                snapshot.get("historical_unit_notional_usd", previous_unit)
+            )
+            previous_leverage = float(snapshot["leverage"])
+        except (KeyError, TypeError, ValueError):
             return False
-        if float(snapshot.get("leverage", -1)) != self.leverage:
+        if not all(math.isfinite(value) and value > 0 for value in (previous_unit, historical_unit)):
             return False
+        if previous_leverage != self.leverage:
+            return False
+        self.historical_unit_notional_usd = historical_unit
         self.activation_ts = datetime.fromisoformat(snapshot["activation_ts"]).astimezone(UTC)
         self.machine = CloseRangeMachine.restore(snapshot["machine"])
         self._recent_decisions = deque(snapshot.get("recent_decisions", []), maxlen=256)

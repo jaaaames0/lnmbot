@@ -774,6 +774,15 @@ def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_pat
     assert not any(row["strategy"] == "portfolio" for row in rows)
     assert dashboard._orders(db_path) == []
 
+    # Resizing future funded orders must leave the seeded paper stack at its
+    # original $100 per unit.
+    context["unit_notional_usd"] = 40
+    context["historical_unit_notional_usd"] = 100
+    resized_paper = dashboard._historical_paper_position(context, 85_000.0)
+    assert resized_paper is not None
+    assert resized_paper["total_notional_usd"] == 400
+    assert resized_paper["gross_sats"] == expected_sats
+
     # A changed live parent must suppress the reconstruction instead of showing stale prices.
     context["campaign"]["units"][0]["entry_price"] = 78_000.0
     assert dashboard._historical_paper_position(context, 85_000.0) is None

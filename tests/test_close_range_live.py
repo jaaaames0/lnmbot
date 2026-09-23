@@ -9,7 +9,12 @@ import pandas as pd
 
 from lnmarkets_bot.strategy import Bar, StrategyState
 from lnmarkets_bot.strategy.base import TfPosition
-from lnmarkets_bot.strategy.close_range import CampaignUnit, CloseRangeMachine, DailyCandle
+from lnmarkets_bot.strategy.close_range import (
+    BreakoutDecision,
+    CampaignUnit,
+    CloseRangeMachine,
+    DailyCandle,
+)
 from lnmarkets_bot.strategy.close_range_live import CloseRangeLive
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,6 +158,69 @@ def test_failed_reversal_close_survives_restart_and_never_enters_early():
     state.position("k0").qty_sats = 0
     restored.reconcile_execution_state(state)
     assert [intent.kind.value for intent in restored.on_bar(_minute(next_open + timedelta(minutes=3)), state)] == ["entry"]
+
+
+def test_changed_unit_size_restores_old_trade_and_sizes_next_entry():
+    strategy, state, next_open = _august_reversal()
+    legacy_snapshot = strategy.persistent_state()
+    legacy_snapshot.pop("historical_unit_notional_usd")
+    smaller = CloseRangeLive({**strategy.params, "unit_notional_usd": 40})
+    assert smaller.restore_persistent_state(legacy_snapshot)
+    smaller.reconcile_execution_state(state)
+    smaller.on_startup(state)
+    assert state.position("k0").qty_sats == -100
+    assert smaller.persistent_state()["historical_unit_notional_usd"] == 100
+    assert smaller.persistent_state()["unit_notional_usd"] == 40
+
+    retry = smaller.on_bar(_minute(next_open + timedelta(minutes=1)), state)
+    assert [(intent.kind.value, intent.position_key) for intent in retry] == [("exit", "k0")]
+    smaller.on_order_result(
+        retry[0],
+        SimpleNamespace(order_id=9, detail={}),
+        state,
+    )
+    state.position("k0").qty_sats = 0
+    entry = smaller.on_bar(_minute(next_open + timedelta(minutes=2)), state)
+    assert len(entry) == 1
+    assert entry[0].size_usd == 40
+
+    larger = CloseRangeLive({**strategy.params, "unit_notional_usd": 80})
+    assert larger.restore_persistent_state(smaller.persistent_state())
+    assert larger.persistent_state()["historical_unit_notional_usd"] == 100
+    assert larger.persistent_state()["unit_notional_usd"] == 80
+
+
+def test_invalid_saved_size_is_not_accepted_as_restart_state():
+    strategy = CloseRangeLive({"unit_notional_usd": 100, "leverage": 5})
+    snapshot = strategy.persistent_state()
+    snapshot["unit_notional_usd"] = float("nan")
+    assert not CloseRangeLive({"unit_notional_usd": 40, "leverage": 5}).restore_persistent_state(
+        snapshot
+    )
+
+
+def test_resized_addon_does_not_change_existing_parent_position():
+    previous = CloseRangeLive({"unit_notional_usd": 100, "leverage": 5})
+    current = CloseRangeLive({"unit_notional_usd": 40, "leverage": 5})
+    assert current.restore_persistent_state(previous.persistent_state())
+    state = _state()
+    state.position("k0").qty_sats = 75
+    state.position("k0").entry_price_usd = 80_000
+    addon = BreakoutDecision(
+        ts=datetime(2026, 9, 24, tzinfo=UTC),
+        kind="paper_addon",
+        reason="range_breakout",
+        campaign_id="20260822L",
+        k=1,
+        side=1,
+        price=85_000,
+        metadata={},
+    )
+    intents = current._intents([addon], state)
+    assert len(intents) == 1
+    assert intents[0].size_usd == 40
+    assert state.position("k0").qty_sats == 75
+    assert state.position("k0").entry_price_usd == 80_000
 
 
 def test_reversal_expires_instead_of_entering_late_or_leaving_paper_occupancy():
