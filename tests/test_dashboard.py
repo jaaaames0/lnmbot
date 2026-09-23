@@ -563,7 +563,7 @@ def _create_multistrategy_dashboard_db(db_path, *, funded: bool) -> None:
         "units": (
             [{"k": 0, "entry_price": 78_330.0}, {"k": 1, "entry_price": 79_000.0}]
             if funded
-            else [{"k": 0, "entry_price": 78_330.0}]
+            else [{"k": 0, "entry_price": 78_330.64575}]
         ),
     }
     with sqlite3.connect(db_path) as connection:
@@ -687,6 +687,16 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "20260822L" in overview
     assert "no funded units" in overview
     assert "Historical · no funded trade" in overview
+    assert "Show paper units and signal trail" in overview
+    assert "Blocked by prior short" in overview
+    assert "2026-08-19" in overview
+    assert "2026-08-21" in overview
+    assert "2026-08-24" in overview
+    assert "2026-08-26" in overview
+    assert "2026-08-27" in overview
+    assert "$400 paper" in overview
+    assert "$80 paper" in overview
+    assert "No venue trades or wallet P&amp;L" in overview
     assert "Recent breakout decisions" in overview
     assert "addon_cap" in overview
     assert "Latest MA 1d signals" in overview
@@ -707,6 +717,69 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert ">MA 1d</a>" in nav
     assert ">MA 4h</a>" in nav
     assert ">Breakout</a>" in nav
+
+
+def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_path):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=False)
+    dashboard = _dashboard_module()
+    context = dashboard._breakout_context(dashboard._persisted_breakout_state(db_path), [])
+    paper = dashboard._historical_paper_position(context, 85_000.0)
+    assert paper is not None
+    assert [unit["k"] for unit in paper["units"]] == [0, 1, 2, 3]
+    assert [unit["signal_ts"][:10] for unit in paper["units"]] == [
+        "2026-08-21", "2026-08-24", "2026-08-26", "2026-08-27"
+    ]
+    expected_sats = round(
+        sum(100 * (1 / unit["entry_price"] - 1 / 85_000) for unit in paper["units"])
+        * 1e8
+    )
+    assert paper["gross_sats"] == expected_sats
+    rows = dashboard._position_status_rows([], {}, "sats", 85_000.0, context)
+    campaign = next(row for row in rows if row["slot"] == "campaign")
+    assert "paper gross" in campaign["mark_pnl"]
+    assert "data-preserve-open" in campaign["_details_html"]
+    assert not any(row["strategy"] == "portfolio" for row in rows)
+    assert dashboard._orders(db_path) == []
+
+    # A changed live parent must suppress the reconstruction instead of showing stale prices.
+    context["campaign"]["units"][0]["entry_price"] = 78_000.0
+    assert dashboard._historical_paper_position(context, 85_000.0) is None
+
+
+def test_historical_paper_reference_matches_independent_seed_replay():
+    import pandas as pd
+
+    from lnmarkets_bot.strategy.close_range import CloseRangeMachine, DailyCandle
+
+    dashboard = _dashboard_module()
+    reference = dashboard._historical_breakout_reference()
+    assert reference is not None
+    frame = pd.read_parquet(dashboard.LNM_DAILY_SEED_CACHE)
+    frame = frame.loc[frame.ts <= pd.Timestamp(reference["source_as_of"])].copy()
+    frame["high"] = frame[["open", "high", "close"]].max(axis=1)
+    frame["low"] = frame[["open", "low", "close"]].min(axis=1)
+    machine = CloseRangeMachine()
+    entry_signals = {}
+    for row in frame.itertuples(index=False):
+        decisions = machine.advance(
+            DailyCandle(row.ts.to_pydatetime(), row.open, row.high, row.low, row.close),
+            activation_ts=dashboard.datetime(2100, 1, 1, tzinfo=dashboard.UTC),
+        )
+        for decision in decisions:
+            if (
+                decision.campaign_id == reference["campaign_id"]
+                and decision.kind in {"historical_parent", "historical_addon"}
+            ):
+                entry_signals[decision.k] = decision.metadata["signal_ts"]
+    assert machine.campaign is not None
+    assert machine.campaign.campaign_id == reference["campaign_id"]
+    assert machine.campaign.boundary == pytest.approx(reference["boundary"])
+    for unit, recorded in zip(machine.campaign.units, reference["units"], strict=True):
+        assert unit.k == recorded["k"]
+        assert unit.entry_ts.isoformat() == recorded["entry_ts"]
+        assert unit.entry_price == pytest.approx(recorded["entry_price"])
+        assert entry_signals[unit.k] == recorded["signal_ts"]
 
 
 def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):

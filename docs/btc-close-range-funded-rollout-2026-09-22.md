@@ -128,6 +128,17 @@ snapshots were present and SQLite `quick_check` passed. The accepted release
 has a root-only rollback checkpoint at
 `/data/security-backups/lnmbot-dashboard-three-position-20260922T230545Z`.
 
+The historical campaign display uses a versioned replay of the four
+hypothetical units of `20260822L` from the immutable LN Markets daily seed
+feed. Its seed and candle hashes must match before the dashboard shows the
+child entries; an independent test repeats the replay and compares every unit.
+An expandable position row presents K0
+through K3, the qualifying signal dates and the earlier blocked August 19–20
+signals. It marks the stack with the current BTC price using gross inverse
+contract arithmetic and the configured USD 100 per-unit notional. These are
+paper estimates: fees, funding and liquidation are not modeled; no synthetic
+order is inserted into the funded positions, wallet balance or P&L totals.
+
 ## Funded reversal execution correction — 2026-09-23
 
 The August 19 and 20 long breakout signals passed the structure test, but the

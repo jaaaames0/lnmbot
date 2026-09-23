@@ -1,0 +1,115 @@
+{
+  "campaign_id": "20260822L",
+  "entry_ts": "2026-08-22T00:00:00+00:00",
+  "boundary": 72968.0,
+  "units": [
+    {
+      "k": 0,
+      "entry_ts": "2026-08-22T00:00:00+00:00",
+      "entry_price": 78330.64575,
+      "signal_ts": "2026-08-21T00:00:00+00:00",
+      "signal_close": 78290.5,
+      "signal_boundary": 72968.0,
+      "distance_ema_atr": 7.963525540960301,
+      "average_overlap10": 0.37912176131634095
+    },
+    {
+      "k": 1,
+      "entry_ts": "2026-08-25T00:00:00+00:00",
+      "entry_price": 78975.96824999999,
+      "signal_ts": "2026-08-24T00:00:00+00:00",
+      "signal_close": 78937.5,
+      "signal_boundary": 78290.5,
+      "distance_ema_atr": 4.59775387147362,
+      "average_overlap10": 0.26494447476436167
+    },
+    {
+      "k": 2,
+      "entry_ts": "2026-08-27T00:00:00+00:00",
+      "entry_price": 79022.49149999999,
+      "signal_ts": "2026-08-26T00:00:00+00:00",
+      "signal_close": 78983.0,
+      "signal_boundary": 78937.5,
+      "distance_ema_atr": 3.3855261429781103,
+      "average_overlap10": 0.27721383233812696
+    },
+    {
+      "k": 3,
+      "entry_ts": "2026-08-28T00:00:00+00:00",
+      "entry_price": 80265.61275,
+      "signal_ts": "2026-08-27T00:00:00+00:00",
+      "signal_close": 80222.0,
+      "signal_boundary": 78983.0,
+      "distance_ema_atr": 3.5044196010492743,
+      "average_overlap10": 0.28124435902811146
+    }
+  ],
+  "signal_trail": [
+    {
+      "signal_ts": "2026-08-19T00:00:00+00:00",
+      "action_ts": "2026-08-20T00:00:00+00:00",
+      "result": "Blocked by prior short",
+      "signal_close": 69274.5,
+      "range_boundary": 64876.0,
+      "distance_ema_atr": 5.215036051174697,
+      "average_overlap10": 0.4280115174040582
+    },
+    {
+      "signal_ts": "2026-08-20T00:00:00+00:00",
+      "action_ts": "2026-08-21T00:00:00+00:00",
+      "result": "Blocked by prior short",
+      "signal_close": 72968.0,
+      "range_boundary": 69274.5,
+      "distance_ema_atr": 6.227390826622853,
+      "average_overlap10": 0.40088555347912563
+    },
+    {
+      "signal_ts": "-",
+      "action_ts": "2026-08-22T00:00:00+00:00",
+      "result": "Prior short range-close",
+      "signal_close": null,
+      "range_boundary": null,
+      "distance_ema_atr": null,
+      "average_overlap10": null
+    },
+    {
+      "signal_ts": "2026-08-21T00:00:00+00:00",
+      "action_ts": "2026-08-22T00:00:00+00:00",
+      "result": "K0 paper entry",
+      "signal_close": 78290.5,
+      "range_boundary": 72968.0,
+      "distance_ema_atr": 7.963525540960301,
+      "average_overlap10": 0.37912176131634095
+    },
+    {
+      "signal_ts": "2026-08-24T00:00:00+00:00",
+      "action_ts": "2026-08-25T00:00:00+00:00",
+      "result": "K1 paper entry",
+      "signal_close": 78937.5,
+      "range_boundary": 78290.5,
+      "distance_ema_atr": 4.59775387147362,
+      "average_overlap10": 0.26494447476436167
+    },
+    {
+      "signal_ts": "2026-08-26T00:00:00+00:00",
+      "action_ts": "2026-08-27T00:00:00+00:00",
+      "result": "K2 paper entry",
+      "signal_close": 78983.0,
+      "range_boundary": 78937.5,
+      "distance_ema_atr": 3.3855261429781103,
+      "average_overlap10": 0.27721383233812696
+    },
+    {
+      "signal_ts": "2026-08-27T00:00:00+00:00",
+      "action_ts": "2026-08-28T00:00:00+00:00",
+      "result": "K3 paper entry",
+      "signal_close": 80222.0,
+      "range_boundary": 78983.0,
+      "distance_ema_atr": 3.5044196010492743,
+      "average_overlap10": 0.28124435902811146
+    }
+  ],
+  "source_as_of": "2026-09-12T00:00:00+00:00",
+  "seed_sha256": "0520b8aa6c212696e46a5487f772a89e5d6fcb36a19df997e89fcb2a06110534",
+  "candles_sha256": "46b9763b4a1267dd917d168e0ad0b491f91ac8286443434135becd99c2091ff7"
+}

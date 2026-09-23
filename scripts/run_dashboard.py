@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import html
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -33,6 +35,16 @@ BREAKOUT_INSTANCE_ID = "btc_close_range_v1"
 CONSTANT_NOTIONAL_USD = 100.0
 BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1h_4y.parquet"
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
+LNM_DAILY_SEED_CACHE = (
+    Path(__file__).resolve().parents[1]
+    / "data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+)
+BREAKOUT_CAMPAIGN_SEED = (
+    Path(__file__).resolve().parents[1] / "docs/btc-close-range-lnm-live-seed-2026-09-13.json"
+)
+BREAKOUT_PAPER_REFERENCE = (
+    Path(__file__).resolve().parents[1] / "docs/btc-close-range-lnm-paper-reference-2026-09-13.json"
+)
 SAT_TOKEN = "__SAT_SYMBOL__"
 SAT_ICON = '<i class="fak fa-satoshisymbol-solidtilt sat-symbol" aria-label="sats"></i>'
 POSITIVE_OPEN = "__POSITIVE_OPEN__"
@@ -407,6 +419,11 @@ def _table(
             for column in columns
         )
         + "</tr>"
+        + (
+            f'<tr class="paper-detail-row"><td colspan="{len(columns)}">{row["_details_html"]}</td></tr>'
+            if isinstance(row.get("_details_html"), SafeHtml)
+            else ""
+        )
         for row in rows
     )
     class_name = " compact-table" if compact else ""
@@ -948,6 +965,36 @@ def _persisted_breakout_state(db_path: Path) -> dict[str, object] | None:
     return state
 
 
+@lru_cache(maxsize=1)
+def _historical_breakout_reference() -> dict[str, object] | None:
+    """Load the build-time replay only when its seed candles still match."""
+    if not all(path.is_file() for path in (LNM_DAILY_SEED_CACHE, BREAKOUT_CAMPAIGN_SEED, BREAKOUT_PAPER_REFERENCE)):
+        return None
+    try:
+        reference = json.loads(BREAKOUT_PAPER_REFERENCE.read_text())
+        seed = json.loads(BREAKOUT_CAMPAIGN_SEED.read_text())
+        expected = seed["active_hypothetical_stack"]
+        if (
+            hashlib.sha256(BREAKOUT_CAMPAIGN_SEED.read_bytes()).hexdigest()
+            != reference["seed_sha256"]
+            or hashlib.sha256(LNM_DAILY_SEED_CACHE.read_bytes()).hexdigest()
+            != reference["candles_sha256"]
+            or reference["source_as_of"] != seed["as_of_close"]
+            or reference["campaign_id"] != expected["parent_id"]
+            or reference["entry_ts"] != expected["entry_ts"]
+            or not math.isclose(reference["boundary"], expected["boundary"], abs_tol=1e-6)
+            or len(reference["units"]) != expected["active_units"]
+            or not math.isclose(
+                reference["units"][0]["entry_price"], expected["entry_price"], abs_tol=1e-6
+            )
+        ):
+            return None
+        return reference
+    except (KeyError, IndexError, TypeError, ValueError, OSError) as exc:
+        _LOG.warning("dashboard.historical_breakout_reference_unavailable: %s", exc)
+        return None
+
+
 def _breakout_context(
     state: dict[str, object] | None, positions: list[dict[str, object]]
 ) -> dict[str, object]:
@@ -962,8 +1009,152 @@ def _breakout_context(
         "last_daily_bar": machine.get("last_bar_ts"),
         "snapshot_ts": state.get("snapshot_ts") if state else None,
         "closing_slots": state.get("closing_slots", []) if state else [],
+        "unit_notional_usd": state.get("unit_notional_usd", 100) if state else 100,
+        "leverage": state.get("leverage", 5) if state else 5,
+        "pending_exit": machine.get("pending_exit"),
         "available": state is not None,
     }
+
+
+def _historical_paper_position(
+    context: dict[str, object], mark: float | None
+) -> dict[str, object] | None:
+    """Mark a verified, unowned campaign without touching funded accounting."""
+    campaign = context.get("campaign")
+    if (
+        not isinstance(campaign, dict)
+        or campaign.get("origin") != "historical"
+        or context.get("owned")
+    ):
+        return None
+    reference = _historical_breakout_reference()
+    if reference is None:
+        return None
+    units = reference["units"]
+    if not isinstance(units, list) or not units:
+        return None
+    parent = units[0]
+    if (
+        campaign.get("campaign_id") != reference["campaign_id"]
+        or campaign.get("entry_ts") != reference["entry_ts"]
+        or not math.isclose(float(campaign.get("boundary") or 0), float(reference["boundary"]))
+        or not math.isclose(
+            float(campaign.get("units", [{}])[0].get("entry_price") or 0),
+            float(parent["entry_price"]),
+            abs_tol=1e-6,
+        )
+        or int(campaign.get("lifetime_units") or 0) != len(units)
+    ):
+        return None
+    notional = float(context["unit_notional_usd"])
+    leverage = float(context["leverage"])
+    if notional <= 0 or leverage <= 0:
+        return None
+    mark = float(mark) if mark is not None else None
+    if mark is not None and (not math.isfinite(mark) or mark <= 0):
+        mark = None
+    side = int(campaign["side"])
+    weighted_entry = len(units) / sum(1 / float(unit["entry_price"]) for unit in units)
+    gross_btc = (
+        sum(
+            side * notional * (1 / float(unit["entry_price"]) - 1 / mark)
+            for unit in units
+        )
+        if mark is not None
+        else None
+    )
+    return {
+        **reference,
+        "mark": mark,
+        "side": side,
+        "unit_notional_usd": notional,
+        "leverage": leverage,
+        "total_notional_usd": notional * len(units),
+        "initial_margin_usd": notional * len(units) / leverage,
+        "weighted_entry": weighted_entry,
+        "gross_sats": round(gross_btc * 1e8) if gross_btc is not None else None,
+        "gross_usd": gross_btc * mark if gross_btc is not None and mark else None,
+        "held_days": int(campaign.get("held_days") or 0),
+        "peak_favorable_pct": float(campaign.get("peak_favorable") or 0) * 100,
+        "pending_exit": context.get("pending_exit"),
+    }
+
+
+def _paper_details_html(paper: dict[str, object], denomination: str) -> SafeHtml:
+    """An expandable, clearly segregated reconstruction of one historical stack."""
+    mark = paper["mark"]
+    side = int(paper["side"])
+    notional = float(paper["unit_notional_usd"])
+    unit_rows = []
+    for unit in paper["units"]:
+        entry = float(unit["entry_price"])
+        gross_sats = round(side * notional * (1 / entry - 1 / mark) * 1e8) if mark else None
+        unit_rows.append(
+            {
+                "unit": f"K{unit['k']} · {'parent' if unit['k'] == 0 else 'add-on'}",
+                "signal_ts": unit["signal_ts"],
+                "entry_ts": unit["entry_ts"],
+                "entry_price": _format_price(entry),
+                "mark_move": f"{side * (mark / entry - 1) * 100:+.2f}%" if mark else "-",
+                "paper_gross_pnl": (
+                    _format_signed_amount(gross_sats, denomination, mark) if mark else "-"
+                ),
+            }
+        )
+    trail_rows = [
+        {
+            "signal_ts": event["signal_ts"],
+            "action_ts": event["action_ts"],
+            "result": event["result"],
+            "signal_close": _format_price(event["signal_close"]),
+            "range_boundary": _format_price(event["range_boundary"]),
+            "ema_distance_atr": (
+                f"{event['distance_ema_atr']:.2f}"
+                if event["distance_ema_atr"] is not None
+                else "-"
+            ),
+            "overlap_10": (
+                f"{event['average_overlap10']:.3f}"
+                if event["average_overlap10"] is not None
+                else "-"
+            ),
+        }
+        for event in paper["signal_trail"]
+    ]
+    boundary = float(paper["boundary"])
+    distance = f"{side * (mark / boundary - 1) * 100:+.2f}%" if mark else "-"
+    pending = "pending exit" if paper["pending_exit"] else "no pending exit"
+    summary = (
+        f"Mark {_format_price(mark)} · original range {_format_price(boundary)} "
+        f"({distance} in trade direction) · day {paper['held_days']}/120 · "
+        f"peak favorable {paper['peak_favorable_pct']:.2f}% · {pending}. "
+        "Recovery exit eligibility begins on day 85."
+    )
+    units_html = _table(
+        "Paper units",
+        unit_rows,
+        ("unit", "signal_ts", "entry_ts", "entry_price", "mark_move", "paper_gross_pnl"),
+        compact=True,
+    )
+    trail_html = _table(
+        "Signal trail",
+        trail_rows,
+        (
+            "signal_ts", "action_ts", "result", "signal_close", "range_boundary",
+            "ema_distance_atr", "overlap_10",
+        ),
+        compact=True,
+    )
+    return SafeHtml(
+        '<details data-preserve-open class="paper-drilldown">'
+        '<summary>Show paper units and signal trail</summary>'
+        f'<p>{html.escape(summary)}</p>{units_html}{trail_html}'
+        '<p class="muted">Replayed from LN Markets daily candles through '
+        f'{html.escape(str(paper["source_as_of"])[:10])}. '
+        'Gross inverse-contract estimates exclude fees, funding and liquidation. '
+        'No venue trades or wallet P&amp;L are recorded for this historical campaign.</p>'
+        '</details>'
+    )
 
 
 def _breakout_card(context: dict[str, object], denomination: str, btc_price: float | None) -> str:
@@ -991,11 +1182,14 @@ def _breakout_card(context: dict[str, object], denomination: str, btc_price: flo
         boundary = _format_price(campaign.get("boundary"))
         if origin == "historical":
             status = "State mismatch" if owned else "Historical campaign"
+            paper = _historical_paper_position(context, btc_price)
             detail = (
                 "Historical state has funded units"
                 if owned
                 else f"{side} {campaign_id} · no funded units · new parent blocked"
             )
+            if paper is not None:
+                detail += f" · {len(paper['units'])} paper units"
             card_class = "flat"
         else:
             status = f"{side} · {len(owned)}/4 units" if owned else "Closing campaign"
@@ -1020,6 +1214,14 @@ def _breakout_card(context: dict[str, object], denomination: str, btc_price: flo
                 "<small>Open P&amp;L "
                 + _signed_amount_html(sum(values), denomination, btc_price)
                 + "</small>"
+            )
+    elif isinstance(campaign, dict) and campaign.get("origin") == "historical":
+        paper = _historical_paper_position(context, btc_price)
+        if paper is not None:
+            pnl = (
+                "<small>Paper gross mark "
+                + _signed_amount_html(paper["gross_sats"], denomination, btc_price)
+                + " · excluded from account totals</small>"
             )
     return (
         f'<article class="card position-card breakout-card {card_class}">'
@@ -1158,6 +1360,7 @@ def _position_status_rows(
         campaign = breakout["campaign"]
         owned = breakout["owned"]
         assert isinstance(owned, list)
+        paper = _historical_paper_position(breakout, btc_price)
         side = (
             "long"
             if isinstance(campaign, dict) and campaign.get("side") == 1
@@ -1177,20 +1380,27 @@ def _position_status_rows(
             status = f"Funded · {len(owned)}/4 units" if owned else "Closing"
         else:
             status = "State mismatch" if owned else "Flat"
-        rows.append(
-            {
+        campaign_row = {
                 "strategy": BREAKOUT_INSTANCE_ID,
                 "status": status,
                 "slot": "campaign",
                 "timeframe": "1d",
                 "side": side,
-                "contracts": f"${sum(int(p['contracts']) for p in owned):,}" if owned else "-",
-                "leverage": "-",
+                "contracts": (
+                    f"${paper['total_notional_usd']:,.0f} paper"
+                    if paper is not None
+                    else f"${sum(int(p['contracts']) for p in owned):,}" if owned else "-"
+                ),
+                "leverage": f"{paper['leverage']:g}x paper" if paper is not None else "-",
                 "entry_ts": campaign.get("entry_ts", "-") if isinstance(campaign, dict) else "-",
-                "entry_price": "-",
-                "mark_pnl": "-",
-                "margin": "-",
-                "funding": "-",
+                "entry_price": _format_price(paper["weighted_entry"]) if paper is not None else "-",
+                "mark_pnl": (
+                    f"{_format_signed_amount(paper['gross_sats'], denomination, btc_price)} paper gross"
+                    if paper is not None
+                    else "-"
+                ),
+                "margin": f"${paper['initial_margin_usd']:,.0f} paper" if paper is not None else "-",
+                "funding": "not modeled" if paper is not None else "-",
                 "long_trigger": "-",
                 "short_trigger": "-",
                 "exit_trigger": (
@@ -1199,7 +1409,9 @@ def _position_status_rows(
                     else "-"
                 ),
             }
-        )
+        if paper is not None:
+            campaign_row["_details_html"] = _paper_details_html(paper, denomination)
+        rows.append(campaign_row)
     for position in positions:
         if position.get("strategy") != BREAKOUT_INSTANCE_ID:
             continue
@@ -2584,13 +2796,24 @@ def _render(
         "</style>",
         """.positive,.topbar .positive{color:var(--accent)}.negative,.topbar .negative{color:#f87171}.position-card-body{display:flex;justify-content:space-between;gap:1rem;align-items:end}.position-static,.position-dynamic{display:flex;flex-direction:column}.position-dynamic{text-align:right}.position-card .position-static strong,.position-card .position-dynamic strong{margin:.4rem 0 .15rem}.position-card .position-dynamic strong{font-size:1.1rem}.topbar{justify-content:space-between}.topbar-market{align-items:flex-start}.market-main{display:flex;align-items:baseline;gap:.7rem}.market-changes{margin:0}.topbar-metric{flex-direction:row;align-items:baseline;gap:1rem;text-align:right}.equity-main{display:flex;align-items:baseline;gap:.35rem}.topbar-metric small{margin-left:.15rem}.sidebar-controls .nav-label,.sidebar-controls .scope-links{padding-left:0;padding-right:0}.config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.pnl-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1.2rem;align-items:start}.pnl-grid .compact-table .table-wrap,.periodic-pnl .table-wrap{width:100%}.pnl-grid .compact-table table,.periodic-pnl table{width:100%;table-layout:fixed}.pnl-grid .table-section h2,.periodic-pnl h2{margin-top:2rem}.table-heading{display:flex;align-items:baseline;justify-content:space-between;gap:.7rem}.table-heading .period-controls{margin:0}.account-note{margin-top:.65rem}.sidebar-status{display:flex;align-items:center;gap:.55rem;color:var(--muted);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;padding:0 1.25rem 1rem;margin-bottom:.8rem;border-bottom:1px solid var(--border)}@media(max-width:1100px){.config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.pnl-grid{grid-template-columns:1fr}}@media(max-width:700px){.sidebar-status{border:0;padding:0;margin:0}.topbar-metric{align-items:flex-start;text-align:left;flex-wrap:wrap}.market-main{flex-wrap:wrap;gap:.3rem}.config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}\n</style>""",
     )
+    template = template.replace(
+        "</style>",
+        ".paper-detail-row>td{padding:0;white-space:normal;background:var(--surface)}"
+        ".paper-drilldown{padding:.55rem .75rem}"
+        ".paper-drilldown summary{cursor:pointer;color:var(--accent);font-weight:600}"
+        ".paper-drilldown p{margin:.8rem 0;color:var(--muted);white-space:normal}"
+        ".paper-drilldown .table-section h2{margin:1rem 0 .4rem}"
+        ".paper-drilldown .table-wrap{max-width:100%}</style>",
+    )
     refresh_script = """<script>
 (()=>{
   const sync=(current,next)=>{
     if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){current.replaceWith(next.cloneNode(true));return}
     if(current.nodeType===Node.TEXT_NODE){if(current.nodeValue!==next.nodeValue)current.nodeValue=next.nodeValue;return}
+    const wasOpen=current.nodeName==='DETAILS'&&current.hasAttribute('data-preserve-open')?current.open:null
     for(const attribute of [...current.attributes])if(!next.hasAttribute(attribute.name))current.removeAttribute(attribute.name)
     for(const attribute of [...next.attributes])if(current.getAttribute(attribute.name)!==attribute.value)current.setAttribute(attribute.name,attribute.value)
+    if(wasOpen!==null)current.open=wasOpen
     const oldChildren=[...current.childNodes],newChildren=[...next.childNodes]
     for(let index=0;index<Math.max(oldChildren.length,newChildren.length);index+=1){
       if(!oldChildren[index])current.appendChild(newChildren[index].cloneNode(true))
