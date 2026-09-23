@@ -171,6 +171,42 @@ fill, keep the integrated executor active or deliberately drain every breakout
 unit before reverting. Never restore the database merely to undo the additive
 schema.
 
+## Breakout unit sizing across restarts — 2026-09-23
+
+Commit `e8f0718df9f2` permits changing
+`STRATEGY_BREAKOUT_UNIT_NOTIONAL_USD` in the protected trader environment and
+restarting `lnmbot.service`. The new value applies to subsequently submitted
+parent and add-on entry intents. Existing venue trades retain their actual
+quantities and entry prices; the strategy snapshot restores the same campaign
+and MA state. A campaign can therefore contain units opened at different
+notionals. The historical `20260822L` paper campaign retains the original
+USD 100 per-unit model in its own snapshot field, even after the live entry
+size changes. No size change or new order was made during this release.
+
+Before changing the protected setting, record the order count, both strategy
+snapshots, local and venue open sets, service PID and restart count. Edit only
+the breakout size, restart the trader, and confirm the new live snapshot has
+the requested `unit_notional_usd`, the historical field remains 100, MA
+cool-off is unchanged, existing open quantities match the venue and no startup
+order was submitted. The next qualifying entry order records its intended size
+in the signals/orders journal. A previous trader release that requires the
+saved size to match its environment is unsuitable for rollback after a size
+change; roll back to this release with the prior setting instead.
+
+The trader release is
+`/usr/local/lib/lnmbot/prod-20260923.2-ge8f0718df9f2` and the dashboard
+release is
+`/usr/local/lib/lnmbot-dashboard/prod-20260923.3-ge8f0718df9f2`.
+Focused strategy, dashboard and portfolio tests passed (32 tests), as did
+Ruff. The committed code restored the live snapshot in a read-only probe at
+USD 40 and USD 80 while preserving the historical USD 100 paper mark. The
+funded cutover preserved 39 orders, `20260822L`, the MA 1d winner cool-off of
+11, both strategy snapshots and zero post-switch service restarts. The dashboard returned
+HTTP 200 with a live bar feed and unchanged USD 400 notional / USD 80 margin
+paper stack. The timed rollback was disarmed after validation; its root-only
+checkpoint is
+`/data/security-backups/lnmbot-sizing-fix-20260923T125457Z`.
+
 ## Historical campaign paper view — 2026-09-23
 
 Dashboard commit `bc5d43d1edba` is deployed at
