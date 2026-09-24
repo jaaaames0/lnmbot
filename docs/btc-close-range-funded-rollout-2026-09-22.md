@@ -281,3 +281,37 @@ returned 200, the funded trader kept PID 3512167, no orders were added (39),
 SQLite `quick_check` passed and the dashboard had zero restarts. The timed
 rollback was disarmed; its root-only checkpoint is
 `/data/security-backups/lnmbot-dashboard-layout-20260923T143522Z`.
+
+## Funded multi-strategy execution repair — 2026-09-24
+
+Trader commit `605e6643e68dce205e975c4876dfe94ec97debb3` runs at
+`/usr/local/lib/lnmbot/prod-20260924.1-g605e6643e68d`. Restart replay now
+queues missed funded breakout exits; a saved pre-order parent or add-on is
+reconciled against the venue fill; disabling breakout entries retains the
+funded portfolio route and any existing K-unit exit owner. Rejected add-ons
+return their unfilled K slot, and funded signals require complete one-minute
+candles from the earliest uncommitted day. If a market add-on fills more than
+15% beyond its parent, the executor attempts a same-bar close and persists
+the abort for retry across restarts. No strategy thresholds or capital sizing
+changed.
+
+The committed tree passed 252 tests, Ruff, mypy on changed source modules,
+and all three import architecture contracts. The release copied the previous
+runtime dependencies under the unchanged `uv.lock`; its configured seed inputs
+were verified byte-for-byte against the committed files. A root-only checkpoint
+contains the old unit and environment, online SQLite backups (including a
+fresh immediately-before-switch copy), integrity results, order/open-set
+baselines, and the release hashes at
+`/data/security-backups/lnmbot-funded-audit-fix-20260924T010116Z`.
+
+The trader switched at 11:00 UTC. LN Markets rate-limited the 100-day candle
+warmup, which completed by 11:01:51; run 58 then recorded consecutive live
+minute bars. Both strategy snapshots restored. The MA 1d winner cool-off
+remained 11, the `20260822L` campaign remained historical with four modeled
+units, and the existing `ma_cross_primary:4h` venue trade reconciled with no
+new funded order (39 order rows). The trader was active at PID 3769392 with
+zero automatic restarts, SQLite `quick_check` passed, and the separate
+dashboard returned HTTP 200 with zero restarts. The 15-minute rollback would
+have refused to restore old code after a change in orders or the local open
+set; it was disarmed after live-bar and venue checks passed. The previous
+trader release remains available for a guarded rollback.

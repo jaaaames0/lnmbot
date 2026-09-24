@@ -278,6 +278,18 @@ state and skips overlapping warmup bars, so it does not reseed or mutate the
 EMA a second time. A strategy-parameter change intentionally invalidates the
 old snapshot and performs the deep bootstrap again.
 
+The funded runner always restores the MA strategy under `ma_cross_primary`.
+Setting `STRATEGY_BREAKOUT_ENABLED=false` prevents new breakout entries but
+continues to reconcile and exit any funded breakout K units already open.
+After a restart, compare the venue and local open sets, verify the MA cool-off
+and breakout campaign snapshots, and wait for a new live minute bar before
+accepting the restart. A missed breakout campaign exit found during warmup is
+sent when live bars resume. Missing one-minute candles in an uncommitted day
+stop the funded feed rather than forming an incomplete 4h or daily signal;
+investigate the gap before restarting again. Older committed history gaps do
+not invalidate the restored strategy state. The 100-day candle fetch can hit
+LN Markets rate limits even when both strategy snapshots restore successfully.
+
 An unchanged directional verdict is not itself an entry signal. The bot only
 retries under an unchanged verdict when the durable snapshot says that a
 previously emitted order remains unconfirmed. This prevents a cold restart or
