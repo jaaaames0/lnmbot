@@ -106,7 +106,9 @@ def _august_reversal(*, unit_count: int = 1) -> tuple[CloseRangeLive, StrategySt
     ]
     assert strategy.machine.campaign is None
     assert strategy.persistent_state()["pending_reversal"]["campaign_id"] == "20260822L"
-    assert strategy.persistent_state()["recent_decisions"][-1]["reason"] == "awaiting_campaign_close"
+    assert (
+        strategy.persistent_state()["recent_decisions"][-1]["reason"] == "awaiting_campaign_close"
+    )
     return strategy, state, next_open
 
 
@@ -133,7 +135,9 @@ def test_funded_reversal_enters_only_after_old_close_confirms():
     entry = strategy.on_bar(_minute(next_open + timedelta(minutes=3)), state)
     assert [(intent.kind.value, intent.position_key) for intent in entry] == [("entry", "k0")]
     assert entry[0].metadata["campaign_id"] == "20260822L"
-    strategy.on_order_result(entry[0], SimpleNamespace(order_id=12, detail={"price_usd": 78_301}), state)
+    strategy.on_order_result(
+        entry[0], SimpleNamespace(order_id=12, detail={"price_usd": 78_301}), state
+    )
     assert strategy.machine.campaign is not None
     assert strategy.machine.campaign.origin == "live"
     assert strategy.machine.campaign.units[0].entry_price == 78_301
@@ -157,7 +161,10 @@ def test_failed_reversal_close_survives_restart_and_never_enters_early():
     # mirror and reconciliation must still release the deferred parent.
     state.position("k0").qty_sats = 0
     restored.reconcile_execution_state(state)
-    assert [intent.kind.value for intent in restored.on_bar(_minute(next_open + timedelta(minutes=3)), state)] == ["entry"]
+    assert [
+        intent.kind.value
+        for intent in restored.on_bar(_minute(next_open + timedelta(minutes=3)), state)
+    ] == ["entry"]
 
 
 def test_changed_unit_size_restores_old_trade_and_sizes_next_entry():
@@ -289,6 +296,202 @@ def test_live_adapter_routes_parent_to_k0_and_confirms_actual_fill():
     assert strategy.machine.campaign is not None
     assert strategy.machine.campaign.origin == "live"
     assert strategy.machine.campaign.units[0].entry_price == 111.25
+
+
+def test_restart_promotes_recorded_parent_fill_or_discards_unfilled_parent():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    strategy = CloseRangeLive(
+        {"activation_ts": start.isoformat()}, machine=_machine_with_pending_parent(start)
+    )
+    bar = Bar(
+        ts=start + timedelta(days=121),
+        open=700,
+        high=1_010,
+        low=699,
+        close=1_000,
+        volume=1,
+        timeframe="1d",
+    )
+    assert strategy.on_bar(bar, _state())[0].position_key == "k0"
+    snapshot = strategy.persistent_state()
+
+    unfilled = CloseRangeLive(strategy.params)
+    assert unfilled.restore_persistent_state(snapshot)
+    unfilled.on_startup(_state())
+    assert unfilled.machine.campaign is None
+
+    owned = _state()
+    owned.position("k0").qty_sats = 100
+    owned.position("k0").side = "long"
+    owned.position("k0").entry_price_usd = 1_005
+    filled = CloseRangeLive(strategy.params)
+    assert filled.restore_persistent_state(snapshot)
+    filled.on_startup(owned)
+    assert filled.machine.campaign is not None
+    assert filled.machine.campaign.origin == "live"
+    assert filled.machine.campaign.units[0].entry_price == 1_005
+
+
+def test_missed_warmup_exit_is_sent_on_first_live_bar():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = _machine_with_pending_parent(start)
+    machine.seed_campaign(
+        {
+            "parent_id": "funded-long",
+            "side": "long",
+            "entry_ts": (start + timedelta(days=100)).isoformat(),
+            "entry_price": 230,
+            "boundary": 220,
+            "held_days": 20,
+            "peak_favorable_pct": 0.1,
+            "active_units": 1,
+            "pending_exit": None,
+        }
+    )
+    assert machine.campaign is not None
+    machine.campaign.origin = "live"
+    machine.campaign.units[0].origin = "live"
+    strategy = CloseRangeLive({"activation_ts": start.isoformat()}, machine=machine)
+    state = _state()
+    state.position("k0").qty_sats = 100
+    state.position("k0").side = "long"
+    state.position("k0").entry_price_usd = 230
+    strategy.on_startup(state)
+    assert (
+        strategy.on_bar(
+            Bar(
+                ts=start + timedelta(days=121),
+                open=215,
+                high=216,
+                low=209,
+                close=210,
+                volume=1,
+                timeframe="1d",
+                warmup=True,
+            ),
+            state,
+        )
+        == []
+    )
+    assert strategy.machine.campaign is None
+    assert strategy.persistent_state()["closing_slots"] == ["k0"]
+    exits = strategy.on_bar(_minute(start + timedelta(days=121, minutes=1)), state)
+    assert [(intent.kind.value, intent.position_key) for intent in exits] == [("exit", "k0")]
+
+
+def test_rejected_addon_does_not_spend_a_campaign_slot():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = _machine_with_pending_parent(start)
+    machine.seed_campaign(
+        {
+            "parent_id": "funded-long",
+            "side": "long",
+            "entry_ts": (start + timedelta(days=100)).isoformat(),
+            "entry_price": 230,
+            "boundary": 220,
+            "held_days": 20,
+            "peak_favorable_pct": 0.1,
+            "active_units": 1,
+            "pending_exit": None,
+        }
+    )
+    assert machine.campaign is not None
+    machine.campaign.origin = "live"
+    machine.campaign.units[0].origin = "live"
+    machine.campaign.units.append(CampaignUnit(1, start + timedelta(days=121), 235, "paper"))
+    machine.campaign.lifetime_units = 2
+    strategy = CloseRangeLive({"activation_ts": start.isoformat()}, machine=machine)
+    state = _state()
+    state.position("k0").qty_sats = 100
+    decision = BreakoutDecision(
+        start + timedelta(days=121),
+        "paper_addon",
+        "raw_same_side_addon",
+        "funded-long",
+        1,
+        1,
+        235,
+        {},
+    )
+    intent = strategy._intents([decision], state)[0]
+    strategy.on_order_result(intent, SimpleNamespace(order_id=None, detail={}), state)
+    assert machine.campaign.lifetime_units == 1
+    assert [unit.k for unit in machine.campaign.units] == [0]
+
+
+def test_actual_addon_fill_beyond_distance_cap_is_closed_and_survives_restart():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = _machine_with_pending_parent(start)
+    machine.seed_campaign(
+        {
+            "parent_id": "funded-long",
+            "side": "long",
+            "entry_ts": (start + timedelta(days=100)).isoformat(),
+            "entry_price": 100,
+            "boundary": 95,
+            "held_days": 20,
+            "peak_favorable_pct": 0.1,
+            "active_units": 1,
+            "pending_exit": None,
+        }
+    )
+    assert machine.campaign is not None
+    machine.campaign.origin = "live"
+    machine.campaign.units[0].origin = "live"
+    machine.campaign.units.append(CampaignUnit(1, start + timedelta(days=121), 114, "paper"))
+    machine.campaign.lifetime_units = 2
+    strategy = CloseRangeLive({"activation_ts": start.isoformat()}, machine=machine)
+    state = _state()
+    state.position("k0").qty_sats = 100
+    decision = BreakoutDecision(
+        start + timedelta(days=121),
+        "paper_addon",
+        "raw_same_side_addon",
+        "funded-long",
+        1,
+        1,
+        114,
+        {},
+    )
+    intent = strategy._intents([decision], state)[0]
+    pre_fill_snapshot = strategy.persistent_state()
+    result = SimpleNamespace(order_id=1, detail={"price_usd": 116})
+    strategy.on_order_result(intent, result, state)
+    immediate = strategy.post_entry_exits(intent, result, _minute(start + timedelta(days=121)))
+    assert [(value.kind.value, value.position_key) for value in immediate] == [("exit", "k1")]
+    state.position("k1").qty_sats = 100
+    state.position("k1").side = "long"
+    state.position("k1").entry_price_usd = 116
+
+    crashed = CloseRangeLive(strategy.params)
+    assert crashed.restore_persistent_state(pre_fill_snapshot)
+    crashed.on_startup(state)
+    assert crashed.machine.campaign is not None
+    assert crashed.machine.campaign.units[1].origin == "live"
+    assert crashed.persistent_state()["aborting_slots"] == ["k1"]
+
+    restored = CloseRangeLive(strategy.params)
+    assert restored.restore_persistent_state(strategy.persistent_state())
+    restored.on_startup(state)
+    exits = restored.on_bar(_minute(start + timedelta(days=121, minutes=1)), state)
+    assert [(value.kind.value, value.position_key) for value in exits] == [("exit", "k1")]
+    assert exits[0].reason == "addon_fill_too_far"
+    restored.on_order_result(
+        exits[0], SimpleNamespace(order_id=2, detail={"price_usd": 115}), state
+    )
+    assert restored.machine.campaign is not None
+    assert [unit.k for unit in restored.machine.campaign.units] == [0]
+    assert restored.machine.campaign.lifetime_units == 2
+
+
+def test_disabled_breakout_entries_still_preserve_funded_exit():
+    strategy, state, next_open = _august_reversal()
+    disabled = CloseRangeLive({**strategy.params, "entries_enabled": False})
+    assert disabled.restore_persistent_state(strategy.persistent_state())
+    disabled.on_startup(state)
+    exits = disabled.on_bar(_minute(next_open + timedelta(minutes=1)), state)
+    assert [(value.kind.value, value.position_key) for value in exits] == [("exit", "k0")]
+    assert disabled.persistent_state()["pending_reversal"] is None
 
 
 def test_historical_campaign_never_funds_an_addon_without_owned_parent():

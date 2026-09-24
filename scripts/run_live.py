@@ -1,8 +1,7 @@
 """Live deployment runner.
 
-Wires the full pipeline with real LNM API:
-  LnmLiveStream (polling) → MultiTimeframeDataSource → MaCross
-  → RiskGuard → LiveExecutor (real orders)
+Wires one funded LNM feed, portfolio risk guard and isolated-trade executor
+for the MA and optional close-range strategies.
 
 Reads config from environment (via BotConfig) and .env file. Catches
 SIGTERM/SIGINT for clean shutdown. Suitable for optiplex systemd or
@@ -14,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -35,6 +34,42 @@ from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
 from lnmarkets_bot.strategy.close_range_live import CloseRangeLive, load_seed_machine
 from lnmarkets_bot.strategy.ma_cross import MaCross
+
+
+def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime | None:
+    """Validate uncommitted days while ignoring old replay gaps."""
+    names = ["lnmarkets_bot.strategy.ma_cross.MaCross"]
+    if include_breakout:
+        names.append("lnmarkets_bot.strategy.close_range_live.CloseRangeLive")
+    starts: list[datetime] = []
+
+    def day_start(value: datetime | str) -> datetime:
+        stamp = (
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if isinstance(value, str)
+            else value
+        )
+        utc = stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)
+        return utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for name in names:
+        snapshot = recorder.latest_strategy_state(mode="live", strategy_name=name)
+        if snapshot is None:
+            # A cold strategy needs its entire warmup history to be sound.
+            return None
+        starts.append(day_start(snapshot["ts"]))
+        state = snapshot["state"]
+        if name.endswith(".MaCross"):
+            timeframes = state.get("timeframes", {})
+            if not timeframes or any(not item.get("last_bar_ts") for item in timeframes.values()):
+                return None
+            starts.extend(day_start(item["last_bar_ts"]) for item in timeframes.values())
+        else:
+            last_day = state.get("machine", {}).get("last_bar_ts")
+            if not last_day:
+                return None
+            starts.append(day_start(last_day) + timedelta(days=1))
+    return min(starts)
 
 
 async def main() -> int:
@@ -84,6 +119,8 @@ async def main() -> int:
     cfg = BotConfig(_env_file=str(args.env) if args.env.exists() else None)
     if args.test_5m and cfg.strategy_breakout_enabled:
         parser.error("--test-5m cannot run while STRATEGY_BREAKOUT_ENABLED=true")
+    if cfg.strategy_breakout_enabled and not args.allow_orders:
+        parser.error("integrated breakout currently requires funded live execution")
     configure_logging(cfg.storage_log_level, cfg.storage_log_path)
     log = get_logger("live")
     log.info(
@@ -171,10 +208,7 @@ async def main() -> int:
         else "production"
     )
     log.info("live.strategy_profile", profile=profile)
-    higher_timeframes = (
-        tuple(dict.fromkeys((*strat.tfs, "1d"))) if cfg.strategy_breakout_enabled else strat.tfs
-    )
-    ds = MultiTimeframeDataSource(base_stream, higher_timeframes=higher_timeframes)
+    higher_timeframes = tuple(dict.fromkeys((*strat.tfs, "1d"))) if args.allow_orders else strat.tfs
 
     # Wire LiveExecutor via factory. run_paper creates a Recorder against the
     # same database, so using this recorder keeps order writes on that DB.
@@ -186,9 +220,7 @@ async def main() -> int:
             recorder=recorder,
             run_id=-1,
             symbol="BTCUSD",
-            legacy_strategy_instance_id=(
-                "ma_cross_primary" if cfg.strategy_breakout_enabled else None
-            ),
+            legacy_strategy_instance_id="ma_cross_primary",
         )
         account_balance_provider = LiveAccountBalanceProvider(
             account_api=AccountApi(client), isolated_trades_api=trades_api, recorder=recorder
@@ -196,8 +228,25 @@ async def main() -> int:
 
     # Run
     try:
+        owned_breakout = False
         if executor is not None:
             await executor.reconcile()
+            owned_breakout = any(
+                key.startswith("btc_close_range_v1:") and position.qty_sats
+                for key, position in executor.positions.items()
+            )
+        ds = MultiTimeframeDataSource(
+            base_stream,
+            higher_timeframes=higher_timeframes,
+            require_complete_buckets=args.allow_orders,
+            strict_from_ts=(
+                _strict_data_from(
+                    recorder, include_breakout=cfg.strategy_breakout_enabled or owned_breakout
+                )
+                if executor is not None
+                else None
+            ),
+        )
         sizing_policy = SizingPolicy(
             mode=cfg.sizing_mode,
             total_margin_fraction=cfg.sizing_total_margin_fraction,
@@ -205,27 +254,30 @@ async def main() -> int:
             equity_haircut=cfg.sizing_equity_haircut,
             fixed_notional_strategy_ids=frozenset({"btc_close_range_v1"}),
         )
-        if cfg.strategy_breakout_enabled:
-            if executor is None or account_balance_provider is None:
-                raise RuntimeError("integrated breakout currently requires funded live execution")
-            breakout = CloseRangeLive(
-                {
-                    "unit_notional_usd": cfg.strategy_breakout_unit_notional_usd,
-                    "leverage": cfg.strategy_breakout_leverage,
-                    "activation_ts": datetime.now(UTC).isoformat(),
-                },
-                machine=load_seed_machine(
-                    cfg.strategy_breakout_seed_daily_path,
-                    cfg.strategy_breakout_seed_campaign_path,
-                ),
-            )
+        if executor is not None:
+            assert account_balance_provider is not None
+            # Funded MA trades keep namespaced keys even when breakout entries
+            # are disabled. Keep the portfolio dispatcher, and retain the
+            # breakout owner while any K slot is still funded.
+            bindings = [StrategyBinding("ma_cross_primary", strat)]
+            if cfg.strategy_breakout_enabled or owned_breakout:
+                breakout = CloseRangeLive(
+                    {
+                        "unit_notional_usd": cfg.strategy_breakout_unit_notional_usd,
+                        "leverage": cfg.strategy_breakout_leverage,
+                        "activation_ts": datetime.now(UTC).isoformat(),
+                        "entries_enabled": cfg.strategy_breakout_enabled,
+                    },
+                    machine=load_seed_machine(
+                        cfg.strategy_breakout_seed_daily_path,
+                        cfg.strategy_breakout_seed_campaign_path,
+                    ),
+                )
+                bindings.append(StrategyBinding("btc_close_range_v1", breakout))
             run_id = await run_portfolio_live(
                 cfg=cfg,
                 data_source=ds,
-                bindings=(
-                    StrategyBinding("ma_cross_primary", strat),
-                    StrategyBinding("btc_close_range_v1", breakout),
-                ),
+                bindings=tuple(bindings),
                 executor=executor,
                 recorder=recorder,
                 sizing_policy=sizing_policy,

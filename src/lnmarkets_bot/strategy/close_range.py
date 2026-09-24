@@ -261,6 +261,21 @@ class CloseRangeMachine:
             self.campaign.entry_ts = _utc(ts)
             self.campaign.origin = "live"
 
+    def discard_unfilled_addon(self, k: int) -> None:
+        """Undo the latest modeled add-on when no venue trade was opened."""
+        campaign = self.campaign
+        if (
+            campaign is None
+            or k <= 0
+            or campaign.lifetime_units != k + 1
+            or not campaign.units
+            or campaign.units[-1].k != k
+            or campaign.units[-1].origin != "paper"
+        ):
+            raise ValueError("latest unfilled add-on is absent")
+        campaign.units.pop()
+        campaign.lifetime_units -= 1
+
     def parent_liquidated(self, ts: datetime, price: float) -> BreakoutDecision:
         """Apply an externally observed parent liquidation to campaign occupancy."""
         if self.campaign is None:
@@ -281,22 +296,32 @@ class CloseRangeMachine:
 
     def child_liquidated(self, *, k: int, ts: datetime, price: float) -> BreakoutDecision:
         """Remove one liquidated add-on without replenishing its lifetime slot."""
-        if self.campaign is None or k <= 0:
-            raise ValueError("no active child campaign unit")
-        unit = next((value for value in self.campaign.units if value.k == k), None)
-        if unit is None:
-            raise ValueError("campaign child is absent")
-        self.campaign.units.remove(unit)
+        return self.child_closed(k=k, ts=ts, price=price, reason="child_liquidation")
+
+    def child_closed(self, *, k: int, ts: datetime, price: float, reason: str) -> BreakoutDecision:
+        """Remove a funded child that closed independently of the campaign."""
+        unit = self.forget_closed_child(k)
+        assert self.campaign is not None
         return BreakoutDecision(
             ts=_utc(ts),
             kind="unit_exit",
-            reason="child_liquidation",
+            reason=reason,
             campaign_id=self.campaign.campaign_id,
             k=k,
             side=self.campaign.side,
             price=float(price),
             metadata={"origin": unit.origin, "owned": unit.origin == "live"},
         )
+
+    def forget_closed_child(self, k: int) -> CampaignUnit:
+        """Reconcile a child known closed at the venue without reusing its slot."""
+        if self.campaign is None or k <= 0:
+            raise ValueError("no active child campaign unit")
+        unit = next((value for value in self.campaign.units if value.k == k), None)
+        if unit is None:
+            raise ValueError("campaign child is absent")
+        self.campaign.units.remove(unit)
+        return unit
 
     def persistent_state(self) -> dict[str, Any]:
         return {

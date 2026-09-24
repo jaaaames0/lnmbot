@@ -240,3 +240,65 @@ async def test_incremental_stream_closes_5m_without_waiting_for_next_base_bar() 
 
     assert emitted[-1].timeframe == "5m"
     assert emitted[-1].ts == base + timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_funded_stream_rejects_missing_minute_in_completed_bucket() -> None:
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = [
+        Bar(base + timedelta(minutes=i), 100, 101, 99, 100, 1, timeframe="1m")
+        for i in range(10)
+        if i != 7
+    ]
+    source = MultiTimeframeDataSource(
+        _StreamingBars(bars), higher_timeframes=("5m",), require_complete_buckets=True
+    )
+    with pytest.raises(ValueError, match="missing or repeated 1m candle"):
+        [bar async for bar in source.stream()]
+
+
+@pytest.mark.asyncio
+async def test_funded_stream_skips_only_initial_partial_warmup_bucket() -> None:
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = [
+        Bar(base + timedelta(minutes=i), 100, 101, 99, 100, 1, timeframe="1m", warmup=True)
+        for i in range(2, 10)
+    ]
+    source = MultiTimeframeDataSource(
+        _StreamingBars(bars), higher_timeframes=("5m",), require_complete_buckets=True
+    )
+    derived = [bar async for bar in source.stream() if bar.timeframe == "5m"]
+    assert [bar.ts for bar in derived] == [base + timedelta(minutes=10)]
+
+
+@pytest.mark.asyncio
+async def test_funded_stream_allows_committed_history_gap_but_checks_new_bars() -> None:
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def bar(minute: int) -> Bar:
+        return Bar(base + timedelta(minutes=minute), 100, 101, 99, 100, 1)
+
+    old_gap = [bar(i) for i in range(15) if i != 7]
+    source = MultiTimeframeDataSource(
+        _StreamingBars(old_gap),
+        higher_timeframes=("5m",),
+        require_complete_buckets=True,
+        strict_from_ts=base + timedelta(minutes=10),
+    )
+    assert [
+        value.ts for value in [item async for item in source.stream() if item.timeframe == "5m"]
+    ] == [
+        base + timedelta(minutes=5),
+        base + timedelta(minutes=10),
+        base + timedelta(minutes=15),
+    ]
+
+    new_gap = [bar(i) for i in range(15) if i not in {7, 12}]
+    source = MultiTimeframeDataSource(
+        _StreamingBars(new_gap),
+        higher_timeframes=("5m",),
+        require_complete_buckets=True,
+        strict_from_ts=base + timedelta(minutes=10),
+    )
+    with pytest.raises(ValueError, match="missing or repeated 1m candle"):
+        [item async for item in source.stream()]

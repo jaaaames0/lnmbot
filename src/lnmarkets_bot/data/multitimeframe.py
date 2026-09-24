@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import timedelta
-from typing import TYPE_CHECKING
+from datetime import datetime, timedelta
+from itertools import pairwise
+from typing import TYPE_CHECKING, Any, cast
 
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 
 from ..strategy import Bar
 from .source import DataSource
@@ -51,13 +52,15 @@ _TF_SPECS: dict[str, _TfSpec] = {
 
 
 class MultiTimeframeDataSource(DataSource):
-    """Wraps a small-TF BacktestReplay and emits higher-TF bars at boundaries."""
+    """Emit higher-TF bars; funded streams reject missing minute inputs."""
 
     def __init__(
         self,
         base: DataSource,
         *,
         higher_timeframes: tuple[str, ...] = ("1d", "4h", "1h"),
+        require_complete_buckets: bool = False,
+        strict_from_ts: datetime | None = None,
     ) -> None:
         if not higher_timeframes:
             raise ValueError("higher_timeframes must be non-empty")
@@ -71,18 +74,20 @@ class MultiTimeframeDataSource(DataSource):
             )
         )
         self.base = base
+        self.require_complete_buckets = require_complete_buckets
+        self.strict_from_ts = strict_from_ts
         self._cache: dict[str, list[Bar]] = {}
 
     def _load_base(self) -> list[Bar]:
         """Force-load the underlying 1m bars into memory if not already done."""
         if hasattr(self.base, "_load"):
-            base_obj = self.base  # type: ignore[attr-defined]
-            base_obj._load()  # type: ignore[attr-defined]
-            return base_obj._bars  # type: ignore[attr-defined]
+            base_obj = cast("Any", self.base)
+            base_obj._load()
+            return cast("list[Bar]", base_obj._bars)
         # Fall back: read the parquet directly via the public path.
         # (BacktestReplay's _load is a private, but stable, internal API.)
         if hasattr(self.base, "path"):
-            df = pd.read_parquet(self.base.path)  # type: ignore[attr-defined]
+            df = pd.read_parquet(self.base.path)
             df = df.sort_values("ts")
             if df["ts"].dt.tz is None:
                 df["ts"] = df["ts"].dt.tz_localize("UTC")
@@ -187,19 +192,36 @@ class MultiTimeframeDataSource(DataSource):
 
     async def _stream_incremental(self) -> AsyncIterator[Bar]:
         """Aggregate a never-ending 1m stream without preloading it."""
-        bucket_start: dict[str, object] = {}
+        bucket_start: dict[str, datetime] = {}
         bucket_bars: dict[str, list[Bar]] = {tf: [] for tf in self._tfs_desc}
+        first_bucket: set[str] = set(self._tfs_desc)
+        last_base_ts: datetime | None = None
 
         async for bar in self.base.stream():
             if bar.timeframe != "1m":
                 yield bar
                 continue
+            if (
+                self.require_complete_buckets
+                and last_base_ts is not None
+                and (self.strict_from_ts is None or last_base_ts >= self.strict_from_ts)
+                and bar.ts != last_base_ts + timedelta(minutes=1)
+            ):
+                raise ValueError(f"missing or repeated 1m candle after {last_base_ts}")
+            last_base_ts = bar.ts
             completed: list[Bar] = []
             for tf in self._tfs_desc:
                 start = self._bucket_start(bar.ts, tf)
                 previous = bucket_start.get(tf)
                 if previous is not None and start != previous and bucket_bars[tf]:
-                    completed.append(self._aggregate_bucket(tf, bucket_bars[tf], previous))
+                    strict = self._strict_bucket(tf, previous)
+                    if not strict or self._bucket_is_complete(tf, bucket_bars[tf], previous):
+                        completed.append(self._aggregate_bucket(tf, bucket_bars[tf], previous))
+                    elif tf not in first_bucket:
+                        raise ValueError(
+                            f"incomplete {tf} candle ending {self._bucket_end(previous, tf)}"
+                        )
+                    first_bucket.discard(tf)
                     bucket_bars[tf] = []
                 bucket_start[tf] = start
                 bucket_bars[tf].append(bar)
@@ -209,14 +231,21 @@ class MultiTimeframeDataSource(DataSource):
                 # that fact. Waiting caused every higher-TF signal to lag by
                 # roughly one minute.
                 if self._bar_closes_bucket(bar, start, tf):
-                    completed.append(self._aggregate_bucket(tf, bucket_bars[tf], start))
+                    strict = self._strict_bucket(tf, start)
+                    if not strict or self._bucket_is_complete(tf, bucket_bars[tf], start):
+                        completed.append(self._aggregate_bucket(tf, bucket_bars[tf], start))
+                    elif tf not in first_bucket:
+                        raise ValueError(
+                            f"incomplete {tf} candle ending {self._bucket_end(start, tf)}"
+                        )
+                    first_bucket.discard(tf)
                     bucket_bars[tf] = []
             yield bar
             for higher_bar in completed:
                 yield higher_bar
 
     @staticmethod
-    def _bucket_start(ts, timeframe: str):
+    def _bucket_start(ts: datetime, timeframe: str) -> datetime:
         if timeframe == "1d":
             return ts.replace(hour=0, minute=0, second=0, microsecond=0)
         if timeframe.endswith("m"):
@@ -231,13 +260,13 @@ class MultiTimeframeDataSource(DataSource):
         )
 
     @staticmethod
-    def _bar_closes_bucket(bar: Bar, start, timeframe: str) -> bool:
+    def _bar_closes_bucket(bar: Bar, start: datetime, timeframe: str) -> bool:
         return bar.ts + timedelta(minutes=1) == MultiTimeframeDataSource._bucket_end(
             start, timeframe
         )
 
     @staticmethod
-    def _bucket_end(start, timeframe: str):
+    def _bucket_end(start: datetime, timeframe: str) -> datetime:
         if timeframe == "1d":
             return start + timedelta(days=1)
         if timeframe.endswith("m"):
@@ -245,7 +274,7 @@ class MultiTimeframeDataSource(DataSource):
         return start + timedelta(hours=int(timeframe.removesuffix("h")))
 
     @staticmethod
-    def _aggregate_bucket(timeframe: str, bars: list[Bar], start) -> Bar:
+    def _aggregate_bucket(timeframe: str, bars: list[Bar], start: datetime) -> Bar:
         return Bar(
             ts=MultiTimeframeDataSource._bucket_end(start, timeframe),
             open=bars[0].open,
@@ -255,6 +284,23 @@ class MultiTimeframeDataSource(DataSource):
             volume=sum(bar.volume for bar in bars),
             timeframe=timeframe,
             warmup=all(bar.warmup for bar in bars),
+        )
+
+    @staticmethod
+    def _bucket_is_complete(timeframe: str, bars: list[Bar], start: datetime) -> bool:
+        expected = int(
+            (MultiTimeframeDataSource._bucket_end(start, timeframe) - start) / timedelta(minutes=1)
+        )
+        return (
+            len(bars) == expected
+            and bars[0].ts == start
+            and bars[-1].ts == start + timedelta(minutes=expected - 1)
+            and all(right.ts - left.ts == timedelta(minutes=1) for left, right in pairwise(bars))
+        )
+
+    def _strict_bucket(self, timeframe: str, start: datetime) -> bool:
+        return self.require_complete_buckets and (
+            self.strict_from_ts is None or self._bucket_end(start, timeframe) > self.strict_from_ts
         )
 
 

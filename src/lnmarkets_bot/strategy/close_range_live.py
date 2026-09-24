@@ -40,6 +40,7 @@ class CloseRangeLive(Strategy):
     ) -> None:
         super().__init__(params)
         self.unit_notional_usd = float(self.params.get("unit_notional_usd", 100.0))
+        self.entries_enabled = bool(self.params.get("entries_enabled", True))
         # The seeded, unowned campaign is marked at the size used when it was
         # first modeled. Changing the size of future funded entries must not
         # retroactively revalue that paper history.
@@ -52,8 +53,7 @@ class CloseRangeLive(Strategy):
             else datetime.now(UTC)
         )
         if not all(
-            math.isfinite(value) and value > 0
-            for value in (self.unit_notional_usd, self.leverage)
+            math.isfinite(value) and value > 0 for value in (self.unit_notional_usd, self.leverage)
         ):
             raise ValueError("breakout size and leverage must be positive")
         self.machine = machine or CloseRangeMachine()
@@ -61,6 +61,7 @@ class CloseRangeLive(Strategy):
         self._urgent_intents: deque[OrderIntent] = deque()
         self._closing_campaign_id: str | None = None
         self._closing_slots: set[str] = set()
+        self._aborting_slots: set[str] = set()
         self._pending_reversal: dict[str, Any] | None = None
 
     def on_startup(self, state: StrategyState) -> None:
@@ -75,6 +76,46 @@ class CloseRangeLive(Strategy):
             self.machine.confirm_owned_fill(k=0, ts=campaign.entry_ts, price=price)
             self._pending_reversal = None
             return
+        campaign = self.machine.campaign
+        if campaign is not None and campaign.origin == "paper":
+            if "k0" in owned:
+                parent = state.position("k0")
+                if parent.entry_price_usd is None:
+                    raise RuntimeError("owned breakout parent has no entry price")
+                expected_side = "long" if campaign.side == 1 else "short"
+                if parent.side != expected_side:
+                    raise RuntimeError("owned breakout parent side disagrees with campaign")
+                self.machine.confirm_owned_fill(
+                    k=0,
+                    ts=parent.entry_ts or campaign.entry_ts,
+                    price=parent.entry_price_usd,
+                )
+            elif not owned:
+                # A snapshot committed before a rejected/never-submitted order
+                # must not turn a missed entry into indefinite paper occupancy.
+                self.machine.campaign = None
+                self.machine.pending_exit = None
+        campaign = self.machine.campaign
+        if campaign is not None and campaign.origin == "live":
+            for unit in reversed(tuple(campaign.units[1:])):
+                if unit.origin != "paper":
+                    continue
+                slot = f"k{unit.k}"
+                position = state.position(slot)
+                if position.qty_sats:
+                    if position.entry_price_usd is None:
+                        raise RuntimeError(f"owned breakout {slot} has no entry price")
+                    expected_side = "long" if campaign.side == 1 else "short"
+                    if position.side != expected_side:
+                        raise RuntimeError(f"owned breakout {slot} side disagrees with campaign")
+                    self.machine.confirm_owned_fill(
+                        k=unit.k,
+                        ts=position.entry_ts or unit.entry_ts,
+                        price=position.entry_price_usd,
+                    )
+                else:
+                    self.machine.discard_unfilled_addon(unit.k)
+            self._mark_out_of_range_fills()
         if owned and self.machine.campaign is None and set(owned) <= self._closing_slots:
             for slot in owned:
                 self._urgent_intents.append(
@@ -99,6 +140,19 @@ class CloseRangeLive(Strategy):
         urgent = [] if bar.warmup else list(self._urgent_intents)
         if not bar.warmup:
             self._urgent_intents.clear()
+            if not self.entries_enabled and self._pending_reversal:
+                self._abandon_pending_reversal()
+            if bar.timeframe == "1m":
+                urgent.extend(
+                    self._exit_intent(
+                        slot,
+                        "addon_fill_too_far",
+                        self.machine.campaign.campaign_id if self.machine.campaign else None,
+                        {"abort_addon": True, "observed_at": bar.ts.isoformat()},
+                    )
+                    for slot in sorted(self._aborting_slots)
+                    if state.position(slot).qty_sats and slot not in self._closing_slots
+                )
         if self._pending_reversal and not bar.warmup:
             entry_ts = datetime.fromisoformat(self._pending_reversal["ts"]).astimezone(UTC)
             if bar.ts.astimezone(UTC) > entry_ts + self.REVERSAL_ENTRY_WINDOW:
@@ -131,8 +185,32 @@ class CloseRangeLive(Strategy):
         for decision in decisions:
             self._recent_decisions.append(self._decision_dict(decision))
         if bar.warmup:
+            self._reconcile_warmup_decisions(decisions, state)
             return urgent
         return urgent + self._intents(decisions, state)
+
+    def _reconcile_warmup_decisions(
+        self, decisions: list[BreakoutDecision], state: StrategyState
+    ) -> None:
+        """Keep missed exits actionable without entering on replayed signals."""
+        for decision in decisions:
+            if decision.kind == "campaign_exit":
+                owned = [slot for slot in self.position_slots if state.position(slot).qty_sats]
+                if owned:
+                    self._closing_campaign_id = decision.campaign_id
+                    for slot in owned:
+                        self._closing_slots.add(slot)
+                        self._urgent_intents.append(
+                            self._exit_intent(
+                                slot, decision.reason, decision.campaign_id, trigger_tf="1d"
+                            )
+                        )
+            elif decision.kind == "paper_parent":
+                self._abandon_unfunded_parent(decision.campaign_id)
+            elif decision.kind == "paper_addon":
+                campaign = self.machine.campaign
+                if campaign is not None and campaign.origin == "live" and decision.k is not None:
+                    self.machine.discard_unfilled_addon(decision.k)
 
     def _intents(
         self, decisions: list[BreakoutDecision], state: StrategyState
@@ -146,6 +224,22 @@ class CloseRangeLive(Strategy):
                 "decision_kind": decision.kind,
             }
             if decision.kind in {"paper_parent", "paper_addon"} and decision.k is not None:
+                if self._aborting_slots:
+                    if decision.kind == "paper_parent":
+                        self._abandon_unfunded_parent(decision.campaign_id)
+                    elif (
+                        self.machine.campaign is not None and self.machine.campaign.origin == "live"
+                    ):
+                        self.machine.discard_unfilled_addon(decision.k)
+                    continue
+                if not self.entries_enabled:
+                    if decision.kind == "paper_parent":
+                        self._abandon_unfunded_parent(decision.campaign_id)
+                    elif (
+                        self.machine.campaign is not None and self.machine.campaign.origin == "live"
+                    ):
+                        self.machine.discard_unfilled_addon(decision.k)
+                    continue
                 if self._closing_slots:
                     if decision.kind == "paper_parent" and self._closing_campaign_id:
                         self._pending_reversal = self._decision_dict(decision)
@@ -198,12 +292,20 @@ class CloseRangeLive(Strategy):
                 self._closing_slots.discard(intent.position_key)
                 if not self._closing_slots:
                     self._closing_campaign_id = None
+                if intent.metadata.get("abort_addon"):
+                    self._finish_aborted_addon(
+                        intent.position_key,
+                        datetime.fromisoformat(intent.metadata["observed_at"]),
+                        float(decision.detail.get("price_usd") or 0),
+                    )
             return
         if intent.kind != SignalKind.ENTRY:
             return
         if not decision.order_id or decision.order_id <= 0:
             if intent.position_key == "k0":
                 self._abandon_unfunded_parent(intent.metadata.get("campaign_id"))
+            else:
+                self.machine.discard_unfilled_addon(int(intent.position_key[1:]))
             return
         price = decision.detail.get("price_usd")
         if price is None:
@@ -218,6 +320,23 @@ class CloseRangeLive(Strategy):
         )
         if k == 0:
             self._pending_reversal = None
+        else:
+            self._mark_out_of_range_fills()
+
+    def post_entry_exits(self, intent: OrderIntent, decision: Any, bar: Bar) -> list[OrderIntent]:
+        """Immediately unwind a market add-on filled beyond the distance cap."""
+        slot = intent.position_key
+        if slot not in self._aborting_slots:
+            return []
+        return [
+            self._exit_intent(
+                slot,
+                "addon_fill_too_far",
+                self.machine.campaign.campaign_id if self.machine.campaign else None,
+                {"abort_addon": True, "observed_at": bar.ts.isoformat()},
+                trigger_tf=bar.timeframe,
+            )
+        ]
 
     def on_external_position_closed(self, event: Any, state: StrategyState) -> None:
         """Fold venue liquidation into campaign state and close surviving children."""
@@ -252,8 +371,16 @@ class CloseRangeLive(Strategy):
                 k=k, ts=event.observed_at, price=event.price_usd
             )
             self._recent_decisions.append(self._decision_dict(outcome))
+            self._aborting_slots.discard(event.position_key)
 
     def reconcile_execution_state(self, state: StrategyState) -> None:
+        for slot in tuple(self._aborting_slots):
+            if state.position(slot).qty_sats == 0:
+                campaign = self.machine.campaign
+                k = int(slot[1:])
+                if campaign is not None and any(unit.k == k for unit in campaign.units):
+                    self.machine.forget_closed_child(k)
+                self._aborting_slots.discard(slot)
         for slot in tuple(self._closing_slots):
             if state.position(slot).qty_sats == 0:
                 self._closing_slots.discard(slot)
@@ -271,6 +398,7 @@ class CloseRangeLive(Strategy):
             "recent_decisions": list(self._recent_decisions),
             "closing_campaign_id": self._closing_campaign_id,
             "closing_slots": sorted(self._closing_slots),
+            "aborting_slots": sorted(self._aborting_slots),
             "pending_reversal": self._pending_reversal,
         }
 
@@ -279,13 +407,13 @@ class CloseRangeLive(Strategy):
             return False
         try:
             previous_unit = float(snapshot["unit_notional_usd"])
-            historical_unit = float(
-                snapshot.get("historical_unit_notional_usd", previous_unit)
-            )
+            historical_unit = float(snapshot.get("historical_unit_notional_usd", previous_unit))
             previous_leverage = float(snapshot["leverage"])
         except (KeyError, TypeError, ValueError):
             return False
-        if not all(math.isfinite(value) and value > 0 for value in (previous_unit, historical_unit)):
+        if not all(
+            math.isfinite(value) and value > 0 for value in (previous_unit, historical_unit)
+        ):
             return False
         if previous_leverage != self.leverage:
             return False
@@ -295,9 +423,40 @@ class CloseRangeLive(Strategy):
         self._recent_decisions = deque(snapshot.get("recent_decisions", []), maxlen=256)
         self._closing_campaign_id = snapshot.get("closing_campaign_id")
         self._closing_slots = set(snapshot.get("closing_slots", []))
+        self._aborting_slots = set(snapshot.get("aborting_slots", []))
         pending = snapshot.get("pending_reversal")
         self._pending_reversal = dict(pending) if pending else None
-        return self._closing_slots <= set(self.position_slots)
+        return self._closing_slots <= set(self.position_slots) and self._aborting_slots <= set(
+            self.position_slots[1:]
+        )
+
+    def _mark_out_of_range_fills(self) -> None:
+        campaign = self.machine.campaign
+        if campaign is None or campaign.origin != "live":
+            return
+        parent_price = campaign.units[0].entry_price
+        for unit in campaign.units[1:]:
+            slot = f"k{unit.k}"
+            if unit.origin != "live":
+                continue
+            # During on_order_result the executor has not yet been mirrored to
+            # StrategyState, so use the confirmed unit fill itself.
+            displacement = campaign.side * (unit.entry_price / parent_price - 1)
+            if displacement > self.machine.MAX_ADDON_DISPLACEMENT + 1e-12:
+                self._aborting_slots.add(slot)
+
+    def _finish_aborted_addon(self, slot: str, ts: datetime, price: float) -> None:
+        campaign = self.machine.campaign
+        k = int(slot[1:])
+        if campaign is not None and any(unit.k == k for unit in campaign.units):
+            if price > 0:
+                outcome = self.machine.child_closed(
+                    k=k, ts=ts, price=price, reason="addon_fill_too_far"
+                )
+                self._recent_decisions.append(self._decision_dict(outcome))
+            else:
+                self.machine.forget_closed_child(k)
+        self._aborting_slots.discard(slot)
 
     def _pending_reversal_intent(self) -> OrderIntent:
         assert self._pending_reversal is not None

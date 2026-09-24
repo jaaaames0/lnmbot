@@ -258,7 +258,8 @@ async def run_portfolio_live(
                             )
                             strategy_snapshot_saved[binding.instance_id] = True
 
-                    for original in intents:
+                    pending_intents = list(intents)
+                    for original in pending_intents:
                         local_key = original.position_key or original.trigger_tf
                         intent = replace(
                             original,
@@ -301,6 +302,17 @@ async def run_portfolio_live(
                         result_hook = getattr(strategy, "on_order_result", None)
                         if result_hook is not None:
                             result_hook(intent, decision, state)
+                        if (
+                            original.kind.value == "entry"
+                            and decision.order_id
+                            and decision.order_id > 0
+                        ):
+                            followup_hook = getattr(strategy, "post_entry_exits", None)
+                            if followup_hook is not None:
+                                followups = intents_to_list(followup_hook(intent, decision, bar))
+                                if any(value.kind.value != "exit" for value in followups):
+                                    raise RuntimeError("post-entry followups must reduce exposure")
+                                pending_intents.extend(followups)
                         if decision.order_id is not None and decision.order_id > 0:
                             guard.record_realized_pnl(executor.consume_realized_pnl_usd(), bar.ts)
                             log.info(
