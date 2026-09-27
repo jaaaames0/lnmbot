@@ -33,11 +33,9 @@ data/cache/
 runs/
 logs/
 
-# Local strategy-research archive and historical operations evidence.
-# Runtime seeds and current dashboard/deployment docs live outside these paths.
-docs/research/
-docs/operations/
-docs/strategy-research-history.md
+# Local strategy-research and operations archive. Current product and
+# deployment documentation lives at the repository root.
+docs/
 scripts/research/
 tests/research/
 

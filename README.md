@@ -1,107 +1,68 @@
-# LN Markets MA-cross bot
+# LN Markets bot
 
-An isolated-margin BTC/USD futures bot for LN Markets.  It runs one locked
-moving-average strategy independently on the `4h` and `1d` timeframes: each
-timeframe owns at most one isolated trade, so an action on one never closes,
-resizes, or otherwise changes the other.
+An isolated-margin BTC/USD futures bot with a read-only operations dashboard.
+The live runner always operates the MA-cross strategy independently on `4h`
+and `1d`. It can also operate a daily close-range breakout campaign with
+separately owned units in the same funded account. The breakout strategy is
+disabled in the example configuration; enabling it requires an order-enabled
+run. Historical breakout and shadow results remain separate from funded P&L.
 
-The intended operating model is deliberately boring:
+The runner polls completed LN Markets one-minute candles and forms strategy
+bars locally. The dashboard's public price ticker is for display only. SQLite
+holds the local audit trail and restart state; systemd runs the trader and
+dashboard as separate services.
 
-```text
-deployment env file   reviewed trading configuration
-systemd               one always-on strategy process
-SQLite                local audit trail
-dashboard             loopback-only, read-only monitoring
-journalctl            diagnostics and incident evidence
-```
+## Operating safeguards
 
-The bot acts only on completed one-minute candles.  Those are aggregated into
-the two production timeframes; the dashboard's price ticker is separate and
-presentation-only.
+- `scripts/run_live.py` is observe-only unless `--allow-orders` is supplied.
+  Mainnet orders also require `--confirm-mainnet`. The checked-in trader unit
+  has neither flag; a deliberate override is needed for funded operation.
+- The MA timeframes and funded breakout units have distinct position owners.
+  Startup reconciles local ownership with venue inventory and blocks new
+  admission when an untracked or ambiguous remote trade needs attention.
+- Risk caps and available cash constrain entries. Known exits can continue
+  when entry admission is blocked; the halt switch stops processing and does
+  not automatically close positions.
+- `HALTED=1` or the configured `HALT_FILE` stops the runner. The dashboard
+  cannot place orders or change configuration and should use a separate LN
+  Markets key with **Read** permission only.
 
-## Safety properties
+These controls cannot prevent market loss, venue failure, or liquidation.
 
-- `run_live.py` is observe-only unless `--allow-orders` is supplied.  Mainnet
-  execution additionally requires `--confirm-mainnet`.
-- The systemd template in this repository is intentionally observe-only.  A
-  deliberate service override is required to enable production orders.
-- Each entry, exit, signal, funding settlement, and run is recorded locally.
-- Real isolated positions are reconciled on startup.  An untracked or
-  ambiguously mapped remote trade causes live startup to fail closed rather
-  than risk duplicate exposure.
-- A same-direction entry is idempotent.  If an entry response is ambiguous,
-  the executor checks remote running trades and stops rather than blindly
-  retrying.
-- `HALTED=1` or the presence of `HALT_FILE` prevents new processing.
-- The dashboard is read-only and should use a separate LN Markets API key with
-  **Read** permission only. Its production listener is restricted to the LAN by
-  the host firewall; a loopback bind is preferred where LAN access is not needed.
+## Run and monitor
 
-This is risk-control infrastructure, not a guarantee against market loss,
-exchange failure, liquidation, or operational mistakes.
-
-## Everyday operation
-
-The included service templates use the following names.  Choose installation
-paths and a service account appropriate to the host; the full adaptation steps
-are in [DEPLOYMENT.md](DEPLOYMENT.md).
-
-| Item | Value |
-|---|---|
-| Trading service | `lnmbot.service` |
-| Dashboard service | `lnmbot-dashboard.service` |
-| Trading configuration | a root-owned env file outside the repository |
-| Dashboard credentials | a separate root-owned read-only env file |
-| Database and halt file | a service-writable state directory |
-
-Monitor the bot:
+The supplied templates are `scripts/lnmbot.service` and
+`scripts/lnmbot-dashboard.service`. Render their release-directory placeholders
+before installation; [DEPLOYMENT.md](DEPLOYMENT.md) covers the env files,
+service setup, recovery, and the current strategy options.
 
 ```bash
-systemctl status lnmbot
+systemctl status lnmbot lnmbot-dashboard
 journalctl -u lnmbot -f
+curl http://127.0.0.1:8082/healthz
 ```
 
-Monitor the dashboard:
+The example dashboard unit binds port `8082` on all interfaces. Restrict it
+with the host firewall or change the unit to loopback. For a loopback listener,
+use `ssh -L 8082:127.0.0.1:8082 <bot-host>` and open
+`http://127.0.0.1:8082` locally. The dashboard shows account context, strategy
+positions, signals, funding, P&L, run configuration, and health.
+
+Changing sizing or direction settings requires editing the trader env file
+and restarting its service. Existing venue positions are reconciled, not
+resized. Check the dashboard, venue inventory, and journal after restart.
+
+## Development
+
+Install the project and run the default local suite:
 
 ```bash
-systemctl status lnmbot-dashboard
-journalctl -u lnmbot-dashboard -f
+uv sync --extra dev
+uv run pytest -q
 ```
 
-The dashboard is served on the host and port configured in its systemd unit.
-The Optiplex deployment uses firewall-restricted LAN port `8082`; for a
-loopback deployment, use an SSH tunnel rather than exposing it publicly:
-
-```bash
-ssh -L 8082:127.0.0.1:8082 <bot-host>
-```
-
-Then open `http://127.0.0.1:8082` locally.  It shows combined account context
-plus timeframe-specific signals, positions, trade history, funding, P&L,
-active configuration, and health.  It cannot enable trading or change sizing.
-
-For configuration changes, edit the trading environment file, restart the
-service, then verify the new run and configuration in the dashboard and
-journal:
-
-```bash
-sudo systemctl restart lnmbot
-```
-
-A restart reconciles any running isolated trades.  It cannot resize an already
-open trade; new size/leverage settings apply to later entries.
-
-## Sizing in brief
-
-`SIZING_MODE=fixed_notional` requests
-`SIZING_FIXED_NOTIONAL_USD` whole USD contracts per new timeframe entry at
-`SIZING_LEVERAGE`.  `RISK_*` settings remain independent hard ceilings.
-
-`SIZING_MODE=equity_fraction` reads the account before each real entry,
-applies its haircut and margin allocation, then converts the result to whole
-contracts.  It is still capped by every applicable `RISK_*` setting.
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the complete configuration reference,
-safe installation, smoke tests, recovery procedure, and production service
-setup.  The deliberately read-only dashboard scope and deferred ideas live in
-[docs/runtime/dashboard-roadmap.md](docs/runtime/dashboard-roadmap.md).
+The default suite uses synthetic data, temporary databases, and fake venue
+APIs. Historical strategy investigations under the local, Git-ignored `docs/`,
+`scripts/research/`, and `tests/research/` archives are outside normal test
+collection. See [CHANGELOG.md](CHANGELOG.md) for production and dashboard
+history.

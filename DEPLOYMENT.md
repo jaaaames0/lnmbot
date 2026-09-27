@@ -1,15 +1,20 @@
 # Deployment and operations runbook
 
-This document describes the repository as it is now: the production `1d` and
-`4h` isolated-margin MA-cross strategy and optional daily close-range breakout, the `lnmbot` systemd service, and the
-separate read-only dashboard.  Replace every angle-bracket placeholder with a
-value for the target host.
+This guide covers the live `1d`/`4h` MA-cross strategy, the optional funded
+daily close-range breakout, and the separate read-only dashboard. The example
+configuration disables breakout; the accepted September 27 production release
+had it enabled. Replace every angle-bracket placeholder for the target host.
+See [CHANGELOG.md](CHANGELOG.md) for dated deployment and dashboard history.
 
 ## 1. What runs in production
 
 `scripts/run_live.py` connects to LN Markets, polls completed `BTCUSD` one-
 minute candles, aggregates them into `4h` and `1d` bars, and runs `MaCross`.
 Each timeframe has independent strategy and isolated-position state.
+When `STRATEGY_BREAKOUT_ENABLED=true`, the same funded runner also manages a
+daily close-range breakout campaign with separately owned K units. It requires
+`--allow-orders`; the runner rejects a breakout-enabled observe-only start.
+Turning new breakout entries off does not abandon funded units already open.
 
 The strategy uses SMA(20), EMA(21), a 0.5% tolerance band, per-timeframe
 winner and loss cool-offs, and optional 4h high-CHOP entry-size reduction.
@@ -37,16 +42,18 @@ consecutive failures emit an error-level journal event; recovery is logged.
 | Trading service | `lnmbot.service` |
 | Dashboard service | `lnmbot-dashboard.service` |
 
-The checked-in service templates deliberately contain the invalid placeholders
-`@TRADER_RELEASE_DIR@` and `@DASHBOARD_RELEASE_DIR@`. Render those placeholders
-to two independently built immutable release directories before installation.
-Never point either production service at the editable source checkout, and do
-not switch the trader merely because a dashboard release is ready.
+The checked-in service templates contain unresolved placeholders
+`@TRADER_RELEASE_DIR@` and `@DASHBOARD_RELEASE_DIR@`. Build each pinned release
+with its own `.venv` from `uv.lock`, then render its template with its absolute
+release path before installation. Keep production services on immutable
+releases rather than the editable checkout. Trader and dashboard revisions can
+be changed independently.
 
 ## 3. Configuration reference
 
 Copy [`.env.example`](.env.example) to the trading environment-file path, set
-mode `600`, and keep it outside Git.  Blank optional values are disabled.  The
+root ownership and mode `640` with group access for `lnmbot`, and keep it
+outside Git. Blank optional values are disabled. The
 example service injects
 `STORAGE_DB_PATH=/var/lib/lnmbot/lnmarkets.sqlite`, so that value takes
 precedence over the same variable in the env file.
@@ -83,16 +90,18 @@ entries.
 
 | Variable | Meaning |
 |---|---|
-| `RISK_MAX_POSITION_USD` | Maximum requested notional for one timeframe position. |
+| `RISK_MAX_POSITION_USD` | Maximum requested notional for one position slot. |
 | `RISK_MAX_LEVERAGE` | Maximum leverage accepted by the guard. |
 | `RISK_MAX_DAILY_LOSS_USD` | Entry circuit breaker based on recorded realised P&L and funding. It is not an exchange-side stop-loss. |
 | `RISK_MAX_ORDERS_PER_MINUTE` | Maximum order submissions across the process. Exits still pass through. |
-| `RISK_MAX_TOTAL_NOTIONAL_USD` | Optional aggregate cap across active `1d` and `4h` positions. |
-| `RISK_MAX_TOTAL_MARGIN_USD` | Optional aggregate margin cap across active positions. |
+| `RISK_MAX_TOTAL_NOTIONAL_USD` | Optional aggregate cap across active funded positions. |
+| `RISK_MAX_TOTAL_MARGIN_USD` | Optional aggregate margin cap across active funded positions. |
 
-For live operation, set both aggregate caps deliberately.  They remain useful
-even when fixed-notional sizing is used, because they prevent combined
-exposure from exceeding the intended account allocation.
+For live operation, decide explicitly whether to set both aggregate caps.
+They remain useful even with fixed-notional sizing because they prevent
+combined exposure from exceeding the intended account allocation.
+The September 27 accepted production configuration left both optional caps
+unset; adding them is a separate risk-policy change.
 
 ### Optional 4h CHOP overlay
 
@@ -108,14 +117,37 @@ STRATEGY_CHOP_HIGH_THRESHOLD=61.8
 STRATEGY_CHOP_HIGH_SIZE_MULTIPLIER=0.5
 ```
 
+### Optional funded close-range breakout
+
+`STRATEGY_BREAKOUT_ENABLED` controls admission of new breakout entries. Set it
+to `false` for an observe-only service. When enabled, the strategy uses the
+seed files in `config/seeds/` and shares the live account and risk guard with
+MA-cross. Set `STRATEGY_BREAKOUT_UNIT_NOTIONAL_USD` and
+`STRATEGY_BREAKOUT_LEVERAGE` deliberately. `STRATEGY_BREAKOUT_DIRECTION_MODE`
+accepts `both`, `long_only`, or `short_only` for **new** parents and add-ons;
+it does not rewrite or close an existing campaign. On a recovery exit, a
+qualifying same-direction parent is rejected at that same open, while later
+signals and existing exits follow their ordinary rules.
+
+The seeded historical campaign and order-incapable shadow book are references
+only; neither is a funded position or part of funded P&L. Review owned venue
+inventory and campaign state before changing breakout settings.
+
 ## 4. First-time installation
 
-Install dependencies from the checkout:
+For local checks, install dependencies in the checkout:
 
 ```bash
 cd /home/james/src/lnmbot
 uv sync --extra dev --extra dashboard --extra backfill
 ```
+
+Build separate immutable trader and dashboard releases from a reviewed Git
+commit, retaining `config/seeds/`, the service scripts, and `uv.lock`. Run
+`uv sync --frozen` in each release directory, with the extras required there.
+The service accounts `lnmbot`, `lnmbot-dashboard`, and the shared `lnmbot-db`
+group must exist before installing state directories or units. Do not point a
+production service at the editable checkout.
 
 Create the required directories and trading configuration:
 
@@ -128,7 +160,10 @@ sudoedit /etc/lnmbot/trader.env
 ```
 
 Set `LNM_NETWORK`, credentials, sizing, and conservative hard caps before
-continuing.  Do not put API credentials in the checkout or Git.
+continuing. Set `STORAGE_LOG_PATH` blank for journald-only logging or to a
+writable path under `/var/lib/lnmbot`; the example's relative `./logs/` path
+is unsuitable for the hardened release unit. Do not put API credentials in
+the checkout or Git.
 
 Verify authenticated access without placing an order:
 
@@ -159,13 +194,25 @@ uv run python scripts/smoke_live_reconcile.py --env /etc/lnmbot/trader.env \
 
 ## 5. Install the services
 
-Install the template units:
+Render the template units using the absolute directories of the two built
+releases, then install the rendered files. For example, after setting
+`TRADER_RELEASE_DIR` and `DASHBOARD_RELEASE_DIR` to those paths:
 
 ```bash
-sudo install -m 644 scripts/lnmbot.service /etc/systemd/system/lnmbot.service
-sudo install -m 644 scripts/lnmbot-dashboard.service /etc/systemd/system/lnmbot-dashboard.service
+sed "s|@TRADER_RELEASE_DIR@|${TRADER_RELEASE_DIR:?set release path}|g" scripts/lnmbot.service \
+  | sudo tee /etc/systemd/system/lnmbot.service >/dev/null
+sed "s|@DASHBOARD_RELEASE_DIR@|${DASHBOARD_RELEASE_DIR:?set release path}|g" scripts/lnmbot-dashboard.service \
+  | sudo tee /etc/systemd/system/lnmbot-dashboard.service >/dev/null
+sudo chmod 644 /etc/systemd/system/lnmbot.service /etc/systemd/system/lnmbot-dashboard.service
+sudo systemd-analyze verify /etc/systemd/system/lnmbot.service /etc/systemd/system/lnmbot-dashboard.service
 sudo systemctl daemon-reload
 ```
+
+Check that no `@...@` placeholder remains in either installed unit. The
+trader unit is observe-only and must use `STRATEGY_BREAKOUT_ENABLED=false` in
+that mode. An existing funded breakout campaign needs the order-enabled
+service to continue its exits; use a separate reviewed recovery procedure
+rather than switching it to observe-only.
 
 ### Trading service: observe-only first
 
@@ -190,8 +237,12 @@ Enter exactly:
 ```ini
 [Service]
 ExecStart=
-ExecStart=<trader-release>/.venv/bin/python <trader-release>/scripts/run_live.py --env /etc/lnmbot/trader.env --allow-orders --confirm-mainnet
+ExecStart=/usr/bin/env STORAGE_DB_PATH=/var/lib/lnmbot/lnmarkets.sqlite <trader-release>/.venv/bin/python <trader-release>/scripts/run_live.py --env /etc/lnmbot/trader.env --allow-orders --confirm-mainnet
 ```
+
+Replace both `<trader-release>` values with the installed trader release path.
+Keep the `STORAGE_DB_PATH` assignment: replacing `ExecStart` also removes the
+database-path assignment from the template command.
 
 Then reload and restart:
 
@@ -225,6 +276,14 @@ admits it only from the intended LAN. A loopback bind plus SSH tunnel is a good
 default on hosts without that firewall boundary. The dashboard uses the
 separate key for authoritative account snapshots and a public WebSocket for
 the visual BTC/USD ticker; neither path can submit orders.
+
+An optional, separately installed `lnmbot-breakout-shadow.service` and timer
+can advance an order-incapable daily breakout book from completed public
+Binance candles. Render its `@SHADOW_RELEASE_DIR@` placeholder before
+installation. Its state belongs under `/var/lib/lnmbot-shadow`, never in the
+funded trader database. The dashboard can read that book through the optional
+`LNMBOT_PORTFOLIO_SHADOW_DB` setting in its own env file; it keeps hypothetical
+results separate from funded accounting.
 
 ## 6. Normal operation
 
@@ -350,9 +409,12 @@ before resuming.
    the new direction. The recorded signal metadata includes the LNM close,
    SMA, EMA, tolerance, and distances used for that decision.
 
-The dashboard is useful but not an independent uptime monitor.  External
-monitoring from the VPS is the priority deferred safeguard; see
-[docs/runtime/dashboard-roadmap.md](docs/runtime/dashboard-roadmap.md).
+The dashboard is useful but not an independent uptime monitor. An external
+monitor should check host, VPN, dashboard, trader process, and data freshness;
+the `/healthz` endpoint alone cannot detect every live-but-stalled condition.
+Other deferred dashboard work includes prominent halt/risk/reconciliation
+status and read-only notifications. Any future emergency halt control must
+remain unable to enable orders or alter sizing or strategy parameters.
 
 ## 7. Test-only 5m profile
 
@@ -397,16 +459,19 @@ counter depletion, and resumption; it is never a production calibration.
 | `scripts/smoke_live_reconcile.py` | Live executor reconciliation smoke test |
 | `scripts/run_dashboard.py` | Read-only local dashboard |
 | `scripts/lnmbot.service` | Observe-only systemd template |
-| `scripts/lnmbot-dashboard.service` | Loopback read-only dashboard unit |
+| `scripts/lnmbot-dashboard.service` | Read-only dashboard unit; wildcard listener needs a firewall or loopback edit |
+| `scripts/lnmbot-breakout-shadow.service` | Optional order-incapable shadow unit and timer |
 | `src/lnmarkets_bot/strategy/ma_cross.py` | Locked strategy defaults |
 | `src/lnmarkets_bot/engine/live_executor.py` | Isolated-order execution and reconciliation |
 | `src/lnmarkets_bot/risk/guard.py` | Hard limits and sizing guard |
-| `docs/runtime/dashboard-roadmap.md` | Dashboard scope and deferred safeguards |
+| `CHANGELOG.md` | Dated production and dashboard release history |
 
 
-## Audit remediation release (27 September 2026)
+## 10. Recovery behavior introduced in the September 2026 remediation
 
-See [acceptance evidence and cutover procedure](docs/runtime/remediation-release-2026-09-27.md).
+The release history and dated acceptance result are in
+[CHANGELOG.md](CHANGELOG.md); the full transcript remains in the local,
+Git-ignored operations archive.
 Stable snapshot names are `ma_cross_primary` and `btc_close_range_v1`; readers
 prefer them over retained legacy class-name rows. Never select an arbitrary
 newest strategy snapshot.

@@ -1,9 +1,71 @@
 # Changelog
 
-This file records operationally meaningful changes to the live bot. Dates are
-UTC and entries describe deployed behaviour rather than every internal refactor.
+Dates are UTC. Dated entries record operational releases; `Unreleased` records
+source changes that have not been installed as a production release.
 
 ## Unreleased
+
+### Repository and documentation
+
+- Keep local research and operations evidence under the Git-ignored `docs/`
+  archive. The README and deployment guide now describe the funded breakout
+  path and current service templates directly.
+- Make the default test suite self-contained and exclude archived research
+  checks that require local market data. The current default run passes 300
+  tests in about 30 seconds; it is not a live-venue or profitability test.
+
+## 2026-09-27 — Funded multi-strategy remediation accepted
+
+Production tag: `production/prod-20260927.2-gc0cb72dac281`; source commits
+`be69aae` and `c0cb72d`.
+
+- The MA timeframes and funded daily close-range campaign now use distinct,
+  durable position ownership and shared-wallet cash admission. Known exits
+  continue when new entries are blocked. Breakout campaigns keep their own
+  parent and unit state; disabling breakout prevents new entries while allowing
+  funded units already open to reconcile and exit.
+- Repair entry, close, funding, fee, and daily-loss accounting across retries,
+  partial closes, and restarts. Venue inventory and available cash remain
+  authoritative; historical shadow trades stay outside funded accounting.
+- Normalize real LN Markets trade timestamps at the API boundary. Classify
+  external MA closures as confirmed manual, confirmed liquidation, or unknown;
+  unknown causes remain unclassified while starting the loss cooldown.
+- Include the eight-hour funding settlement at a venue endpoint's exclusive
+  upper bound before the modeled price observation. Add a dry-run-first
+  operator utility for evidence-backed external-close classification.
+- The September 27 cutover used a consistent database backup and a guarded,
+  evidence-bound ledger repair, with no diagnostic or startup order. At
+  acceptance the venue had no running or pending trades, the order journal
+  remained at 40, and the repaired owned ledger held 351 events and 325,969
+  net sats. The trader and dashboard passed health and snapshot checks; the
+  encrypted backup completed. These are dated acceptance facts, not current
+  account balances or evidence of future profitability.
+
+The release did not exercise real partial fills or exchange outages. Its
+funded results do not make the generic paper engine an inverse-contract,
+shared-wallet simulator. The full acceptance transcript remains in the local,
+Git-ignored operations archive.
+
+## 2026-09-24 — Multi-strategy dashboard rollout
+
+The dashboard used `prod-20260924.1-g9d121c6dcc24`; the integrated trader
+used `prod-20260924.2-g9d121c6dcc24`.
+
+- Group MA timeframes, the funded breakout campaign, and shared wallet in the
+  overview. Keep a combined causal signal timeline and group campaign exits
+  for display while retaining unit-level SQLite records.
+- Compare saved strategy states with a fresh read-only venue snapshot for
+  execution alignment. Show pending, mismatched, and unavailable states
+  separately, and remove the obsolete `restart_state_aligned` signal.
+- Show cooldown ordinal context and keep hypothetical seeded campaigns
+  separate from funded positions and P&L.
+- The deployed trader and dashboard revisions were accepted after service,
+  snapshot, health, order-journal, and encrypted-backup checks. Deferred
+  monitoring and dashboard safeguards are described in [DEPLOYMENT.md](DEPLOYMENT.md).
+
+## 2026-08-31 — Dashboard and release hygiene
+
+Commit: `a085624` (`Separate source from trader and dashboard releases`)
 
 ### Dashboard operational context
 
@@ -20,7 +82,9 @@ UTC and entries describe deployed behaviour rather than every internal refactor.
   remove retired `~/srv/tradingbot` paths from current templates and tests.
 - Correct the project copyright holder name.
 
-### Restart-safe indicator and execution recovery
+## 2026-07-29 — Restart-safe indicator and execution recovery
+
+Commit: `33695fb` (`Harden restart state and EMA continuity`)
 
 - Bootstrap a new live strategy from 100 days of LN Markets 1-minute candles,
   aggregated locally, so the daily EMA(21) closely matches a continuously
