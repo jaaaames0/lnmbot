@@ -41,6 +41,23 @@ from lnmarkets_bot.strategy.historical import hydrate_historical
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
 
+async def _historical_funding(client, from_ts: datetime, to_ts: datetime):
+    # Venue history has an exclusive upper bound. The model needs the
+    # settlement AT this boundary before observing its prices.
+    rows = await MarketApi(client).funding_settlements(
+        from_ts=from_ts, to_ts=to_ts + timedelta(seconds=1)
+    )
+    result = [
+        (
+            datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
+            float(row["fundingRate"]),
+            float(row["fixingPrice"]),
+        )
+        for row in rows
+    ]
+    return [row for row in result if row[0] <= to_ts]
+
+
 def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime | None:
     """Validate uncommitted days while ignoring old replay gaps."""
     names = ["lnmarkets_bot.strategy.ma_cross.MaCross"]
@@ -323,15 +340,7 @@ async def main() -> int:
                 hydrate_historical(machine, ref, rows)
 
             async def historical_funding(from_ts, to_ts):
-                rows = await MarketApi(client).funding_settlements(from_ts=from_ts, to_ts=to_ts)
-                return [
-                    (
-                        datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
-                        float(row["fundingRate"]),
-                        float(row["fixingPrice"]),
-                    )
-                    for row in rows
-                ]
+                return await _historical_funding(client, from_ts, to_ts)
 
             run_id = await run_portfolio_live(
                 cfg=cfg,

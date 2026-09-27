@@ -21,7 +21,10 @@ Real venue responses revealed ISO timestamp strings, a numeric `liquidation`
 price and no closure-cause field. API timestamps now normalize to UTC and entry
 execution uses `filledAt` before `createdAt`. Invalid nonempty timestamps fail
 closed. Cause handling uses three states; a numeric liquidation threshold is
-never interpreted as a boolean cause. Operator classification is dry-run by
+never interpreted as a boolean cause. A live GET preflight also established
+that the funding endpoint excludes its upper bound. The runner requests one
+second beyond the required settlement and filters back to the inclusive model
+boundary, so every eight-hour settlement precedes its modeled price observation. Operator classification is dry-run by
 default, requires a stopped trader for production application and refuses a
 later slot trade or outstanding execution command.
 
@@ -65,7 +68,9 @@ The actual dirty checkout's offline suite passed 368 tests in 69.96 seconds,
 from an empty environment and neutral directory. Authenticated/funded modules
 `test_isolated_positions.py` and `test_live_integration.py` are excluded.
 Subsequent focused checks cover UTC timestamp normalization/refusal and the
-operator classification receipt/ledger transaction. Ruff and import contracts
+operator classification receipt/ledger transaction and the exclusive venue
+funding boundary. Repository-wide Ruff also reports 30 pre-existing findings in
+unchanged files; changed runtime/new regression files pass the scoped check. Ruff and import contracts
 are checked for the changed production implementation.
 
 Keep unrelated research/editable work. Selectively commit the repaired runtime,
