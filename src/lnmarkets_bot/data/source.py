@@ -11,9 +11,12 @@ This keeps the engine plumbing consistent across modes.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
-from ..strategy import Bar
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from ..strategy import Bar
 
 
 class DataSource(ABC):

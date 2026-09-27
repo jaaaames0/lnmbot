@@ -104,4 +104,4 @@ contracts.  It is still capped by every applicable `RISK_*` setting.
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the complete configuration reference,
 safe installation, smoke tests, recovery procedure, and production service
 setup.  The deliberately read-only dashboard scope and deferred ideas live in
-[docs/dashboard-roadmap.md](docs/dashboard-roadmap.md).
+[docs/runtime/dashboard-roadmap.md](docs/runtime/dashboard-roadmap.md).

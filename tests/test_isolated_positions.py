@@ -7,6 +7,7 @@ checks that both positions end up where they should.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
@@ -19,28 +20,29 @@ from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_
 from lnmarkets_bot.persistence.models import orders as orders_t
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def _build_fixture(p: "Path") -> None:
-    """Synthesize 30 days of 1m bars so 1d warmup (21 bars) completes.
 
-    Days 1–20: gently oscillating around $100 (warmup).
-    Days 21–25: rally to $120.
-    Day 26–28: pullback to $115.
-    Day 29–30: another rally to $125.
+def _build_fixture(p: Path) -> None:
+    """Synthesize 30 days of sparse minute input for 4h and daily closes.
+
+    The replay does not require complete buckets; one bar per 4h bucket keeps
+    this isolation check fast while exercising both timeframe aggregations.
     """
     base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
     rows = []
-    for i in range(30 * 24 * 60 + 1):
-        ts = base + timedelta(minutes=i)
-        day = i // (24 * 60)
+    for i in range(30 * 6 + 1):
+        ts = base + timedelta(hours=4 * i)
+        day = i // 6
         if day < 20:
-            p_val = 100.0 + ((i % (24 * 60)) / 200.0 - 60)  # ±$30 around $100
+            p_val = 100.0
         elif day < 25:
-            p_val = 100.0 + (day - 20) * 4.0  # $100 → $120
+            p_val = 100.0 + (day - 19) * 4.0
         elif day < 28:
-            p_val = 120.0 - (day - 25) * 1.5  # $120 → $115.5
+            p_val = 110.0
         else:
-            p_val = 115.5 + (day - 28) * 5.0  # $115.5 → $125.5
+            p_val = 125.0
         rows.append(
             {"ts": ts, "open": p_val, "high": p_val + 0.5,
              "low": p_val - 0.5, "close": p_val, "volume": 1.0}
@@ -50,7 +52,6 @@ def _build_fixture(p: "Path") -> None:
 
 @pytest.mark.asyncio
 async def test_1d_and_4h_positions_are_independent(tmp_path) -> None:
-    from pathlib import Path
     parquet = tmp_path / "isolation_fixture.parquet"
     _build_fixture(parquet)
 

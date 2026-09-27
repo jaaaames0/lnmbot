@@ -320,7 +320,7 @@ async def main() -> int:
             async def historical_hydrator(machine):
                 root = Path(__file__).resolve().parents[1]
                 ref = json.loads(
-                    (root / "docs/btc-close-range-lnm-paper-reference-2026-09-13.json").read_text()
+                    (root / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json").read_text()
                 )
                 if (
                     hashlib.sha256(

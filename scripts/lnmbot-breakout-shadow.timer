@@ -1,0 +1,14 @@
+[Unit]
+Description=Run BTC close-range shadow after the UTC daily close
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+OnCalendar=*-*-* 01:10:00 UTC
+OnCalendar=*-*-* 02:10:00 UTC
+RandomizedDelaySec=60
+AccuracySec=30
+Persistent=true
+Unit=lnmbot-breakout-shadow.service
+
+[Install]
+WantedBy=timers.target

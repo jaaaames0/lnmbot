@@ -3,8 +3,8 @@
 Status: **accepted live at 10:40 UTC on 27 September 2026**. Both services
 run normal production mode from the immutable release recorded below. This is
 an implementation/operations repair, not evidence of future profitability.
-The [initial audit](independent-audit-2026-09-26.md) and
-[source remediation report](remediation-2026-09-27.md) retain dated evidence.
+The initial audit and source remediation report retain dated evidence in the
+local, git-ignored `docs/operations/2026-09-22-rollout-and-audit/` archive.
 
 ## Approved behavior
 

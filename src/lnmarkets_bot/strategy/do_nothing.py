@@ -5,10 +5,12 @@ runs under both engines with the same input and produces zero signals in both.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import Bar, Strategy, StrategyState
-from .intents import OrderIntent
+
+if TYPE_CHECKING:
+    from .intents import OrderIntent
 
 
 class DoNothing(Strategy):

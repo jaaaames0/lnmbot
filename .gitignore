@@ -33,6 +33,47 @@ data/cache/
 runs/
 logs/
 
+# Local strategy-research archive and historical operations evidence.
+# Runtime seeds and current dashboard/deployment docs live outside these paths.
+docs/research/
+docs/operations/
+docs/strategy-research-history.md
+scripts/research/
+tests/research/
+
+# Earlier research launchers kept locally for reproducing past studies.
+scripts/analyze_bootstrap_state.py
+scripts/backfill_binance.py
+scripts/build_sizing_history.py
+scripts/debug_1d_verdicts.py
+scripts/derive_binance_timeframe.py
+scripts/discover_timeframes.py
+scripts/evaluate_momentum_confirmation_overlay.py
+scripts/evaluate_timeframe.py
+scripts/explore_pre2022_features.py
+scripts/extract_v13_trade_log.py
+scripts/monte_carlo_sizing.py
+scripts/run_2y_combined_sweep.py
+scripts/run_cooloff_sweep.py
+scripts/run_donchian_challenger.py
+scripts/run_momentum_burst_challenger.py
+scripts/run_overlap_matrix.py
+scripts/run_pertf_cooloff_sweep.py
+scripts/run_tuning_matrix.py
+scripts/run_v13_verify.py
+scripts/select_1h_tolerance.py
+scripts/select_1h_winner_cooloff.py
+scripts/study_choppiness_regime.py
+scripts/sweep_age_decay.py
+scripts/sweep_cooldown_modes_2y.py
+scripts/validate_loss_cooldown_2y.py
+scripts/walkforward_timeframe.py
+
+# One-off deployment transcripts from the September rollout.
+scripts/deploy_breakout_rollout.sh
+scripts/deploy_credential_redaction.sh
+scripts/deploy_dashboard_multistrategy.sh
+
 # Secrets — never commit
 .env
 .env.local

@@ -1,0 +1,22 @@
+{
+  "mode": "shadow_no_orders",
+  "strategy": "structure_parent_addons_raw",
+  "allowed_direction": "both",
+  "generated_at": "2026-09-22T04:44:53.751839+00:00",
+  "as_of_close": "2026-09-21T00:00:00+00:00",
+  "next_open": "2026-09-22T00:00:00+00:00",
+  "active_hypothetical_stack": {
+    "parent_id": "20260822L",
+    "side": "long",
+    "entry_ts": "2026-08-22T00:00:00+00:00",
+    "entry_price": 78348.25455,
+    "boundary": 72998.7,
+    "held_days": 31,
+    "peak_favorable_pct": 0.11534201370412034,
+    "close_progress_pct": 0.10504950617307657,
+    "active_units": 4,
+    "pending_exit": null
+  },
+  "rules_sha256": "e145380a68c865b10d4bc383cbf4e143e1e5219f9b1a206defef23af9f5bb7f4",
+  "order_capability": false
+}

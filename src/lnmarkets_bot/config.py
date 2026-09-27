@@ -99,10 +99,10 @@ class BotConfig(BaseSettings):
     strategy_breakout_unit_notional_usd: float = 100.0
     strategy_breakout_leverage: float = 5.0
     strategy_breakout_seed_daily_path: Path = Path(
-        "./data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+        "./config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
     )
     strategy_breakout_seed_campaign_path: Path = Path(
-        "./docs/btc-close-range-lnm-live-seed-2026-09-13.json"
+        "./config/seeds/btc-close-range-lnm-live-seed-2026-09-13.json"
     )
 
     # --- Kill switch ---

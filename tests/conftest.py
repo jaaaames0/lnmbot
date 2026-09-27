@@ -1,9 +1,8 @@
 """Shared pytest fixtures."""
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
@@ -11,6 +10,10 @@ import pytest
 from lnmarkets_bot.config import BotConfig
 from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
 from lnmarkets_bot.persistence.recorder import Recorder
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 
 @pytest.fixture

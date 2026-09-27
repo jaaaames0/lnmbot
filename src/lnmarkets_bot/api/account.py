@@ -6,9 +6,10 @@ treat cross-margin as the only mode.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .client import LnmRestClient
+if TYPE_CHECKING:
+    from .client import LnmRestClient
 
 
 class AccountApi:

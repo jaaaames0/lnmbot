@@ -10,13 +10,16 @@ run, `realtime` for a wall-clock-paced run (useful for the paper-mode mock).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from ..strategy import Bar
 from .source import DataSource
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 _REPLAY_MODES = ("realtime", "fast", "instant")
 
@@ -72,11 +75,8 @@ class BacktestReplay(DataSource):
             for bar in self._bars:
                 yield bar
             return
-        if self.cadence == "fast":
-            # 1000x faster than realtime — still keeps timing-based logic separable but runs in seconds
-            interval = 0.001
-        else:  # realtime
-            interval = 60.0  # 1m bars
+        # Fast mode keeps timing-based logic separable; realtime follows 1m bars.
+        interval = 0.001 if self.cadence == "fast" else 60.0
         prev_ts = None
         for bar in self._bars:
             if prev_ts is not None and self.cadence == "realtime":

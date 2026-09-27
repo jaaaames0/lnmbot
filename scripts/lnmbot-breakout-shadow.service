@@ -1,0 +1,57 @@
+[Unit]
+Description=lnm-bot: order-incapable BTC close-range daily shadow
+Documentation=file://@SHADOW_RELEASE_DIR@/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lnmbot-shadow
+Group=lnmbot-shadow-db
+WorkingDirectory=@SHADOW_RELEASE_DIR@
+Environment=HOME=/nonexistent
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=lnmbot-shadow
+RuntimeDirectory=lnmbot-shadow
+StateDirectoryMode=0750
+RuntimeDirectoryMode=0750
+UMask=0027
+ExecStart=@SHADOW_RELEASE_DIR@/.venv/bin/python @SHADOW_RELEASE_DIR@/scripts/run_breakout_shadow_job.py --snapshot @SHADOW_RELEASE_DIR@/config/seeds/btc-close-range-shadow-seed-2026-09-22.json --cache /var/lib/lnmbot-shadow/btcusdt-perp-1d-completed.parquet --database /var/lib/lnmbot-shadow/portfolio.sqlite --lock /run/lnmbot-shadow/daily.lock --bootstrap-start 2019-09-09T00:00:00+00:00 --installed-order-incapable-service
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lnmbot-breakout-shadow
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=@SHADOW_RELEASE_DIR@
+ReadWritePaths=/var/lib/lnmbot-shadow /run/lnmbot-shadow
+InaccessiblePaths=-/etc/lnmbot
+InaccessiblePaths=-/etc/lnmbot-dashboard
+InaccessiblePaths=-/etc/lnd
+InaccessiblePaths=-/etc/bitcoin
+InaccessiblePaths=-/var/lib/lnmbot
+InaccessiblePaths=-/var/lib/lnd
+InaccessiblePaths=-/data
+MemoryMax=256M
+CPUQuota=50%

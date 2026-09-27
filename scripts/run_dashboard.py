@@ -37,13 +37,13 @@ BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
 LNM_DAILY_SEED_CACHE = (
     Path(__file__).resolve().parents[1]
-    / "data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+    / "config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
 )
 BREAKOUT_CAMPAIGN_SEED = (
-    Path(__file__).resolve().parents[1] / "docs/btc-close-range-lnm-live-seed-2026-09-13.json"
+    Path(__file__).resolve().parents[1] / "config/seeds/btc-close-range-lnm-live-seed-2026-09-13.json"
 )
 BREAKOUT_PAPER_REFERENCE = (
-    Path(__file__).resolve().parents[1] / "docs/btc-close-range-lnm-paper-reference-2026-09-13.json"
+    Path(__file__).resolve().parents[1] / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json"
 )
 SAT_TOKEN = "__SAT_SYMBOL__"
 SAT_ICON = '<i class="fak fa-satoshisymbol-solidtilt sat-symbol" aria-label="sats"></i>'

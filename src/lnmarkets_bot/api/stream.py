@@ -12,10 +12,14 @@ For v0 the paper-mode uses `MockLiveStream` so this remains untested in CI.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
-from ..strategy import Bar
 from ..data.source import DataSource
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from ..strategy import Bar
 
 
 class LnmStreamClient(DataSource):

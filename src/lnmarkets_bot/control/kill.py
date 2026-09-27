@@ -11,12 +11,13 @@ avoids hammering the filesystem on every engine tick.
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from ..config import BotConfig
+if TYPE_CHECKING:
+    from ..config import BotConfig
 
 
 @dataclass

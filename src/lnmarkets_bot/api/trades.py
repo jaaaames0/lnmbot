@@ -11,10 +11,10 @@ network.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .client import LnmRestClient
+if TYPE_CHECKING:
+    from .client import LnmRestClient
 
 
 @dataclass

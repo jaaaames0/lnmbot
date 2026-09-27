@@ -13,10 +13,7 @@ intentionally a thin shell over the engines — no business logic here.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -26,7 +23,7 @@ from sqlalchemy import func, select
 from .config import BotConfig, load_config
 from .data import BacktestReplay, MockLiveStream
 from .logging import configure_logging, get_logger
-from .persistence.db import make_engine, init_schema, make_session_factory
+from .persistence.db import init_schema, make_engine, make_session_factory
 from .persistence.models import (
     account_snapshots,
     bars,
@@ -37,7 +34,6 @@ from .persistence.models import (
     runs,
     signals,
 )
-from .persistence.recorder import Recorder
 from .strategy import import_strategy
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -54,7 +50,7 @@ def _load_strategy(cfg: BotConfig):
     log = get_logger("cli")
     try:
         strat = import_strategy(cfg.strategy)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.error("cli.strategy_load_failed", spec=cfg.strategy, error=str(exc))
         raise typer.Exit(code=2) from exc
     return strat

@@ -76,6 +76,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B011"]
+# Typer evaluates Option defaults and Path annotations when registering commands.
+"src/lnmarkets_bot/cli.py" = ["B008", "TC003"]
 
 # --- Mypy ---
 [tool.mypy]
@@ -97,6 +99,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Archived research checks require local, git-ignored market data.
+norecursedirs = ["research"]
 addopts = "-ra --strict-markers --strict-config"
 
 # --- Import-linter: enforce the "strategy never imports api or live data" rule ---

@@ -8,13 +8,16 @@ the same dataset the backtest uses.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from ..strategy import Bar
 from .source import DataSource
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 class MockLiveStream(DataSource):

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -11,8 +10,6 @@ from lnmarkets_bot.strategy.close_range import (
     CloseRangeMachine,
     DailyCandle,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def candle(ts: datetime, price: float, *, close: float | None = None) -> DailyCandle:
@@ -135,70 +132,6 @@ def test_recovery_exit_does_not_block_opposite_side_parent() -> None:
         ("historical_exit", "recover"),
         ("paper_parent", "structure_parent"),
     ]
-
-
-def test_feature_calculation_matches_frozen_research_matrix():
-    pd = pytest.importorskip("pandas")
-    from scripts.investigate_btc_broad_features import daily_features
-    from scripts.replay_btc_close_range_native import load_data
-
-    daily, _, _ = load_data()
-    reference = daily_features(daily)
-    expected = reference[(reference.index >= 120) & reference.raw_side.ne(0)].copy()
-    machine = CloseRangeMachine()
-    actual = {}
-    activation = datetime(2100, 1, 1, tzinfo=UTC)
-    for row in daily.itertuples(index=False):
-        decisions = machine.advance(
-            DailyCandle(row.ts.to_pydatetime(), row.open, row.high, row.low, row.close),
-            activation_ts=activation,
-        )
-        for decision in decisions:
-            if decision.kind == "signal":
-                actual[pd.Timestamp(decision.metadata["signal_ts"])] = decision
-
-    assert set(actual) == set(expected.ts)
-    for row in expected.itertuples(index=False):
-        decision = actual[row.ts]
-        assert decision.side == int(row.raw_side)
-        assert decision.metadata["boundary"] == pytest.approx(
-            row.upper if row.raw_side == 1 else row.lower
-        )
-        assert decision.metadata["ema20"] == pytest.approx(row.ema20, rel=1e-12)
-        assert decision.metadata["atr14"] == pytest.approx(row.atr14, rel=1e-12)
-        assert decision.metadata["average_overlap10"] == pytest.approx(
-            row.average_overlap10, rel=1e-12
-        )
-        assert decision.metadata["structure_pass"] == bool(
-            row.raw_side * (row.close - row.ema20) / row.atr14 >= 1.5
-            and row.average_overlap10 <= 0.55
-        )
-
-
-def test_current_seed_retains_latest_signal_and_is_not_owned():
-    pd = pytest.importorskip("pandas")
-    snapshot = json.loads((ROOT / "runs/btc-close-range-shadow-latest.json").read_text())
-    daily = pd.read_parquet(ROOT / "data/cache/btcusdt_perp_1d_shadow_2026-09-22.parquet")
-    daily = daily[daily.ts <= pd.Timestamp(snapshot["as_of_close"])].sort_values("ts")
-    machine = CloseRangeMachine()
-    machine.warmup(
-        [
-            DailyCandle(row.ts.to_pydatetime(), row.open, row.high, row.low, row.close)
-            for row in daily.itertuples(index=False)
-        ]
-    )
-    machine.seed_campaign(snapshot["active_hypothetical_stack"])
-    assert machine.pending_candidate is not None
-    assert machine.pending_candidate.signal_ts == datetime(2026, 9, 21, tzinfo=UTC)
-    next_bar = candle(datetime(2026, 9, 22, tzinfo=UTC), 86_000)
-    decisions = machine.advance(next_bar, activation_ts=datetime(2026, 9, 22, tzinfo=UTC))
-    rejection = next(value for value in decisions if value.reason == "addon_cap")
-    assert rejection.kind == "reject"
-    assert machine.campaign is not None
-    assert machine.campaign.origin == "historical"
-    assert machine.campaign.lifetime_units == 4
-    assert len(machine.campaign.units) == 1
-    assert all(unit.origin == "historical" for unit in machine.campaign.units)
 
 
 def test_seeded_exit_clears_at_next_open_without_creating_owned_close():

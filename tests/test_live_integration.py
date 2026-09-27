@@ -1,184 +1,125 @@
-"""Live integration test: MockLiveStream → MultiTimeframeDataSource → MaCross → RiskGuard → LiveExecutor (with FakeIsolatedTradesApi).
+"""End-to-end MA execution with a local candle stream and fake venue API."""
 
-Verifies the full pipeline works end-to-end without hitting the network.
-"""
 from __future__ import annotations
 
-import asyncio
-import tempfile
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pandas as pd
 import pytest
+from sqlalchemy import select
 
 from lnmarkets_bot.api.isolated import IsolatedCloseResponse, IsolatedTrade
 from lnmarkets_bot.config import BotConfig
 from lnmarkets_bot.data import MockLiveStream, MultiTimeframeDataSource
 from lnmarkets_bot.engine.live import run_paper
 from lnmarkets_bot.engine.live_executor import LiveExecutor
-from lnmarkets_bot.persistence.db import make_engine, make_session_factory
-from lnmarkets_bot.persistence.models import orders as orders_t, signals, fills
+from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
+from lnmarkets_bot.persistence.models import orders as orders_t
 from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.strategy.ma_cross import MaCross
-from sqlalchemy import select, func
 
 
 class FakeIsolatedTradesApi:
-    def __init__(self):
-        self.trades: list[dict] = []
-        self.closes: list[str] = []
-        self.next_id = 1
+    """Expose the inventory reads required before the executor admits entries."""
 
-    async def new_trade(self, params):
-        tid = f"iso-{self.next_id}"
-        self.next_id += 1
-        self.trades.append({
-            "id": tid, "side": params.side, "qty": params.quantity,
-            "leverage": params.leverage, "type": params.type,
-        })
-        return IsolatedTrade(
-            id=tid, type=params.type, side=params.side,
-            quantity=params.quantity, leverage=params.leverage, price=0.0,
+    def __init__(self) -> None:
+        self.trades: list[IsolatedTrade] = []
+        self.running: dict[str, IsolatedTrade] = {}
+        self.closed: list[str] = []
+
+    async def new_trade(self, params) -> IsolatedTrade:
+        trade = IsolatedTrade(
+            id=f"iso-{len(self.trades) + 1}",
+            type=params.type,
+            side=params.side,
+            quantity=params.quantity,
+            leverage=params.leverage,
+            price=0.0,
         )
+        self.trades.append(trade)
+        self.running[trade.id] = trade
+        return trade
 
-    async def close_trade(self, trade_id):
-        self.closes.append(trade_id)
-        return IsolatedCloseResponse(id=trade_id, pl=0, raw={})
+    async def close_trade(self, trade_id: str) -> IsolatedCloseResponse:
+        self.closed.append(trade_id)
+        self.running.pop(trade_id, None)
+        return IsolatedCloseResponse(id=trade_id, pl=0, raw={"id": trade_id})
+
+    async def get_running_trades(self) -> list[IsolatedTrade]:
+        return list(self.running.values())
+
+    async def get_closed_trades(self) -> list[IsolatedTrade]:
+        return []
+
+    async def iter_funding_fees(self, _from_ts, _to_ts):
+        if False:
+            yield None
+
+
+def _synthetic_candles(path) -> None:
+    """Sparse minute input yields 4h and daily closes without a large cache fixture."""
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = []
+    for index in range(30 * 6 + 1):
+        day = index // 6
+        price = 100.0 if day < 24 else 120.0 if day < 27 else 80.0
+        rows.append(
+            {
+                "ts": start + timedelta(hours=4 * index),
+                "open": price,
+                "high": price * 1.01,
+                "low": price * 0.99,
+                "close": price,
+                "volume": 1.0,
+            }
+        )
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+async def _run_with_fake_api(tmp_path):
+    candles = tmp_path / "candles.parquet"
+    _synthetic_candles(candles)
+    cfg = BotConfig(
+        storage_db_path=tmp_path / "live.sqlite",
+        initial_balance_usd=10_000.0,
+        risk_max_position_usd=10_000.0,
+        risk_max_leverage=10.0,
+        risk_max_daily_loss_usd=1_000_000.0,
+        risk_max_orders_per_minute=10_000,
+    )
+    engine = make_engine(cfg.storage_db_path)
+    init_schema(engine)
+    sessions = make_session_factory(engine)
+    recorder = Recorder(sessions)
+    api = FakeIsolatedTradesApi()
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=-1, symbol="BTCUSD")
+    stream = MultiTimeframeDataSource(
+        MockLiveStream(candles, seconds_per_bar=0.0, loop_forever=False),
+        higher_timeframes=("1d", "4h"),
+    )
+    run_id = await run_paper(
+        cfg=cfg,
+        data_source=stream,
+        strategy=MaCross(),
+        install_signal_handlers=False,
+        executor_factory=lambda: executor,
+    )
+    with sessions() as session:
+        rows = session.execute(select(orders_t).where(orders_t.c.run_id == run_id)).mappings().all()
+    return run_id, api, rows
 
 
 @pytest.mark.asyncio
-async def test_live_engine_with_fake_api():
-    """End-to-end: MockLiveStream → MultiTimeframeDataSource → MaCross → LiveExecutor (with FakeIsolatedTradesApi).
-
-    Uses a slice of the real 2y BTC fixture (which has many MA-crosses)
-    to ensure the strategy actually fires orders. Verifies the executor
-    receives those orders via the fake API.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        # Use a slice of the real 2y fixture that contains known MA-crosses
-        # (around the Nov 5, 2024 area per the user's chart observations).
-        src = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1m_2y.parquet"
-        import pandas as pd
-        df = pd.read_parquet(src)
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        df = df.set_index("ts")
-        # Take ~60 days: Oct 2024 - Dec 2024
-        slice_df = df.loc["2024-10-01":"2024-12-01"].reset_index()
-        slice_df.columns = ["ts", "open", "high", "low", "close", "volume"]
-        pq = Path(td) / "live_fixture.parquet"
-        slice_df.to_parquet(pq, index=False)
-
-        cfg = BotConfig(
-            storage_db_path=Path(td) / "live_int.sqlite",
-            initial_balance_usd=10_000.0,
-            risk_max_position_usd=10_000.0,
-            risk_max_leverage=10.0,
-            risk_max_daily_loss_usd=1_000_000.0,
-            risk_max_orders_per_minute=10_000,
-        )
-
-        from lnmarkets_bot.persistence.db import init_schema
-        engine = make_engine(cfg.storage_db_path)
-        init_schema(engine)
-        fac = make_session_factory(engine)
-        recorder = Recorder(fac)
-
-        api = FakeIsolatedTradesApi()
-        executor_factory = lambda: LiveExecutor(
-            trades_api=api, recorder=recorder, run_id=-1, symbol="BTCUSD",
-        )
-
-        ds = MultiTimeframeDataSource(
-            MockLiveStream(pq, seconds_per_bar=0.0, loop_forever=False),
-            higher_timeframes=("1d", "4h"),
-        )
-        strat = MaCross()
-        run_id = await run_paper(
-            cfg=cfg, data_source=ds, strategy=strat,
-            duration_seconds=30.0,
-            install_signal_handlers=False,
-            executor_factory=executor_factory,
-        )
-
-        # Verify the run completed.
-        assert run_id > 0
-
-        # Verify the FakeIsolatedTradesApi received orders (real BTC data has MA-crosses).
-        with fac() as s:
-            n_signals = s.execute(
-                select(func.count()).select_from(signals).where(signals.c.run_id == run_id)
-            ).scalar()
-            n_orders = s.execute(
-                select(func.count()).select_from(orders_t).where(orders_t.c.run_id == run_id)
-            ).scalar()
-            n_lnm = s.execute(
-                select(func.count()).select_from(orders_t)
-                .where(orders_t.c.run_id == run_id)
-                .where(orders_t.c.lnm_order_id.isnot(None))
-            ).scalar()
-
-        print(
-            f"\nrun_id={run_id} signals={n_signals} orders_in_db={n_orders} "
-            f"orders_with_lnm_id={n_lnm} api_orders={len(api.trades)} "
-            f"closed={len(api.closes)}"
-        )
-        # With real BTC data we should see orders.
-        assert n_orders > 0, f"expected orders, got {n_orders}"
-        assert len(api.trades) > 0, f"expected fake API to receive orders, got {len(api.trades)}"
-        assert n_lnm > 0, f"expected orders with lnm_order_id, got {n_lnm}"
+async def test_live_engine_with_fake_api(tmp_path) -> None:
+    run_id, api, orders = await _run_with_fake_api(tmp_path)
+    assert run_id > 0
+    assert orders
+    assert api.trades
+    assert all(row["lnm_order_id"] for row in orders)
 
 
 @pytest.mark.asyncio
-async def test_live_engine_per_tf_isolation():
-    """1d and 4h signals should be processed independently through LiveExecutor."""
-    with tempfile.TemporaryDirectory() as td:
-        src = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1m_2y.parquet"
-        import pandas as pd
-        df = pd.read_parquet(src)
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        df = df.set_index("ts")
-        slice_df = df.loc["2024-10-01":"2024-11-15"].reset_index()
-        slice_df.columns = ["ts", "open", "high", "low", "close", "volume"]
-        pq = Path(td) / "live_iso.parquet"
-        slice_df.to_parquet(pq, index=False)
-
-        cfg = BotConfig(
-            storage_db_path=Path(td) / "live_iso.sqlite",
-            initial_balance_usd=10_000.0,
-            risk_max_position_usd=10_000.0,
-            risk_max_leverage=10.0,
-            risk_max_daily_loss_usd=1_000_000.0,
-            risk_max_orders_per_minute=10_000,
-        )
-
-        from lnmarkets_bot.persistence.db import init_schema
-        engine = make_engine(cfg.storage_db_path)
-        init_schema(engine)
-        fac = make_session_factory(engine)
-        recorder = Recorder(fac)
-
-        api = FakeIsolatedTradesApi()
-        executor = LiveExecutor(
-            trades_api=api, recorder=recorder, run_id=-1, symbol="BTCUSD",
-        )
-
-        ds = MultiTimeframeDataSource(
-            MockLiveStream(pq, seconds_per_bar=0.0, loop_forever=False),
-            higher_timeframes=("1d", "4h"),
-        )
-        strat = MaCross()
-        run_id = await run_paper(
-            cfg=cfg, data_source=ds, strategy=strat,
-            duration_seconds=15.0,
-            install_signal_handlers=False,
-            executor_factory=lambda: executor,
-        )
-
-        # Verify that the engine processed bars and recorded signals/orders.
-        with fac() as s:
-            n_signals = s.execute(
-                select(func.count()).select_from(signals).where(signals.c.run_id == run_id)
-            ).scalar()
-        print(f"\nrun_id={run_id} signals={n_signals}")
-        assert n_signals > 0, f"expected signals on real BTC data, got {n_signals}"
+async def test_live_engine_per_tf_isolation(tmp_path) -> None:
+    _, api, orders = await _run_with_fake_api(tmp_path)
+    assert {row["trigger_tf"] for row in orders} == {"1d", "4h"}
+    assert len({trade.id for trade in api.trades}) == len(api.trades)

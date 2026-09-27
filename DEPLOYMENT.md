@@ -352,7 +352,7 @@ before resuming.
 
 The dashboard is useful but not an independent uptime monitor.  External
 monitoring from the VPS is the priority deferred safeguard; see
-[docs/dashboard-roadmap.md](docs/dashboard-roadmap.md).
+[docs/runtime/dashboard-roadmap.md](docs/runtime/dashboard-roadmap.md).
 
 ## 7. Test-only 5m profile
 
@@ -401,12 +401,12 @@ counter depletion, and resumption; it is never a production calibration.
 | `src/lnmarkets_bot/strategy/ma_cross.py` | Locked strategy defaults |
 | `src/lnmarkets_bot/engine/live_executor.py` | Isolated-order execution and reconciliation |
 | `src/lnmarkets_bot/risk/guard.py` | Hard limits and sizing guard |
-| `docs/dashboard-roadmap.md` | Dashboard scope and deferred safeguards |
+| `docs/runtime/dashboard-roadmap.md` | Dashboard scope and deferred safeguards |
 
 
 ## Audit remediation release (27 September 2026)
 
-See [acceptance evidence and cutover procedure](docs/remediation-release-2026-09-27.md).
+See [acceptance evidence and cutover procedure](docs/runtime/remediation-release-2026-09-27.md).
 Stable snapshot names are `ma_cross_primary` and `btc_close_range_v1`; readers
 prefer them over retained legacy class-name rows. Never select an arbitrary
 newest strategy snapshot.

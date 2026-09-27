@@ -1,7 +1,6 @@
 """Kill switch — env var + halt file + cache TTL."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from lnmarkets_bot.config import BotConfig

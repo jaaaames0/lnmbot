@@ -5,10 +5,10 @@ Every timestamp that crosses a module boundary is UTC.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 
 
-class BarResolution(str, Enum):
+class BarResolution(StrEnum):
     M1 = "1m"
     M5 = "5m"
     M15 = "15m"

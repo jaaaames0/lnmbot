@@ -29,7 +29,7 @@ from lnmarkets_bot.strategy.close_range_live import CloseRangeLive
 
 CACHE = (
     Path(__file__).resolve().parents[1]
-    / "data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+    / "config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
 )
 INSTANCE = "btc_close_range_v1"
 PARENT_TS = datetime(2026, 8, 22, tzinfo=UTC)

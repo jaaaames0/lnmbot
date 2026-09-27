@@ -50,7 +50,7 @@ def _state() -> StrategyState:
 def _august_reversal(*, unit_count: int = 1) -> tuple[CloseRangeLive, StrategyState, datetime]:
     """The real LN Markets long signal arrived while a funded short was closing."""
     frame = pd.read_parquet(
-        ROOT / "data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+        ROOT / "config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
     ).sort_values("ts")
     frame["ts"] = pd.to_datetime(frame.ts, utc=True)
     frame["high"] = frame[["open", "high", "close"]].max(axis=1)

@@ -78,26 +78,6 @@ def test_legacy_compact_seed_is_explicitly_incomplete():
     assert m.observe_historical_prices(datetime(2026, 1, 11, tzinfo=UTC), 100, 70, 100) == []
 
 
-def test_real_seed_rebuild_is_complete_and_preserves_source(tmp_path):
-    from pathlib import Path
-
-    from scripts.rebuild_historical_occupancy import rebuild
-
-    root = Path(__file__).resolve().parents[1]
-    result = rebuild(
-        root / "data/cache/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet",
-        root / "docs/btc-close-range-lnm-live-seed-2026-09-13.json",
-        root / "docs/btc-close-range-lnm-paper-reference-2026-09-13.json",
-        root / "data/cache/lnmarkets_btc_funding_2024-01-01_2026-09-22.parquet",
-    )
-    state = result["machine"]
-    assert state["historical_model_complete"]
-    assert [u["k"] for u in state["campaign"]["units"]] == [0, 1, 2, 3]
-    assert state["campaign"]["campaign_id"] == "20260822L"
-    assert all(u["origin"] == "historical" for u in state["campaign"]["units"])
-    assert state["source_count"] > 2000
-
-
 def test_incomplete_funding_cannot_certify_historical_seed():
     from lnmarkets_bot.strategy.historical import hydrate_historical
 
