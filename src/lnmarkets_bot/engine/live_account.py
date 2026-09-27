@@ -41,6 +41,14 @@ class LiveAccountBalanceProvider:
         )
         return equity_sats * price_usd / 1e8
 
+    async def available_cash_usd(
+        self, *, run_id: int, ts: datetime, price_usd: float, margin_used_usd: float
+    ) -> float:
+        balance_sats, _ = await self._snapshot(
+            run_id=run_id, ts=ts, price_usd=price_usd, margin_used_usd=margin_used_usd
+        )
+        return balance_sats * price_usd / 1e8
+
     async def snapshot(
         self,
         *,

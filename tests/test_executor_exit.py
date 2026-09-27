@@ -9,16 +9,16 @@ After an entry, then an exit at a higher price (short profit), we should see:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 
-from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
-from lnmarkets_bot.persistence.models import orders as orders_t, fills as fills_t
 from lnmarkets_bot.engine.fills import PaperFillExecutor
+from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
+from lnmarkets_bot.persistence.models import fills as fills_t
+from lnmarkets_bot.persistence.models import orders as orders_t
 from lnmarkets_bot.persistence.recorder import Recorder
-from lnmarkets_bot.strategy.intents import OrderIntent, Side, SignalKind
+from lnmarkets_bot.strategy.intents import OrderIntent
 
 
 @pytest.fixture
@@ -139,3 +139,10 @@ async def test_executor_records_flip_orders(recorder, tmp_path):
     with fac() as s:
         n_orders = s.execute(select(func.count()).select_from(orders_t).where(orders_t.c.run_id == run_id)).scalar()
     assert n_orders == 3, f"expected 3 orders, got {n_orders}"  # 1 entry short + 1 exit + 1 entry long
+
+
+def test_exit_slippage_is_adverse_on_both_sides(recorder):
+    executor = PaperFillExecutor(recorder=recorder, run_id=1, slippage_bps=5)
+    executor.update_price(100.0)
+    assert executor._price_for_close("sell") == pytest.approx(99.95)
+    assert executor._price_for_close("buy") == pytest.approx(100.05)

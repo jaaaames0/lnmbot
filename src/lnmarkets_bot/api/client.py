@@ -128,7 +128,8 @@ class LnmRestClient:
         headers = self._build_headers(method, signed_path, body, signed_query) if signed else {}
         content = canonical_json(body) if body else None
 
-        for attempt in range(self.max_retries + 1):
+        safe_read = method.upper() in {"GET", "HEAD", "OPTIONS"}
+        for attempt in range((self.max_retries if safe_read else 0) + 1):
             await self._rate_limiter.acquire()
             resp = await self._client.request(
                 method=method.upper(),
@@ -136,6 +137,8 @@ class LnmRestClient:
                 headers=headers,
                 content=content,
             )
+            if not safe_read and resp.status_code >= 400:
+                raise LnmApiError(resp.status_code, resp.text, url)
             if resp.status_code == 429:
                 # Honor Retry-After (in seconds). If missing, sleep the bucket-window average.
                 retry_after = float(resp.headers.get("Retry-After", "1"))
@@ -208,6 +211,7 @@ class LnmRestClient:
         """Iterate a paginated LNM list endpoint. cursor is an ISO 8601 timestamp."""
         params = dict(params or {})
         params.setdefault("limit", 1000)
+        seen_cursors = set()
         while True:
             page = await self.get(path, params=params)
             data = page.get("data", []) if isinstance(page, dict) else []
@@ -216,6 +220,9 @@ class LnmRestClient:
             next_cursor = page.get("nextCursor") if isinstance(page, dict) else None
             if not next_cursor:
                 return
+            if next_cursor in seen_cursors:
+                raise RuntimeError("API pagination cursor did not advance")
+            seen_cursors.add(next_cursor)
             params[cursor_field] = next_cursor
             # Tiny pause to be friendly.
             await asyncio.sleep(0.05)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from lnmarkets_bot.strategy.base import Bar, StrategyState, TfPosition
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
@@ -114,18 +112,15 @@ def test_restart_catch_up_applies_the_normal_same_bar_flip() -> None:
     assert state.position("5m").side == "short"
 
 
-def test_restart_catch_up_records_indicator_values_when_aligned() -> None:
+def test_restart_catch_up_is_silent_when_aligned() -> None:
     strategy = MaCross(params={"tfs": ("5m",)})
     strategy.tf_state["5m"].sma = 100.0
     strategy.tf_state["5m"].ema = 101.0
     state = StrategyState(positions={"5m": TfPosition(side="long")})
     bar = Bar(ts=datetime.now(UTC), open=100, high=101, low=99, close=100, volume=1, timeframe="5m")
 
-    intent = strategy._restart_catch_up(tf="5m", verdict="FLAT", bar=bar, state=state)[0]
-
-    assert intent.reason == "restart_state_aligned"
-    assert intent.metadata["close_vs_sma_pct"] == 0.0
-    assert intent.metadata["close_vs_ema_pct"] == pytest.approx(-1 / 101)
+    assert strategy._restart_catch_up(tf="5m", verdict="FLAT", bar=bar, state=state) == []
+    assert state.position("5m").side == "long"
 
 
 def test_unchanged_directional_verdict_reconciles_a_stranded_position() -> None:
@@ -258,6 +253,24 @@ def test_restart_transition_spends_cooldown_slot_and_does_not_flip() -> None:
     assert strategy._loss_suppressed_signals["5m"] == 3
 
 
+def test_cooloff_signal_records_total_for_auditable_ordinal() -> None:
+    strategy = MaCross(
+        params={"tfs": ("5m",), "cooldown_signal_count": {"5m": 12}}
+    )
+    strategy._suppressed_signals["5m"] = 11
+
+    intent = strategy._consume_cooldown(
+        tf="5m", previous_verdict="UP_TRUE", verdict="FLAT",
+        cooldowns_before={"winner": 11},
+    )[0]
+
+    assert intent.metadata["winner_total"] == 12
+    assert intent.metadata["winner_remaining_before"] == 11
+    assert intent.metadata["winner_remaining_after"] == 10
+    assert intent.metadata["previous_verdict"] == "UP_TRUE"
+    assert intent.metadata["verdict"] == "FLAT"
+
+
 def test_manual_flat_hold_blocks_only_the_missed_direction_until_verdict_changes() -> None:
     strategy = MaCross(params={"tfs": ("5m",)})
     tf_state = strategy.tf_state["5m"]
@@ -327,9 +340,7 @@ def test_startup_reconciles_restored_position_on_first_live_minute() -> None:
         state,
     )
 
-    assert len(intents) == 1
-    assert intents[0].reason == "restart_state_aligned"
-    assert intents[0].metadata["bar_ts"] == "2026-07-28T04:00:00+00:00"
+    assert intents == []
     assert strategy._restart_pending == set()
 
 

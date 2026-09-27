@@ -11,11 +11,11 @@ has a USD 1 notional), not a BTC amount in sats.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from datetime import datetime
 
     from .client import LnmRestClient
 
@@ -48,6 +48,7 @@ class IsolatedTrade:
     status: str = "open"  # "open" | "closed" | "canceled"
     created_at: datetime | None = None
     closed_at: datetime | None = None
+    filled_at: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -111,9 +112,9 @@ class IsolatedTradesApi:
         return [self._parse_trade(t) for t in items]
 
     async def get_closed_trades(self) -> list[IsolatedTrade]:
-        resp = await self._c.get("/futures/isolated/trades/closed")
-        items = resp.get("data", []) if isinstance(resp, dict) else resp or []
-        return [self._parse_trade(t) for t in items]
+        return [
+            self._parse_trade(t) async for t in self._c.iter_list("/futures/isolated/trades/closed")
+        ]
 
     async def get_open_trades(self) -> list[IsolatedTrade]:
         resp = await self._c.get("/futures/isolated/trades/open")
@@ -162,10 +163,22 @@ class IsolatedTradesApi:
             opening_fee=raw.get("openingFee"),
             closing_fee=raw.get("closingFee"),
             status=str(raw.get("status", "open")),
-            created_at=raw.get("createdAt", raw.get("created_at")),
-            closed_at=raw.get("closedAt", raw.get("closed_at")),
+            created_at=_timestamp(raw.get("createdAt", raw.get("created_at"))),
+            closed_at=_timestamp(raw.get("closedAt", raw.get("closed_at"))),
+            filled_at=_timestamp(raw.get("filledAt", raw.get("filled_at"))),
             raw=raw,
         )
+
+
+def _timestamp(value: object) -> datetime | None:
+    """Normalize venue ISO timestamps; malformed nonempty values fail closed."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if not isinstance(value, datetime):
+        raise ValueError("invalid isolated trade timestamp")
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 __all__ = [

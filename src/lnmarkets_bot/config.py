@@ -95,6 +95,7 @@ class BotConfig(BaseSettings):
 
     # --- Optional close-range strategy in the shared live process ---
     strategy_breakout_enabled: bool = False
+    strategy_breakout_direction_mode: Literal["both", "long_only", "short_only"] = "both"
     strategy_breakout_unit_notional_usd: float = 100.0
     strategy_breakout_leverage: float = 5.0
     strategy_breakout_seed_daily_path: Path = Path(

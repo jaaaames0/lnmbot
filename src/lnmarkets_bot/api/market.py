@@ -2,6 +2,7 @@
 
 These are read-only and public + private alike. Cross-margin-flavoured.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -65,7 +66,7 @@ class MarketApi:
         if to_ts is not None:
             params["to"] = to_ts.isoformat()
         items: list[dict[str, Any]] = []
-        async for item in self._c.iter_list("/futures/data/funding-settlements", params=params):
+        async for item in self._c.iter_list("/futures/funding-settlements", params=params):
             items.append(item)
         return items
 

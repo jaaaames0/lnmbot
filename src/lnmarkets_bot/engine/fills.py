@@ -1,9 +1,8 @@
 """Fill simulator (paper mode) for backtest and live.
 
-v1.1: **isolated-margin multi-position executor**. One position per
-trigger_tf (the timeframe that produced the signal). Strategies never
-see other TFs' positions; the executor owns per-TF position state and
-fills each intent immediately at the current price plus slippage.
+Legacy linear BTC-quantity simulator with one independent slot per timeframe.
+It fills immediately at the current mark plus slippage. It does not simulate
+native inverse-contract collateral, funding or isolated liquidation.
 
 This implements the `Executor` protocol declared in `risk/guard.py`.
 """
@@ -58,6 +57,28 @@ class PaperFillExecutor:
         self.positions: dict[str, _Position] = {}
         self._last_close: float | None = None
         self._unreported_realized_pnl_usd = 0.0
+        self.balance_sats: int | None = None
+
+    def initialize_balance(self, usd: float, price: float) -> None:
+        if self.balance_sats is None:
+            self.balance_sats = int(usd / price * 1e8)
+
+    def unrealized_pnl_sats(self) -> int:
+        if self._last_close is None:
+            return 0
+        # This legacy paper executor models a fixed BTC quantity with linear
+        # USD P&L. It is not the inverse-contract or isolated-liquidation model.
+        return sum(
+            int(p.qty_sats * (self._last_close - p.entry_price_usd) / self._last_close)
+            for p in self.positions.values()
+            if p.qty_sats and p.entry_price_usd
+        )
+
+    def margin_used_sats(self) -> int:
+        return sum(int(abs(p.qty_sats) / p.leverage) for p in self.positions.values())
+
+    def equity_sats(self) -> int:
+        return (self.balance_sats or 0) + self.unrealized_pnl_sats()
 
     def update_price(self, price_usd: float) -> None:
         self._last_close = price_usd
@@ -78,21 +99,28 @@ class PaperFillExecutor:
 
         new_qty_signed = fill.filled_qty_sats * (1 if fill.side == "buy" else -1)
         combined = prev_qty + new_qty_signed
+        newly_realized_usd = 0.0
 
         # Compute realized P&L on the portion that closes or flips
         if prev_qty > 0 and fill.side == "sell" and prev_entry is not None:
             closing_qty = min(prev_qty, fill.filled_qty_sats)
             pnl_per_sat_usd = (fill.fill_price_usd - prev_entry) / 1e8
             realized = pnl_per_sat_usd * closing_qty
+            newly_realized_usd += realized
             pos.realized_pnl_usd += realized
             self._unreported_realized_pnl_usd += realized
         elif prev_qty < 0 and fill.side == "buy" and prev_entry is not None:
             closing_qty = min(-prev_qty, fill.filled_qty_sats)
             pnl_per_sat_usd = (prev_entry - fill.fill_price_usd) / 1e8
             realized = pnl_per_sat_usd * closing_qty
+            newly_realized_usd += realized
             pos.realized_pnl_usd += realized
             self._unreported_realized_pnl_usd += realized
 
+        fee_usd = fill.fee_sats * fill.fill_price_usd / 1e8
+        self._unreported_realized_pnl_usd -= fee_usd
+        if self.balance_sats is not None:
+            self.balance_sats += int(newly_realized_usd / fill.fill_price_usd * 1e8) - fill.fee_sats
         # Update state
         if combined == 0:
             pos.side = None
@@ -231,7 +259,8 @@ class PaperFillExecutor:
         if self._last_close is None:
             raise RuntimeError("no price known — call update_price() first")
         slip = self.slippage_bps / 10_000.0
-        return self._last_close * (1.0 + slip if side == "sell" else 1.0 - slip)
+        # An exit crosses the spread too: selling receives less and buying pays more.
+        return self._last_close * (1.0 - slip if side == "sell" else 1.0 + slip)
 
     # ---- per-TF state accessors for the engine to mirror into strategy state ----
 

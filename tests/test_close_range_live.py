@@ -6,10 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
+from pydantic import ValidationError
 
+from lnmarkets_bot.config import BotConfig
 from lnmarkets_bot.strategy import Bar, StrategyState
 from lnmarkets_bot.strategy.base import TfPosition
 from lnmarkets_bot.strategy.close_range import (
+    BreakoutCandidate,
     BreakoutDecision,
     CampaignUnit,
     CloseRangeMachine,
@@ -116,6 +120,61 @@ def _minute(ts: datetime) -> Bar:
     return Bar(ts, 78_300, 78_300, 78_300, 78_300, 1, timeframe="1m")
 
 
+def test_funded_recovery_exits_without_same_open_reentry(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup(
+        [DailyCandle(start + timedelta(days=i), 100, 101, 99, 100) for i in range(120)]
+    )
+    machine.seed_campaign(
+        {
+            "parent_id": "old", "side": "long",
+            "entry_ts": (start + timedelta(days=30)).isoformat(),
+            "entry_price": 100, "boundary": 90,
+            "held_days": 90, "peak_favorable_pct": 0.2,
+            "active_units": 1, "pending_exit": None,
+        }
+    )
+    assert machine.campaign is not None
+    machine.campaign.origin = "live"
+    machine.campaign.units[0].origin = "live"
+    monkeypatch.setattr(
+        machine, "_candidate",
+        lambda value: BreakoutCandidate(
+            signal_ts=value.ts, side=1, boundary=105,
+            signal_close=value.close, ema20=100, atr14=2,
+            average_overlap10=0.4, distance_ema_atr=3,
+            structure_pass=True,
+        ),
+    )
+    strategy = CloseRangeLive({"activation_ts": start.isoformat()}, machine=machine)
+    state = _state()
+    state.position("k0").qty_sats = 100
+    state.position("k0").entry_price_usd = 100
+    exit_open = start + timedelta(days=121)
+    intents = strategy.on_bar(
+        Bar(exit_open, 100, 120, 99, 119.5, 1, timeframe="1d"), state
+    )
+    assert [(intent.kind.value, intent.position_key, intent.reason) for intent in intents] == [
+        ("exit", "k0", "recover")
+    ]
+    assert strategy.machine.campaign is None
+    assert strategy.persistent_state()["pending_reversal"] is None
+    assert any(
+        decision["reason"] == "recovery_same_open"
+        for decision in strategy.persistent_state()["recent_decisions"]
+    )
+    strategy.on_order_result(intents[0], SimpleNamespace(order_id=99, detail={}), state)
+    state.position("k0").qty_sats = 0
+    next_open = strategy.on_bar(
+        Bar(exit_open + timedelta(days=1), 119.5, 122, 119, 121, 1, timeframe="1d"),
+        state,
+    )
+    assert [(intent.kind.value, intent.position_key) for intent in next_open] == [
+        ("entry", "k0")
+    ]
+
+
 def test_funded_reversal_enters_only_after_old_close_confirms():
     strategy, state, next_open = _august_reversal(unit_count=2)
     assert strategy.on_bar(_minute(next_open + timedelta(minutes=1)), state) == []
@@ -165,6 +224,75 @@ def test_failed_reversal_close_survives_restart_and_never_enters_early():
         intent.kind.value
         for intent in restored.on_bar(_minute(next_open + timedelta(minutes=3)), state)
     ] == ["entry"]
+
+
+def test_direction_mode_change_rejects_deferred_reversal_and_preserves_exit():
+    strategy, state, next_open = _august_reversal(unit_count=4)
+    restricted = CloseRangeLive({**strategy.params, "direction_mode": "short_only"})
+    assert restricted.restore_persistent_state(strategy.persistent_state())
+    assert restricted.persistent_state()["recent_decisions"][-1]["reason"] == (
+        "direction_mode_changed"
+    )
+    restricted.reconcile_execution_state(state)
+    restricted.on_startup(state)
+    retry = restricted.on_bar(_minute(next_open + timedelta(minutes=1)), state)
+    assert [(intent.kind.value, intent.position_key) for intent in retry] == [
+        ("exit", f"k{k}") for k in range(4)
+    ]
+    assert restricted.persistent_state()["pending_reversal"] is None
+    assert any(
+        decision["reason"] == "reversal_direction_mode"
+        for decision in restricted.persistent_state()["recent_decisions"]
+    )
+    for k, intent in enumerate(retry):
+        restricted.on_order_result(intent, SimpleNamespace(order_id=9 + k, detail={}), state)
+        state.position(f"k{k}").qty_sats = 0
+    assert restricted.on_bar(_minute(next_open + timedelta(minutes=2)), state) == []
+
+
+def test_legacy_snapshot_restores_as_both_and_mode_change_is_recorded_once():
+    strategy, state, _ = _august_reversal()
+    legacy_snapshot = strategy.persistent_state()
+    legacy_snapshot.pop("direction_mode")
+    legacy_snapshot.pop("direction_mode_changed_at")
+    restricted = CloseRangeLive({**strategy.params, "direction_mode": "long_only"})
+    assert restricted.restore_persistent_state(legacy_snapshot)
+    assert restricted.machine.campaign is None
+    assert restricted.persistent_state()["pending_reversal"] == legacy_snapshot[
+        "pending_reversal"
+    ]
+    controls = [
+        decision for decision in restricted.persistent_state()["recent_decisions"]
+        if decision["reason"] == "direction_mode_changed"
+    ]
+    assert len(controls) == 1
+    assert controls[0]["metadata"] == {
+        "previous_mode": "both", "direction_mode": "long_only"
+    }
+    assert restricted.persistent_state()["direction_mode_changed_at"]
+
+    restored = CloseRangeLive({**strategy.params, "direction_mode": "long_only"})
+    assert restored.restore_persistent_state(restricted.persistent_state())
+    assert restored.persistent_state()["direction_mode_changed_at"] == (
+        restricted.persistent_state()["direction_mode_changed_at"]
+    )
+    assert sum(
+        decision["reason"] == "direction_mode_changed"
+        for decision in restored.persistent_state()["recent_decisions"]
+    ) == 1
+    restored.reconcile_execution_state(state)
+
+
+def test_direction_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.delenv("STRATEGY_BREAKOUT_DIRECTION_MODE", raising=False)
+    with pytest.raises(ValueError, match="direction mode"):
+        CloseRangeLive({"direction_mode": "hybrid"})
+    assert BotConfig(_env_file=None).strategy_breakout_direction_mode == "both"
+    assert BotConfig(
+        _env_file=None, strategy_breakout_direction_mode="short_only"
+    ).strategy_breakout_direction_mode == "short_only"
+    with pytest.raises(ValidationError):
+        BotConfig(_env_file=None, strategy_breakout_direction_mode="hybrid")
 
 
 def test_changed_unit_size_restores_old_trade_and_sizes_next_entry():

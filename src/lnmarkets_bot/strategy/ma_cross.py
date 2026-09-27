@@ -51,6 +51,7 @@ class MaCross(Strategy):
         size_multipliers:   dict[str, float]  {"1d":1.0, "4h":1.0}
         same_bar_flip:      bool              True
         warmup_bars_per_tf: int               21
+        indicator_mode:     str               "sma20_ema21" (optional research variant: "ema5_only")
     """
 
     DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -98,6 +99,13 @@ class MaCross(Strategy):
         self.size_multipliers: dict[str, float] = dict(merged["size_multipliers"])
         self.same_bar_flip = bool(merged["same_bar_flip"])
         self.warmup = int(merged["warmup_bars_per_tf"])
+        # Do not add this research-only key to DEFAULTS: persisted live
+        # strategy_params must remain byte-for-byte compatible on restart.
+        self.indicator_mode = str(merged.get("indicator_mode", "sma20_ema21"))
+        if self.indicator_mode not in {"sma20_ema21", "ema5_only"}:
+            raise ValueError(f"unsupported indicator_mode: {self.indicator_mode!r}")
+        if self.indicator_mode == "ema5_only" and self.warmup < 5:
+            raise ValueError("ema5_only requires at least 5 warmup bars")
         self.cooldown_mode = str(merged["cooldown_mode"])
         valid_cooldown_modes = {
             "verdict_transition",
@@ -157,6 +165,11 @@ class MaCross(Strategy):
         self._pending_position_reconciliation: dict[str, str | None] = {tf: None for tf in self.tfs}
         self._restart_pending: set[str] = set()
         self._startup_reconciliation_pending = False
+        # External manual closures reset trade eligibility at the next live
+        # subscribed boundary; minute reconciliation and warmup cannot enter.
+        self._external_reset_pending: set[str] = set()
+        self._last_external_trade_id: dict[str, str | None] = {tf: None for tf in self.tfs}
+        self._last_external_closures: dict[str, dict[str, Any]] = {}
 
     # ---- lifecycle ----
 
@@ -198,6 +211,9 @@ class MaCross(Strategy):
             "last_trade_pnl_pct": dict(self._last_trade_pnl_pct),
             "manual_flat_hold": dict(self._manual_flat_hold),
             "pending_position_reconciliation": dict(self._pending_position_reconciliation),
+            "external_reset_pending": sorted(self._external_reset_pending),
+            "last_external_trade_id": dict(self._last_external_trade_id),
+            "last_external_closures": dict(self._last_external_closures),
         }
 
     def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
@@ -205,7 +221,14 @@ class MaCross(Strategy):
         try:
             if snapshot.get("version") != 1:
                 return False
-            if snapshot.get("strategy_params") != self._json_strategy_params():
+            operational = {"base_size_usd", "base_leverage"}
+            saved_rules = {
+                k: v for k, v in snapshot.get("strategy_params", {}).items() if k not in operational
+            }
+            current_rules = {
+                k: v for k, v in self._json_strategy_params().items() if k not in operational
+            }
+            if saved_rules != current_rules:
                 return False
             timeframes = snapshot["timeframes"]
             if set(timeframes) != set(self.tfs):
@@ -264,6 +287,23 @@ class MaCross(Strategy):
             }
             if any(value not in {None, "long", "short", "flat"} for value in pending.values()):
                 return False
+            external_reset = set(snapshot.get("external_reset_pending", []))
+            if not external_reset <= set(self.tfs):
+                return False
+            external_ids = {
+                tf: snapshot.get("last_external_trade_id", {}).get(tf) for tf in self.tfs
+            }
+            if any(value is not None and not isinstance(value, str) for value in external_ids.values()):
+                return False
+            external_closures = snapshot.get("last_external_closures", {})
+            if not isinstance(external_closures, dict) or not set(external_closures) <= set(self.tfs):
+                return False
+            if any(
+                not isinstance(value, dict) or not isinstance(value.get("trade_id"), str)
+                or value.get("liquidated") not in {None, True, False}
+                for value in external_closures.values()
+            ):
+                return False
         except (KeyError, TypeError, ValueError, AttributeError):
             return False
         self.tf_state = restored
@@ -272,6 +312,9 @@ class MaCross(Strategy):
         self._last_trade_pnl_pct = pnl
         self._manual_flat_hold = manual_hold
         self._pending_position_reconciliation = pending
+        self._external_reset_pending = external_reset
+        self._last_external_trade_id = external_ids
+        self._last_external_closures = external_closures
         return True
 
     def _json_strategy_params(self) -> dict[str, Any]:
@@ -291,6 +334,61 @@ class MaCross(Strategy):
         """Risk rejection is a deliberate suppression, not an execution failure."""
         if intent.kind.value == "entry" and intent.trigger_tf in self.tf_state:
             self._pending_position_reconciliation[intent.trigger_tf] = None
+
+    def on_external_position_closed(self, event, state: StrategyState) -> None:
+        """Apply the operator-approved liquidation/manual-close policy per TF."""
+        tf = event.position_key
+        if tf not in self.tf_state:
+            raise ValueError("externally closed MA trade has no owning timeframe")
+        if self._last_external_trade_id[tf] == event.trade_id:
+            return
+        self._last_external_trade_id[tf] = event.trade_id
+        self._last_external_closures[tf] = {
+            "trade_id": event.trade_id,
+            "observed_at": getattr(event, "observed_at", datetime.now(UTC)).isoformat(),
+            "price_usd": event.price_usd,
+            "entry_price_usd": getattr(event, "entry_price_usd", None),
+            "side": getattr(event, "side", None),
+            "net_pl_sats": getattr(event, "net_pl_sats", None),
+            "liquidated": event.liquidated,
+        }
+        self._pending_position_reconciliation[tf] = None
+        self._manual_flat_hold[tf] = None
+        self._restart_pending.discard(tf)
+        self._suppressed_signals[tf] = 0
+        self._loss_suppressed_signals[tf] = 0
+        self._last_trade_pnl_pct[tf] = 0.0
+        state.positions[tf] = TfPosition()
+        if event.liquidated is not False:
+            # Funding can exhaust margin before the ordinary price threshold.
+            # Confirmed liquidation and unknown cause start the configured
+            # count. Unknown cause is retained, never reported as liquidation.
+            self._loss_suppressed_signals[tf] = self.loss_cooldown_signal_count.get(tf, 0)
+            self._external_reset_pending.discard(tf)
+            entry = getattr(event, "entry_price_usd", None)
+            side = getattr(event, "side", None)
+            if entry and side in {"long", "short"}:
+                self._last_trade_pnl_pct[tf] = (
+                    (event.price_usd - entry) / entry * (1 if side == "long" else -1)
+                )
+        else:
+            self._external_reset_pending.add(tf)
+
+    def classify_external_close(self, event, state: StrategyState) -> None:
+        """Amend a previously unknown cause using explicit operator evidence."""
+        tf = event.position_key
+        closure = self._last_external_closures.get(tf)
+        if (
+            closure is None or closure["trade_id"] != event.trade_id
+            or closure["liquidated"] is not None or event.liquidated is None
+        ):
+            raise ValueError("closure is not the last unknown MA trade on this timeframe")
+        if event.liquidated is True:
+            # It already started the loss cooldown; preserve consumed slots.
+            closure["liquidated"] = True
+        else:
+            self._last_external_trade_id[tf] = None
+            self.on_external_position_closed(event, state)
 
     def on_shutdown(self, state: StrategyState) -> None:
         return None
@@ -321,24 +419,36 @@ class MaCross(Strategy):
         if len(ts.closes) < self.warmup:
             return []  # warmup
 
-        # Compute SMA20
         closes = list(ts.closes)
-        sma = sum(closes[-20:]) / 20.0
-        ts.sma = sma
-
-        # Compute EMA21 (seed with SMA(21) on first computation)
-        if not ts.ema_seeded:
-            ts.ema = sum(closes[-21:]) / 21.0
-            ts.ema_seeded = True
+        if self.indicator_mode == "ema5_only":
+            ts.sma = None
+            if not ts.ema_seeded:
+                ts.ema = sum(closes[-5:]) / 5.0
+                ts.ema_seeded = True
+            else:
+                alpha = 2.0 / 6.0
+                ts.ema = bar.close * alpha + ts.ema * (1.0 - alpha)
         else:
-            alpha = 2.0 / 22.0
-            ts.ema = bar.close * alpha + ts.ema * (1.0 - alpha)
+            # Locked live rule: SMA20 and EMA21, seed the EMA with SMA21.
+            ts.sma = sum(closes[-20:]) / 20.0
+            if not ts.ema_seeded:
+                ts.ema = sum(closes[-21:]) / 21.0
+                ts.ema_seeded = True
+            else:
+                alpha = 2.0 / 22.0
+                ts.ema = bar.close * alpha + ts.ema * (1.0 - alpha)
 
         # Verdict for THIS TF only
         tol = self.tolerance_pct
-        if bar.close > ts.sma * (1 + tol) and bar.close > ts.ema * (1 + tol):
+        above = bar.close > ts.ema * (1 + tol) and (
+            ts.sma is None or bar.close > ts.sma * (1 + tol)
+        )
+        below = bar.close < ts.ema * (1 - tol) and (
+            ts.sma is None or bar.close < ts.sma * (1 - tol)
+        )
+        if above:
             verdict = "UP_TRUE"
-        elif bar.close < ts.sma * (1 - tol) and bar.close < ts.ema * (1 - tol):
+        elif below:
             verdict = "DOWN_TRUE"
         else:
             verdict = "FLAT"
@@ -350,7 +460,25 @@ class MaCross(Strategy):
             # retry. Normal processing below decides the new target.
             self._pending_position_reconciliation[tf] = None
         if bar.warmup:
+            if (
+                verdict != prev
+                and self._active_cooldowns(tf)
+                and self._cooldown_consumes(tf=tf, verdict=verdict, state=state)
+            ):
+                self._consume_cooldown(
+                    tf=tf,
+                    previous_verdict=prev,
+                    verdict=verdict,
+                    cooldowns_before=self._active_cooldowns(tf),
+                )
             return []
+        if tf in self._external_reset_pending:
+            self._external_reset_pending.remove(tf)
+            if verdict in {"UP_TRUE", "DOWN_TRUE"}:
+                return self._on_transition(
+                    tf=tf, previous_verdict=prev, side=verdict, bar=bar, state=state
+                )
+            return [OrderIntent.noop(trigger_tf=tf, reason="external_manual_close_reset_flat")]
         held_verdict = self._manual_flat_hold[tf]
         if held_verdict == verdict:
             # The position was manually flattened after a missed entry. Do
@@ -629,8 +757,8 @@ class MaCross(Strategy):
         """
         pos = state.position(tf)
         target_side = {"UP_TRUE": "long", "DOWN_TRUE": "short"}.get(verdict)
-        audit = self._restart_audit_metadata(tf=tf, verdict=verdict, bar=bar, pos=pos)
         if pos.side is not None and target_side is not None and pos.side != target_side:
+            audit = self._restart_audit_metadata(tf=tf, verdict=verdict, bar=bar, pos=pos)
             intents = self._on_transition(
                 tf=tf,
                 previous_verdict="RESTART_UNKNOWN",
@@ -641,13 +769,10 @@ class MaCross(Strategy):
             for intent in intents:
                 intent.metadata.update(audit)
             return intents
-        return [
-            OrderIntent.noop(
-                trigger_tf=tf,
-                reason="restart_state_aligned",
-                metadata=audit,
-            )
-        ]
+        # There is no action to journal. The dashboard reports current
+        # reconciliation state from the snapshot and venue positions instead
+        # of adding an "all clear" signal after every restart.
+        return []
 
     def _restart_audit_metadata(
         self, *, tf: str, verdict: str, bar: Bar, pos: TfPosition
@@ -717,8 +842,10 @@ class MaCross(Strategy):
                     "cooldown_types": sorted(cooldowns_before),
                     "winner_remaining_before": cooldowns_before.get("winner", 0),
                     "winner_remaining_after": self._suppressed_signals[tf],
+                    "winner_total": self.cooldown_signal_count.get(tf, 0),
                     "loss_remaining_before": cooldowns_before.get("loss", 0),
                     "loss_remaining_after": self._loss_suppressed_signals[tf],
+                    "loss_total": self.loss_cooldown_signal_count.get(tf, 0),
                     **(metadata or {}),
                 },
             )

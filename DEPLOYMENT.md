@@ -1,7 +1,7 @@
 # Deployment and operations runbook
 
 This document describes the repository as it is now: the production `1d` and
-`4h` isolated-margin MA-cross strategy, the `lnmbot` systemd service, and the
+`4h` isolated-margin MA-cross strategy and optional daily close-range breakout, the `lnmbot` systemd service, and the
 separate read-only dashboard.  Replace every angle-bracket placeholder with a
 value for the target host.
 
@@ -281,6 +281,28 @@ old snapshot and performs the deep bootstrap again.
 The funded runner always restores the MA strategy under `ma_cross_primary`.
 Setting `STRATEGY_BREAKOUT_ENABLED=false` prevents new breakout entries but
 continues to reconcile and exit any funded breakout K units already open.
+At an open that closes a breakout campaign for `recover`, the strategy rejects
+only a qualifying new parent in the **same direction at that same open**.
+Later daily signals remain eligible, as does an opposite-direction parent.
+The rejection is recorded as `recovery_same_open`; existing add-ons and all
+campaign exits retain their ordinary rules. No timer or saved cooldown state
+is introduced.
+`STRATEGY_BREAKOUT_DIRECTION_MODE` accepts `both` (the default), `long_only`,
+or `short_only`. It controls admission of new breakout parents and funded
+add-ons, including a deferred reversal that has not yet been submitted. A
+disallowed signal is recorded as a blocked breakout decision; it does not
+occupy the campaign slot. A mode change never closes or rewrites an existing
+campaign. Its existing range, recovery, cap, and liquidation exits still run.
+The historical seeded campaign remains a reference to the original
+both-direction rules, including its hypothetical add-ons. The mode and any
+change timestamp appear in the breakout snapshot; the effective mode also
+appears on the dashboard and in new run parameters. Invalid values prevent
+startup. To switch modes, review the current funded campaign and pending
+reversal, edit only this variable in `/etc/lnmbot/trader.env`, then follow the
+normal versioned deployment/restart procedure above and verify the displayed
+mode, campaign state, and venue positions. Reverting the variable to `both`
+restores normal admission for subsequent signals; it does not recreate
+previously rejected entries.
 After a restart, compare the venue and local open sets, verify the MA cool-off
 and breakout campaign snapshots, and wait for a new live minute bar before
 accepting the restart. A missed breakout campaign exit found during warmup is
@@ -380,3 +402,35 @@ counter depletion, and resumption; it is never a production calibration.
 | `src/lnmarkets_bot/engine/live_executor.py` | Isolated-order execution and reconciliation |
 | `src/lnmarkets_bot/risk/guard.py` | Hard limits and sizing guard |
 | `docs/dashboard-roadmap.md` | Dashboard scope and deferred safeguards |
+
+
+## Audit remediation release (27 September 2026)
+
+See [acceptance evidence and cutover procedure](docs/remediation-release-2026-09-27.md).
+Stable snapshot names are `ma_cross_primary` and `btc_close_range_v1`; readers
+prefer them over retained legacy class-name rows. Never select an arbitrary
+newest strategy snapshot.
+
+Confirmed external MA liquidation starts the configured loss cooldown even
+when funding caused liquidation before the price-loss threshold. An external
+closure whose cause is unavailable also starts that cooldown, while its
+accounting remains honestly unclassified. A confirmed manual closure resets
+only its owning timeframe, without cooldown, and reconsiders eligibility at its
+next live timeframe boundary. Warmup and minute reconciliation never open the
+replacement trade. REST closed history has a numeric liquidation price rather
+than a reliable cause flag; price alone does not classify a closure.
+
+An operator with definitive cause evidence may review
+`scripts/classify_ma_external_close.py --db <consistent-copy> --timeframe <1d|4h>
+--trade-id <id> --cause <manual|liquidation>`. Default is read-only. To apply,
+stop the trader, take a consistent backup, add `--apply --evidence-note <note>`,
+and verify the snapshot, delivery receipt and attribution before restarting.
+The utility refuses outstanding commands and a later trade on that slot. It
+changes lifecycle attribution, never fills, fees or P&L quantities.
+
+For recovery, `RISK_MAX_POSITION_USD=0` in the trader's **process environment**
+blocks admissions through the hard size cap while known exits continue. Do not
+use the whole-engine halt for this purpose. Reverting to pre-remediation code
+or restoring an old database after new writes requires a separate review; the
+independent cutover recovery timer uses compatible code with this zero-entry
+cap and retains the current database.

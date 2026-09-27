@@ -175,3 +175,15 @@ strategy_state_snapshots = Table(
     Column("state_json", JSON, nullable=False, default=dict),
     UniqueConstraint("mode", "strategy_name", name="uq_strategy_state_mode_name"),
 )
+
+
+execution_commands = Table(
+    "execution_commands",
+    Base.metadata,
+    Column("command_key", String, primary_key=True),
+    Column("action", String, nullable=False),
+    Column("status", String, nullable=False),  # submitted | received | applied | rejected
+    Column("request_json", JSON, nullable=False),
+    Column("result_json", JSON, nullable=True),
+    Column("notified", Integer, nullable=False, default=0),
+)

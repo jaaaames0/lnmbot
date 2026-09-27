@@ -1,15 +1,13 @@
-"""The load-bearing proof: same strategy + same data + different engines =
-identical behaviour.
+"""Wiring smoke tests for generic backtest and paper engines.
 
-This test runs the do_nothing strategy through both engines using the same
-parquet fixture, then asserts that the recorded signal/order counts match.
+The no-order strategy checks shared loading and persistence; these tests do
+not establish funded execution, collateral, funding or liquidation equivalence.
 """
+
 from __future__ import annotations
 
-import asyncio
-from datetime import UTC, datetime
-
 import pytest
+from sqlalchemy import func, select
 
 from lnmarkets_bot.config import BotConfig
 from lnmarkets_bot.data import BacktestReplay, MockLiveStream
@@ -18,14 +16,19 @@ from lnmarkets_bot.engine.live import run_paper
 from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_factory
 from lnmarkets_bot.persistence.models import orders, runs, signals
 from lnmarkets_bot.strategy import import_strategy
-from sqlalchemy import func, select
 
 
 def _counts_for_run(s, run_id: int) -> dict[str, int]:
     return {
-        "runs": s.execute(select(func.count()).select_from(runs).where(runs.c.id == run_id)).scalar(),
-        "signals": s.execute(select(func.count()).select_from(signals).where(signals.c.run_id == run_id)).scalar(),
-        "orders": s.execute(select(func.count()).select_from(orders).where(orders.c.run_id == run_id)).scalar(),
+        "runs": s.execute(
+            select(func.count()).select_from(runs).where(runs.c.id == run_id)
+        ).scalar(),
+        "signals": s.execute(
+            select(func.count()).select_from(signals).where(signals.c.run_id == run_id)
+        ).scalar(),
+        "orders": s.execute(
+            select(func.count()).select_from(orders).where(orders.c.run_id == run_id)
+        ).scalar(),
     }
 
 
@@ -39,12 +42,14 @@ async def test_backtest_and_paper_use_same_strategy_code(
     strat = import_strategy(cfg.strategy)
 
     bt_run = await run_backtest(
-        cfg=cfg1, data_source=BacktestReplay(small_fixture_path, cadence="instant"),
+        cfg=cfg1,
+        data_source=BacktestReplay(small_fixture_path, cadence="instant"),
         strategy=type(strat)(),
         install_signal_handlers=False,
     )
     ppr_run = await run_paper(
-        cfg=cfg2, data_source=MockLiveStream(small_fixture_path, seconds_per_bar=0.01, loop_forever=False),
+        cfg=cfg2,
+        data_source=MockLiveStream(small_fixture_path, seconds_per_bar=0.01, loop_forever=False),
         strategy=type(strat)(),
         duration_seconds=2.0,
         install_signal_handlers=False,
@@ -64,7 +69,9 @@ async def test_backtest_and_paper_use_same_strategy_code(
 
 
 @pytest.mark.asyncio
-async def test_same_strategy_class_used_in_both_engines(small_fixture_path, cfg: BotConfig, tmp_path) -> None:
+async def test_same_strategy_class_used_in_both_engines(
+    small_fixture_path, cfg: BotConfig, tmp_path
+) -> None:
     """The same Strategy implementation must be imported & executed in both modes.
 
     Both DBs independently start at run_id=1, but that's not what we're proving —
@@ -73,14 +80,19 @@ async def test_same_strategy_class_used_in_both_engines(small_fixture_path, cfg:
     cfg1 = BotConfig(**{**cfg.model_dump(), "storage_db_path": tmp_path / "a.sqlite"})
     cfg2 = BotConfig(**{**cfg.model_dump(), "storage_db_path": tmp_path / "b.sqlite"})
 
-    StratClass = type(import_strategy(cfg.strategy))
+    strategy_class = type(import_strategy(cfg.strategy))
     bt = await run_backtest(
-        cfg=cfg1, data_source=BacktestReplay(small_fixture_path, cadence="instant"),
-        strategy=StratClass(), install_signal_handlers=False,
+        cfg=cfg1,
+        data_source=BacktestReplay(small_fixture_path, cadence="instant"),
+        strategy=strategy_class(),
+        install_signal_handlers=False,
     )
     ppr = await run_paper(
-        cfg=cfg2, data_source=MockLiveStream(small_fixture_path, seconds_per_bar=0.01, loop_forever=False),
-        strategy=StratClass(), duration_seconds=2.0, install_signal_handlers=False,
+        cfg=cfg2,
+        data_source=MockLiveStream(small_fixture_path, seconds_per_bar=0.01, loop_forever=False),
+        strategy=strategy_class(),
+        duration_seconds=2.0,
+        install_signal_handlers=False,
     )
     bt_strategy_name: str | None = None
     ppr_strategy_name: str | None = None

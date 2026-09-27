@@ -122,13 +122,18 @@ class RiskGuard:
         self._today_pnl_restored = False
 
     def _rollover_day(self, ts: datetime) -> None:
+        if getattr(self.executor, "max_entry_age_seconds", None) is not None:
+            ts = self._clock()
         date_str = ts.astimezone(UTC).strftime("%Y-%m-%d")
         if date_str != self._today_date:
             self._today_date = date_str
             self._today_realized_pnl_usd = 0.0
             self._today_pnl_restored = False
         if (
-            self._today_pnl_restored
+            (
+                self._today_pnl_restored
+                and not getattr(self.executor, "authoritative_accounting", False)
+            )
             or self.current_price_usd is None
             or self.current_price_usd <= 0
         ):
@@ -145,7 +150,8 @@ class RiskGuard:
 
     def record_realized_pnl(self, delta_usd: float, ts: datetime) -> None:
         self._rollover_day(ts)
-        self._today_realized_pnl_usd += delta_usd
+        if not getattr(self.executor, "authoritative_accounting", False):
+            self._today_realized_pnl_usd += delta_usd
 
     def _open_notional_usd(self, exclude_tf: str) -> float:
         getter = getattr(self.executor, "open_notional_usd", None)
@@ -216,6 +222,11 @@ class RiskGuard:
         # the daily-loss tripwire and beside an entry in a same-bar flip.
         is_exit = intent.kind == SignalKind.EXIT
         if not is_exit:
+            admission = getattr(self.executor, "entry_admission_reason", None)
+            if admission is not None:
+                reason = admission(intent, ts)
+                if reason:
+                    return self._reject_exposure(run_id, ts, signal_id, reason)
             # Daily loss trip-wire (USD-native; limit and tally both in USD)
             self._rollover_day(ts)
             if self._today_realized_pnl_usd <= -self.limits.max_daily_loss_usd:
@@ -237,7 +248,10 @@ class RiskGuard:
 
             # Rate-limit only risk-increasing entries. A close followed by an
             # entry on the same bar is one legitimate same-bar flip.
-            cutoff = ts - timedelta(seconds=60)
+            rate_ts = (
+                self._clock() if getattr(self.executor, "authoritative_accounting", False) else ts
+            )
+            cutoff = rate_ts - timedelta(seconds=60)
             while self._recent_orders and self._recent_orders[0] < cutoff:
                 self._recent_orders.popleft()
             if len(self._recent_orders) >= self.limits.max_orders_per_minute:
@@ -310,12 +324,33 @@ class RiskGuard:
                 remaining_margin = self.limits.max_total_margin_usd - open_margin_usd
                 if remaining_margin <= 0:
                     return self._reject_exposure(run_id, ts, signal_id, "total_margin_exceeded")
-                max_by_margin = floor(remaining_margin * leverage)
+                margin_per_contract = 1 / leverage
+                if getattr(self.executor, "authoritative_accounting", False):
+                    margin_per_contract += 0.001 * (1 + 1 / leverage)
+                max_by_margin = floor(remaining_margin / margin_per_contract)
                 if max_by_margin <= 0:
                     return self._reject_exposure(run_id, ts, signal_id, "total_margin_exceeded")
                 if size_usd > max_by_margin:
                     size_usd = float(max_by_margin)
                     clamped = True
+
+        if not is_exit:
+            available_cash = getattr(self.account_balance_provider, "available_cash_usd", None)
+            if available_cash is not None:
+                try:
+                    cash = await available_cash(
+                        run_id=run_id,
+                        ts=ts,
+                        price_usd=self.current_price_usd,
+                        margin_used_usd=self._open_margin_usd(exclude_tf=intent.execution_key),
+                    )
+                except Exception:
+                    return self._reject_exposure(run_id, ts, signal_id, "cash_data_unavailable")
+                # Reserve entry fee and ordinary closing-fee maintenance along
+                # with this entry's margin. Do not promise future addon capacity.
+                required = size_usd / leverage + size_usd * (0.002 + 0.001 / leverage)
+                if cash < required:
+                    return self._reject_exposure(run_id, ts, signal_id, "insufficient_cash")
 
         if clamped:
             self.recorder.record_risk_event(
@@ -340,7 +375,7 @@ class RiskGuard:
             leverage=leverage,
         )
         if not is_exit:
-            self._recent_orders.append(ts)
+            self._recent_orders.append(rate_ts)
         merged = dict(meta)
         if clamped:
             merged.update(
@@ -352,7 +387,11 @@ class RiskGuard:
                 }
             )
         return OrderDecision(
-            decision=Decision.CLAMPED if clamped else Decision.SUBMITTED,
+            decision=Decision.REJECTED
+            if not is_exit and order_id < 0
+            else Decision.CLAMPED
+            if clamped
+            else Decision.SUBMITTED,
             order_id=order_id,
             detail=merged,
         )

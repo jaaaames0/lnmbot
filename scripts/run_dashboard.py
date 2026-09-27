@@ -189,6 +189,10 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
         authed=True,
         timeout=10.0,
     )
+
+    async def all_cashflows(path):
+        return [row async for row in client.iter_list(path)]
+
     try:
         (
             account,
@@ -202,10 +206,10 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
             AccountApi(client).get_balance(),
             IsolatedTradesApi(client).get_running_trades(),
             client.get("/futures/funding-settlements", params={"symbol": "BTCUSD", "limit": 1}),
-            client.get("/account/deposits/lightning", params={"limit": 1000}),
-            client.get("/account/deposits/on-chain", params={"limit": 1000}),
-            client.get("/account/withdrawals/lightning", params={"limit": 1000}),
-            client.get("/account/withdrawals/on-chain", params={"limit": 1000}),
+            all_cashflows("/account/deposits/lightning"),
+            all_cashflows("/account/deposits/on-chain"),
+            all_cashflows("/account/withdrawals/lightning"),
+            all_cashflows("/account/withdrawals/on-chain"),
         )
     finally:
         await client.aclose()
@@ -231,7 +235,7 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
         funding_rate = None
 
     def cashflow_total(response: object) -> int:
-        data = response.get("data", []) if isinstance(response, dict) else []
+        data = response.get("data", []) if isinstance(response, dict) else response
         if not isinstance(data, list):
             return 0
         return sum(int(item.get("amount") or 0) for item in data if isinstance(item, dict))
@@ -401,7 +405,7 @@ def _table(
             label = html.escape(str(row.get("_summary_label") or row.get("slot") or "campaign"))
             return SafeHtml(
                 '<details data-preserve-open class="stack-toggle">'
-                f'<summary>{label}</summary></details>'
+                f"<summary>{label}</summary></details>"
             )
         if column == "trade_id" and row.get("trade_id_copy"):
             trade_id = str(row["trade_id_copy"])
@@ -419,12 +423,15 @@ def _table(
         return str(value if value is not None else "")
 
     def render_row(row: dict[str, object], *, child: bool = False) -> str:
-        css_class = ' class="stack-unit-row"' if child else (
-            ' class="stack-summary-row"' if isinstance(row.get("_children"), list) else ""
+        css_class = (
+            ' class="stack-unit-row"'
+            if child
+            else (' class="stack-summary-row"' if isinstance(row.get("_children"), list) else "")
         )
         title = (
             f' title="{html.escape(str(row["_row_title"]), quote=True)}"'
-            if row.get("_row_title") else ""
+            if row.get("_row_title")
+            else ""
         )
         return (
             f"<tr{css_class}{title}>"
@@ -502,9 +509,11 @@ def _position_card(
             f"Cool-off · {remaining} verdict {'change' if remaining == 1 else 'changes'} left"
             f" ({' · '.join(labels)})"
         )
+        if cooldown.get("cause_unavailable"):
+            cooldown_detail += " · external closure cause unavailable"
     if position is None:
         return (
-            f'<article class="card position-card flat"><p>MA {timeframe} position</p>'
+            f'<article class="card position-card flat"><p>{timeframe}</p>'
             f"<strong>{'Cool-off active' if remaining else 'Flat'}</strong>"
             f"<small>{cooldown_detail or 'Ready for the next verdict transition'}</small></article>"
         )
@@ -512,7 +521,7 @@ def _position_card(
     estimate = _signed_amount_html(position["estimated_unrealized_sats"], denomination, btc_price)
     move_display = _signed_percent_html(position.get("position_change_pct"))
     return (
-        f'<article class="card position-card {side}"><p>MA {timeframe} position</p>'
+        f'<article class="card position-card {side}"><p>{timeframe}</p>'
         "<div class=position-card-body><div class=position-static>"
         f"<strong>{side.title()}</strong><small>${position['contracts']:,} · {position['leverage']}x"
         f"{' · ' + cooldown_detail if cooldown_detail else ''}</small>"
@@ -558,9 +567,13 @@ def _active_run(db_path: Path) -> dict[str, object] | None:
 
 
 def _signals(
-    db_path: Path, run_id: int | None = None, tf: str | None = None
+    db_path: Path, run_id: int | None = None, tf: str | None = None, *, limit: int | None = 500
 ) -> list[dict[str, object]]:
-    where = "WHERE run_id = ?" if run_id is not None else ""
+    where = (
+        "WHERE run_id = ? AND reason != 'restart_state_aligned'"
+        if run_id is not None
+        else "WHERE reason != 'restart_state_aligned'"
+    )
     params: tuple[object, ...] = (run_id,) if run_id is not None else ()
     columns = _table_columns(db_path, "signals")
     strategy_column = (
@@ -580,6 +593,7 @@ def _signals(
     for row in rows:
         item = dict(row)
         meta = _metadata(item.pop("metadata_json"))
+        item["metadata"] = meta
         trigger_tf = str(meta.get("trigger_tf") or "")
         strategy = item.get("strategy_instance_id") or "legacy_ma"
         if tf == "breakout" and strategy != BREAKOUT_INSTANCE_ID:
@@ -610,8 +624,9 @@ def _signals(
 
 
 def _orders(
-    db_path: Path, run_id: int | None = None, tf: str | None = None
+    db_path: Path, run_id: int | None = None, tf: str | None = None, *, limit: int | None = 500
 ) -> list[dict[str, object]]:
+    suffix = f" LIMIT {int(limit)}" if limit is not None else ""
     where = "WHERE orders.run_id = ?" if run_id is not None else ""
     params: tuple[object, ...] = (run_id,) if run_id is not None else ()
     columns = _table_columns(db_path, "orders")
@@ -621,14 +636,20 @@ def _orders(
         else "'' AS strategy_instance_id"
     )
     position_column = "orders.position_key" if "position_key" in columns else "'' AS position_key"
+    fill_price_column = (
+        "COALESCE((SELECT fills.price_usd FROM fills WHERE fills.order_id = orders.id "
+        "ORDER BY fills.id DESC LIMIT 1), orders.price_usd) AS price_usd"
+        if _table_columns(db_path, "fills")
+        else "orders.price_usd"
+    )
     rows = _query(
         db_path,
         f"SELECT orders.id, orders.ts, orders.trigger_tf, {strategy_column}, "
         f"{position_column}, orders.side, orders.qty_sats, "
-        "orders.leverage, orders.price_usd, orders.status, orders.lnm_order_id, "
+        f"orders.leverage, {fill_price_column}, orders.status, orders.lnm_order_id, "
         "orders.rejection_reason, orders.metadata_json, signals.metadata_json AS signal_metadata_json "
         "FROM orders LEFT JOIN signals ON signals.id = orders.signal_id "
-        f"{where} ORDER BY orders.id DESC LIMIT 500",
+        f"{where} ORDER BY orders.id DESC{suffix}",
         params,
     )
     result: list[dict[str, object]] = []
@@ -737,7 +758,7 @@ def _trade_history_rows(
 ) -> list[dict[str, object]]:
     """One readable ledger row per isolated LNM trade, not per API action."""
     grouped: dict[str, dict[str, object]] = {}
-    for order in reversed(_orders(db_path, tf=tf)):
+    for order in reversed(_orders(db_path, tf=tf, limit=None)):
         trade_id = str(order.get("trade_id") or "")
         if not trade_id:
             continue
@@ -771,7 +792,7 @@ def _trade_history_rows(
                 "trade_id": f"{trade_id[:8]}…{trade_id[-4:]}",
                 "trade_id_copy": trade_id,
                 "timeframe": opened.get("trigger_tf", "-"),
-                "strategy": opened.get("strategy", "legacy_ma"),
+                "strategy": _strategy_label(opened.get("strategy", "legacy_ma")),
                 "slot": opened.get("slot", opened.get("trigger_tf", "-")),
                 "position": (
                     f"{'Long' if opened.get('side') == 'buy' else 'Short'} · "
@@ -908,8 +929,8 @@ def _persisted_strategy_levels(db_path: Path, tolerance_pct: float) -> dict[str,
         rows = _query(
             db_path,
             "SELECT ts, state_json FROM strategy_state_snapshots "
-            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
-            (MA_STRATEGY_NAME,),
+            "WHERE mode = 'live' AND strategy_name IN (?, ?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+            ("ma_cross_primary", MA_STRATEGY_NAME, "ma_cross_primary"),
         )
     except sqlite3.Error:
         return {}
@@ -948,8 +969,8 @@ def _persisted_cooldowns(db_path: Path) -> dict[str, dict[str, int]]:
         rows = _query(
             db_path,
             "SELECT state_json FROM strategy_state_snapshots "
-            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
-            (MA_STRATEGY_NAME,),
+            "WHERE mode = 'live' AND strategy_name IN (?, ?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+            ("ma_cross_primary", MA_STRATEGY_NAME, "ma_cross_primary"),
         )
     except sqlite3.Error:
         return empty
@@ -966,6 +987,9 @@ def _persisted_cooldowns(db_path: Path) -> dict[str, dict[str, int]]:
                 "winner": max(0, int(winner.get(timeframe, 0))),
                 "loss": max(0, int(loss.get(timeframe, 0))),
             }
+            closure = state.get("last_external_closures", {}).get(timeframe)
+            if isinstance(closure, dict) and closure.get("liquidated") is None:
+                empty[timeframe]["cause_unavailable"] = 1
         except (TypeError, ValueError):
             continue
     return empty
@@ -977,8 +1001,8 @@ def _persisted_breakout_state(db_path: Path) -> dict[str, object] | None:
         rows = _query(
             db_path,
             "SELECT ts, state_json FROM strategy_state_snapshots "
-            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
-            (BREAKOUT_STRATEGY_NAME,),
+            "WHERE mode = 'live' AND strategy_name IN (?, ?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+            (BREAKOUT_INSTANCE_ID, BREAKOUT_STRATEGY_NAME, BREAKOUT_INSTANCE_ID),
         )
     except sqlite3.Error:
         return None
@@ -989,10 +1013,21 @@ def _persisted_breakout_state(db_path: Path) -> dict[str, object] | None:
     return state
 
 
+def _breakout_mode_label(value: object) -> str:
+    return {
+        "both": "Both directions",
+        "long_only": "Long only",
+        "short_only": "Short only",
+    }.get(str(value), "Unknown mode")
+
+
 @lru_cache(maxsize=1)
 def _historical_breakout_reference() -> dict[str, object] | None:
     """Load the build-time replay only when its seed candles still match."""
-    if not all(path.is_file() for path in (LNM_DAILY_SEED_CACHE, BREAKOUT_CAMPAIGN_SEED, BREAKOUT_PAPER_REFERENCE)):
+    if not all(
+        path.is_file()
+        for path in (LNM_DAILY_SEED_CACHE, BREAKOUT_CAMPAIGN_SEED, BREAKOUT_PAPER_REFERENCE)
+    ):
         return None
     try:
         reference = json.loads(BREAKOUT_PAPER_REFERENCE.read_text())
@@ -1036,10 +1071,16 @@ def _breakout_context(
         "unit_notional_usd": state.get("unit_notional_usd", 100) if state else 100,
         "historical_unit_notional_usd": (
             state.get("historical_unit_notional_usd", state.get("unit_notional_usd", 100))
-            if state else 100
+            if state
+            else 100
         ),
         "leverage": state.get("leverage", 5) if state else 5,
+        "direction_mode": state.get("direction_mode", "both") if state else "both",
+        "direction_mode_changed_at": state.get("direction_mode_changed_at") if state else None,
         "pending_exit": machine.get("pending_exit"),
+        "historical_model_complete": machine.get(
+            "historical_model_complete", not campaign or campaign.get("origin") != "historical"
+        ),
         "available": state is not None,
     }
 
@@ -1074,6 +1115,11 @@ def _historical_paper_position(
         or int(campaign.get("lifetime_units") or 0) != len(units)
     ):
         return None
+    if context.get("historical_model_complete", False):
+        active = {int(unit["k"]) for unit in campaign.get("units", [])}
+        units = [unit for unit in units if int(unit["k"]) in active]
+        if not units:
+            return None
     notional = float(context["historical_unit_notional_usd"])
     leverage = float(context["leverage"])
     if notional <= 0 or leverage <= 0:
@@ -1084,15 +1130,13 @@ def _historical_paper_position(
     side = int(campaign["side"])
     weighted_entry = len(units) / sum(1 / float(unit["entry_price"]) for unit in units)
     gross_btc = (
-        sum(
-            side * notional * (1 / float(unit["entry_price"]) - 1 / mark)
-            for unit in units
-        )
+        sum(side * notional * (1 / float(unit["entry_price"]) - 1 / mark) for unit in units)
         if mark is not None
         else None
     )
     return {
         **reference,
+        "units": units,
         "mark": mark,
         "side": side,
         "unit_notional_usd": notional,
@@ -1160,6 +1204,8 @@ def _breakout_card(context: dict[str, object], denomination: str, btc_price: flo
                 if owned
                 else f"{side} {campaign_id} · no funded units · new parent blocked"
             )
+            if not context.get("historical_model_complete", True):
+                detail += " · liquidation reconstruction required; new entries blocked"
             if paper is not None:
                 detail += f" · {len(paper['units'])} paper units"
             card_class = "flat"
@@ -1197,15 +1243,19 @@ def _breakout_card(context: dict[str, object], denomination: str, btc_price: flo
             )
     return (
         f'<article class="card position-card breakout-card {card_class}">'
-        "<p>Close-range breakout</p>"
+        f"<p>Daily campaign · {html.escape(_breakout_mode_label(context.get('direction_mode')))}</p>"
         f"<strong>{html.escape(status)}</strong>"
         f"<small>{detail}</small>{extra}{pnl}{updated}</article>"
     )
 
 
 def _breakout_activity_rows(
-    db_path: Path, state: dict[str, object] | None, paper: dict[str, object] | None,
-    *, recorded_limit: int = 5, decision_limit: int = 8,
+    db_path: Path,
+    state: dict[str, object] | None,
+    paper: dict[str, object] | None,
+    *,
+    recorded_limit: int = 5,
+    decision_limit: int = 8,
 ) -> list[dict[str, object]]:
     """Put emitted signals, recent decisions and the active seed trail in one timeline."""
     rows: list[dict[str, object]] = []
@@ -1218,10 +1268,21 @@ def _breakout_activity_rows(
         return f"{number:.{places}f}" if math.isfinite(number) else "-"
 
     def add(
-        *, source: str, signal_ts: object, action_ts: object, slot: object,
-        kind: object, reason: object, signal_close: object = None,
-        boundary: object = None, distance: object = None, overlap: object = None,
-        side: object = None, size_usd: object = None, leverage: object = None,
+        *,
+        source: str,
+        signal_ts: object,
+        action_ts: object,
+        slot: object,
+        kind: object,
+        reason: object,
+        signal_close: object = None,
+        boundary: object = None,
+        distance: object = None,
+        overlap: object = None,
+        side: object = None,
+        size_usd: object = None,
+        leverage: object = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         rows.append(
             {
@@ -1234,6 +1295,7 @@ def _breakout_activity_rows(
                 "side": side or "-",
                 "size_usd": size_usd,
                 "leverage": leverage,
+                "metadata": metadata or {},
                 "signal_close": _format_price(signal_close),
                 "range_boundary": _format_price(boundary),
                 "ema_distance_atr": metric(distance, 2),
@@ -1244,12 +1306,20 @@ def _breakout_activity_rows(
     emitted = _signals(db_path, tf="breakout")[:recorded_limit]
     for signal in emitted:
         add(
-            source="Recorded signal", signal_ts=signal["signal_ts"], action_ts=signal["ts"],
-            slot=signal["slot"], kind=signal["kind"], reason=signal["reason"],
-            signal_close=signal["signal_close"], boundary=signal["range_boundary"],
-            distance=signal["distance_ema_atr"], overlap=signal["average_overlap10"],
-            side=signal["side"], size_usd=signal["target_size_usd"],
+            source="Recorded signal",
+            signal_ts=signal["signal_ts"],
+            action_ts=signal["ts"],
+            slot=signal["slot"],
+            kind=signal["kind"],
+            reason=signal["reason"],
+            signal_close=signal["signal_close"],
+            boundary=signal["range_boundary"],
+            distance=signal["distance_ema_atr"],
+            overlap=signal["average_overlap10"],
+            side=signal["side"],
+            size_usd=signal["target_size_usd"],
             leverage=signal["target_leverage"],
+            metadata=_metadata(signal.get("metadata")),
         )
     emitted_actions = {(str(row["ts"]), str(row["slot"])) for row in emitted}
     decisions = state.get("recent_decisions", []) if state else []
@@ -1258,31 +1328,49 @@ def _breakout_activity_rows(
             if not isinstance(decision, dict):
                 continue
             slot = f"k{decision['k']}" if decision.get("k") is not None else "-"
-            if decision.get("kind") in {"paper_parent", "paper_addon", "campaign_exit"} and (
-                str(decision.get("ts")), slot
-            ) in emitted_actions:
+            if (
+                decision.get("kind") in {"paper_parent", "paper_addon", "campaign_exit"}
+                and (str(decision.get("ts")), slot) in emitted_actions
+            ):
                 continue
             meta = _metadata(decision.get("metadata"))
             add(
-                source="Live decision", signal_ts=meta.get("signal_ts") or decision.get("ts"),
-                action_ts=decision.get("ts"), slot=slot, kind=decision.get("kind"),
-                reason=decision.get("reason"), signal_close=meta.get("signal_close"),
-                boundary=meta.get("boundary"), distance=meta.get("distance_ema_atr"),
+                source="Live decision",
+                signal_ts=meta.get("signal_ts") or decision.get("ts"),
+                action_ts=decision.get("ts"),
+                slot=slot,
+                kind=decision.get("kind"),
+                reason=decision.get("reason"),
+                signal_close=meta.get("signal_close"),
+                boundary=meta.get("boundary"),
+                distance=meta.get("distance_ema_atr"),
                 overlap=meta.get("average_overlap10"),
-                side="long" if decision.get("side") == 1 else "short" if decision.get("side") == -1 else None,
+                side="long"
+                if decision.get("side") == 1
+                else "short"
+                if decision.get("side") == -1
+                else None,
+                metadata=meta,
             )
     if paper is not None:
         for event in paper["signal_trail"]:
             result = str(event["result"])
             add(
-                source="Historical replay", signal_ts=event["signal_ts"],
+                source="Historical replay",
+                signal_ts=event["signal_ts"],
                 action_ts=event["action_ts"],
                 slot=result[:2].lower() if result.startswith("K") else "-",
                 kind="entry" if result.startswith("K") else "decision",
-                reason=result.replace(" paper entry", " entry"), signal_close=event["signal_close"],
-                boundary=event["range_boundary"], distance=event["distance_ema_atr"],
+                reason=result.replace(" paper entry", " entry"),
+                signal_close=event["signal_close"],
+                boundary=event["range_boundary"],
+                distance=event["distance_ema_atr"],
                 overlap=event["average_overlap10"],
-                side="long" if result.startswith("K") and paper["side"] == 1 else "short" if result.startswith("K") else None,
+                side="long"
+                if result.startswith("K") and paper["side"] == 1
+                else "short"
+                if result.startswith("K")
+                else None,
             )
     rows.sort(
         key=lambda row: _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
@@ -1291,60 +1379,253 @@ def _breakout_activity_rows(
     return rows
 
 
+def _strategy_label(strategy_id: object) -> str:
+    if strategy_id == BREAKOUT_INSTANCE_ID:
+        return "Breakout"
+    if strategy_id in {"legacy_ma", "ma_cross_primary"}:
+        return "MA cross"
+    return str(strategy_id or "Unknown")
+
+
+def _verdict_label(value: object) -> str:
+    return {"UP_TRUE": "Up", "DOWN_TRUE": "Down", "FLAT": "Flat"}.get(str(value), str(value or "?"))
+
+
+def _cooloff_detail(metadata: dict[str, object]) -> str:
+    parts: list[str] = []
+    types = metadata.get("cooldown_types")
+    for kind in ("winner", "loss"):
+        if isinstance(types, list) and kind not in types:
+            continue
+        try:
+            before = int(metadata[f"{kind}_remaining_before"])
+            after = int(metadata[f"{kind}_remaining_after"])
+            total = int(metadata[f"{kind}_total"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if total > 0 and 0 < before <= total:
+            parts.append(f"{kind} {total - before + 1}/{total}")
+        else:
+            parts.append(f"{kind} {after} left")
+    if not parts:
+        for kind in ("winner", "loss"):
+            remaining = metadata.get(f"{kind}_remaining_after")
+            if remaining is not None:
+                parts.append(f"{kind} {remaining} left")
+    previous = metadata.get("previous_verdict")
+    current = metadata.get("verdict")
+    if current:
+        parts.append(
+            f"{_verdict_label(previous)} → {_verdict_label(current)}"
+            if previous
+            else _verdict_label(current)
+        )
+    return " · ".join(parts) or "Cooldown active"
+
+
+def _signal_event(kind: object, side: object, reason: object) -> str:
+    if reason in {"cool_off", "cool_off_same_bar_flip", "cool_off_pending_position_reconciliation"}:
+        return "Suppressed"
+    if reason == "verdict_flat":
+        return "Flat"
+    if kind in {"paper_parent", "historical_parent"}:
+        return "Parent"
+    if kind in {"paper_addon", "historical_addon"}:
+        return "Add-on"
+    if kind == "entry":
+        return f"Enter {side}" if side in {"long", "short"} else "Entry"
+    if kind == "exit" or kind == "campaign_exit":
+        return "Exit"
+    if kind == "reject":
+        return "Blocked"
+    if kind == "signal":
+        return "Breakout"
+    return str(kind or "Decision").replace("_", " ").capitalize()
+
+
+def _signal_detail(reason: object, metadata: dict[str, object] | None = None) -> str:
+    metadata = metadata or {}
+    if reason == "direction_mode_changed":
+        return (
+            f"{_breakout_mode_label(metadata.get('previous_mode'))} → "
+            f"{_breakout_mode_label(metadata.get('direction_mode'))}"
+        )
+    if reason in {"parent_direction_mode", "addon_direction_mode", "reversal_direction_mode"}:
+        return f"{_breakout_mode_label(metadata.get('direction_mode'))} blocks this entry"
+    if reason == "cool_off":
+        return _cooloff_detail(metadata)
+    if reason == "cool_off_same_bar_flip":
+        return (
+            f"Cooldown started · {_verdict_label(metadata.get('previous_verdict'))}"
+            f" → {_verdict_label(metadata.get('verdict'))} · flip skipped"
+        )
+    if reason == "cool_off_pending_position_reconciliation":
+        remaining = [
+            f"{kind} {metadata[f'{kind}_remaining']} left"
+            for kind in ("winner", "loss")
+            if metadata.get(f"{kind}_remaining")
+        ]
+        verdict = metadata.get("verdict")
+        if verdict:
+            remaining.append(_verdict_label(verdict))
+        return "Pending entry · " + " · ".join(remaining) if remaining else "Pending entry"
+    labels = {
+        "structure_parent": "Structure passed",
+        "raw_same_side_addon": "Same-side breakout",
+        "structure_pass": "Structure passed",
+        "structure_reject": "Structure failed",
+        "parent_structure": "Parent filter failed",
+        "recovery_same_open": "Recovery exit · same-open parent blocked",
+        "addon_cap": "Four-unit cap",
+        "addon_distance": "Beyond 15% from parent",
+        "addon_parent_boundary": "Back inside parent range",
+        "occupied_opposite": "Opposite signal while occupied",
+        "range_close": "Back inside parent range",
+        "recover": "97% of parent peak",
+        "maximum_hold": "Day 120 cap",
+        "parent_liquidation": "Parent liquidated",
+        "child_liquidation": "Child liquidated",
+        "verdict_flat": "Verdict changed to Flat",
+        "manual_flat_hold": "Operator hold",
+        "cool_off_same_bar_flip": "Cooldown started; flip skipped",
+        "cool_off_pending_position_reconciliation": "Cooldown holds pending entry",
+    }
+    return labels.get(str(reason), str(reason or "-").replace("_", " "))
+
+
 def _signal_timeline_rows(
-    db_path: Path, tf: str | None, breakout_state: dict[str, object] | None,
+    db_path: Path,
+    tf: str | None,
+    breakout_state: dict[str, object] | None,
     paper: dict[str, object] | None,
 ) -> list[dict[str, object]]:
-    """Give MA records and breakout decisions one readable event vocabulary."""
+    """Give MA records and breakout decisions one compact event vocabulary."""
     rows: list[dict[str, object]] = []
     if tf != "breakout":
         for signal in _signals(db_path, tf=tf):
             if signal["strategy"] == BREAKOUT_INSTANCE_ID:
                 continue
-            metrics = []
-            if signal["kind"] == "entry":
-                metrics.append(f"${float(signal['target_size_usd'] or 0):,.0f}")
-                if signal["target_leverage"] != "-":
-                    metrics.append(f"{float(signal['target_leverage'] or 0):g}x")
+            qualifiers = []
             if signal["chop_regime"] != "-":
-                metrics.append(f"chop {signal['chop_regime']} ({signal['chop_value']})")
-            if signal["entry_size_multiplier"] != "-":
-                metrics.append(f"size {signal['entry_size_multiplier']}")
+                qualifiers.append(f"chop {signal['chop_regime']} ({signal['chop_value']})")
+            signal_ts = signal["signal_ts"]
+            # MA aggregates are labelled at their right edge; the signal candle
+            # itself begins one timeframe earlier. Older records lack signal_ts.
+            if not signal["metadata"].get("signal_ts") and signal["timeframe"] in TIMEFRAMES:
+                close_ts = _parse_ts(signal_ts)
+                if close_ts is not None:
+                    period = (
+                        timedelta(days=1) if signal["timeframe"] == "1d" else timedelta(hours=4)
+                    )
+                    signal_ts = (close_ts - period).isoformat()
             rows.append(
                 {
-                    "signal_ts": signal["signal_ts"], "action_ts": signal["ts"],
-                    "source": "Recorded signal",
-                    "strategy": signal["strategy"], "slot": signal["slot"],
-                    "kind": signal["kind"], "side": signal["side"] or "-",
-                    "reason": signal["reason"], "metrics": " · ".join(metrics) or "-",
+                    "signal_ts": signal_ts,
+                    "action_ts": signal["ts"],
+                    "source": "Live",
+                    "strategy": _strategy_label(signal["strategy"]),
+                    "slot": signal["slot"],
+                    "kind": signal["kind"],
+                    "side": signal["side"] or "-",
+                    "event": _signal_event(signal["kind"], signal["side"], signal["reason"]),
+                    "detail": _signal_detail(signal["reason"], signal["metadata"]),
+                    "reason": signal["reason"],
+                    "qualifiers": " · ".join(qualifiers) or "-",
                 }
             )
     if tf in {None, "breakout"}:
         for event in _breakout_activity_rows(
             db_path, breakout_state, paper, recorded_limit=500, decision_limit=256
         ):
-            metrics = []
-            if event["kind"] == "entry" and event["size_usd"] is not None:
-                metrics.append(f"${float(event['size_usd']):,.0f}")
-                if event["leverage"] not in {None, "-"}:
-                    metrics.append(f"{float(event['leverage']):g}x")
+            qualifiers = []
             for key, label in (
-                ("signal_close", "close"), ("range_boundary", "range"),
-                ("ema_distance_atr", "EMA ATR"), ("overlap_10", "overlap"),
+                ("signal_close", "close"),
+                ("range_boundary", "range"),
+                ("ema_distance_atr", "EMA ATR"),
+                ("overlap_10", "overlap"),
             ):
                 if event[key] != "-":
-                    metrics.append(f"{label} {event[key]}")
+                    qualifiers.append(f"{label} {event[key]}")
+            paper_only = event["source"] == "Historical replay" or (
+                event["source"] == "Live decision"
+                and paper is not None
+                and event["kind"] in {"paper_parent", "paper_addon", "campaign_exit", "reject"}
+            )
             rows.append(
                 {
-                    "signal_ts": event["signal_ts"], "action_ts": event["action_ts"],
-                    "source": event["source"],
-                    "strategy": BREAKOUT_INSTANCE_ID, "slot": event["slot"],
-                    "kind": event["kind"], "side": event["side"],
-                    "reason": event["reason"], "metrics": " · ".join(metrics) or "-",
+                    "signal_ts": event["signal_ts"],
+                    "action_ts": event["action_ts"],
+                    "source": {
+                        "Recorded signal": "Live",
+                        "Live decision": "Decision",
+                        "Historical replay": "Replay",
+                    }.get(str(event["source"]), str(event["source"])),
+                    "strategy": "Breakout*" if paper_only else "Breakout",
+                    "slot": event["slot"],
+                    "kind": event["kind"],
+                    "side": event["side"],
+                    "event": _signal_event(event["kind"], event["side"], event["reason"]),
+                    "detail": _signal_detail(event["reason"], _metadata(event.get("metadata"))),
+                    "reason": event["reason"],
+                    "qualifiers": " · ".join(qualifiers) or "-",
                 }
             )
+
+    def exit_key(row: dict[str, object]) -> tuple[str, str]:
+        action_ts = _parse_ts(row["action_ts"])
+        return (
+            action_ts.isoformat() if action_ts else str(row["action_ts"]),
+            str(row["reason"]),
+        )
+
+    live_exits = {
+        exit_key(row)
+        for row in rows
+        if row["strategy"].startswith("Breakout")
+        and row["source"] == "Live"
+        and row["kind"] == "exit"
+    }
+    collapsed: list[dict[str, object]] = []
+    exit_groups: dict[tuple[str, str], dict[str, object]] = {}
+    for row in rows:
+        if (
+            row["strategy"].startswith("Breakout")
+            and row["source"] == "Decision"
+            and row["kind"] == "campaign_exit"
+            and exit_key(row) in live_exits
+        ):
+            continue
+        if (
+            row["strategy"].startswith("Breakout")
+            and row["source"] == "Live"
+            and row["kind"] == "exit"
+        ):
+            key = exit_key(row)
+            existing = exit_groups.get(key)
+            if existing is not None:
+                slots = existing["_slots"]
+                assert isinstance(slots, list)
+                slots.append(str(row["slot"]).upper())
+                continue
+            row["_slots"] = [str(row["slot"]).upper()]
+            exit_groups[key] = row
+        collapsed.append(row)
+    for row in exit_groups.values():
+        slots = sorted(
+            row.pop("_slots"), key=lambda value: int(value[1:]) if value[1:].isdigit() else 99
+        )
+        if len(slots) > 1:
+            row["slot"] = f"{slots[0]}-{slots[-1]}"
+        else:
+            row["slot"] = slots[0]
+    rows = collapsed
+    # At a shared next-open timestamp, show the observed breakout before its
+    # decision so the table reads in causal order despite newest-first dates.
     rows.sort(
-        key=lambda row: _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
+        key=lambda row: (
+            _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
+            2 if row["kind"] == "signal" else 1 if row["source"] == "Decision" else 0,
+        ),
         reverse=True,
     )
     return rows
@@ -1407,7 +1688,8 @@ def _position_status_rows(
         rows.append(
             {
                 "strategy": (
-                    "Legacy MA" if position and position.get("strategy") == "legacy_ma"
+                    "Legacy MA"
+                    if position and position.get("strategy") == "legacy_ma"
                     else "MA cross"
                 ),
                 "slot": position.get("slot", timeframe) if position else timeframe,
@@ -1492,47 +1774,76 @@ def _position_status_rows(
             "strategy": "Breakout",
             "slot": "campaign",
             "_summary_label": (
-                f"campaign · {len(paper['units'])}/4" if paper is not None
-                else f"campaign · {len(owned)}/4" if owned else "campaign"
+                f"campaign · {len(paper['units'])}/4"
+                if paper is not None
+                else f"campaign · {len(owned)}/4"
+                if owned
+                else "campaign"
             ),
             "_row_title": (
                 "Historical model; no funded venue trades or wallet P&L"
-                if paper is not None else None
+                if paper is not None
+                else None
             ),
             "timeframe": "1d",
             "side": side,
             "contracts": (
                 f"${paper['total_notional_usd']:,.0f}"
-                if paper is not None else f"${funded_notional:,}" if owned else "-"
+                if paper is not None
+                else f"${funded_notional:,}"
+                if owned
+                else "-"
             ),
             "leverage": (
                 f"{paper['leverage']:g}x"
-                if paper is not None else next(iter(funded_leverages))
-                if len(funded_leverages) == 1 else "mixed" if owned else "-"
+                if paper is not None
+                else next(iter(funded_leverages))
+                if len(funded_leverages) == 1
+                else "mixed"
+                if owned
+                else "-"
             ),
             "entry_ts": campaign.get("entry_ts", "-") if isinstance(campaign, dict) else "-",
             "entry_price": _format_price(
                 paper["weighted_entry"] if paper is not None else funded_entry
             ),
             "mark_pnl": (
-                _format_signed_amount(paper['gross_sats'], denomination, btc_price)
-                if paper is not None else _format_signed_amount(
-                    sum(funded_pnl) if all(isinstance(value, int) for value in funded_pnl) else None,
-                    denomination, btc_price,
-                ) if owned else "-"
+                _format_signed_amount(paper["gross_sats"], denomination, btc_price)
+                if paper is not None
+                else _format_signed_amount(
+                    sum(funded_pnl)
+                    if all(isinstance(value, int) for value in funded_pnl)
+                    else None,
+                    denomination,
+                    btc_price,
+                )
+                if owned
+                else "-"
             ),
             "margin": (
                 f"${paper['initial_margin_usd']:,.0f}"
-                if paper is not None else _format_amount(
-                    sum(funded_margins) if all(isinstance(value, int) for value in funded_margins) else None,
-                    denomination, btc_price,
-                ) if owned else "-"
+                if paper is not None
+                else _format_amount(
+                    sum(funded_margins)
+                    if all(isinstance(value, int) for value in funded_margins)
+                    else None,
+                    denomination,
+                    btc_price,
+                )
+                if owned
+                else "-"
             ),
             "funding": (
-                "-" if paper is not None else _format_signed_amount(
+                "-"
+                if paper is not None
+                else _format_signed_amount(
                     sum(int(position.get("accumulated_funding_sats") or 0) for position in owned),
-                    denomination, btc_price, invert=True,
-                ) if owned else "-"
+                    denomination,
+                    btc_price,
+                    invert=True,
+                )
+                if owned
+                else "-"
             ),
             "long_trigger": "-",
             "short_trigger": "-",
@@ -1545,8 +1856,7 @@ def _position_status_rows(
             for unit in paper["units"]:
                 entry = float(unit["entry_price"])
                 gross_sats = (
-                    round(paper["side"] * notional * (1 / entry - 1 / mark) * 1e8)
-                    if mark else None
+                    round(paper["side"] * notional * (1 / entry - 1 / mark) * 1e8) if mark else None
                 )
                 unit_rows.append(
                     {
@@ -1562,7 +1872,8 @@ def _position_status_rows(
                         "funding": "-",
                         "mark_pnl": (
                             _format_signed_amount(gross_sats, denomination, btc_price)
-                            if mark else "-"
+                            if mark
+                            else "-"
                         ),
                     }
                 )
@@ -1580,7 +1891,9 @@ def _position_status_rows(
                     "entry_price": _format_price(position.get("entry_price")),
                     "margin": _format_amount(position.get("margin_sats"), denomination, btc_price),
                     "funding": _format_signed_amount(
-                        position.get("accumulated_funding_sats"), denomination, btc_price,
+                        position.get("accumulated_funding_sats"),
+                        denomination,
+                        btc_price,
                         invert=True,
                     ),
                     "mark_pnl": _format_signed_amount(
@@ -1591,13 +1904,24 @@ def _position_status_rows(
             ]
             campaign_row["_children"] = unit_rows
         rows.append(campaign_row)
+    for row in rows:
+        for value in [row, *row.get("_children", [])]:
+            size = str(value.get("contracts") or "-")
+            leverage = str(value.get("leverage") or "-")
+            if size != "-" and leverage != "-":
+                value["exposure"] = (
+                    f"{size} · {leverage if leverage.endswith('x') else leverage + 'x'}"
+                )
+            else:
+                value["exposure"] = size
+            value["exit_watch"] = value.get("exit_trigger", "-")
     return rows
 
 
 def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
     """Return exact completed isolated-trade P&L components at close time."""
     grouped: dict[str, dict[str, dict[str, object]]] = {}
-    for order in reversed(_orders(db_path)):
+    for order in reversed(_orders(db_path, limit=None)):
         trade_id = str(order.get("trade_id") or "")
         if not trade_id:
             continue
@@ -1894,7 +2218,7 @@ def _strategy_performance_rows(
     labels = ("MA 1d", "MA 4h", "Breakout units", "Combined")
     open_started: dict[str, list[datetime]] = {label: [] for label in labels}
     grouped: dict[str, dict[str, dict[str, object]]] = {}
-    for order in reversed(_orders(db_path)):
+    for order in reversed(_orders(db_path, limit=None)):
         trade_id = str(order.get("trade_id") or "")
         if not trade_id or order.get("action") not in {"open", "close"}:
             continue
@@ -2025,8 +2349,10 @@ def _account_profitability_rows(
             "deposits": _amount_html(exchange.deposits_sats, denomination, btc_price),
             "withdrawals": _amount_html(exchange.withdrawals_sats, denomination, btc_price),
             "net_deposits": _amount_html(net_deposits, denomination, btc_price),
-            "cashflow_adjusted_pnl": _format_signed_amount(adjusted_pnl, denomination, btc_price),
-            "return_on_net_deposits": _signed_percent_html(return_pct),
+            "equity_less_listed_flows": _format_signed_amount(
+                adjusted_pnl, denomination, btc_price
+            ),
+            "ratio_to_listed_net_flows": _signed_percent_html(return_pct),
         }
     ]
 
@@ -2172,7 +2498,7 @@ def _strategy_accounting_panel(
         row = by_strategy.get(strategy_id)
         display.append(
             {
-                "strategy": strategy_id or "legacy_ma",
+                "strategy": _strategy_label(strategy_id or "legacy_ma"),
                 "trades": row["trades"] if row else 0,
                 "opening_fees": _format_signed_amount(
                     row["opening_fees"] if row else 0, denomination, btc_price
@@ -2207,7 +2533,7 @@ def _overview(
     exchange: ExchangeSnapshot | None,
 ) -> str:
     price, _, _ = _market_context(db_path)
-    orders = _orders(db_path)
+    orders = _orders(db_path, limit=None)
     positions = _open_positions(db_path, orders, price, exchange)
     levels = _ma_levels(db_path, _strategy_tolerance(run))
     breakout_state = _persisted_breakout_state(db_path)
@@ -2224,21 +2550,48 @@ def _overview(
         if position.get("strategy") in {"legacy_ma", "ma_cross_primary"}
     }
     cooldowns = _persisted_cooldowns(db_path)
-    cards = "".join(
-        (
-            _position_card(
-                "1d", by_timeframe.get("1d"), denomination, price, levels.get("1d"), cooldowns["1d"]
-            ),
-            _position_card(
-                "4h", by_timeframe.get("4h"), denomination, price, levels.get("4h"), cooldowns["4h"]
-            ),
-            _breakout_card(breakout, denomination, price) if breakout_enabled else "",
-            _pnl_card(pnl, denomination, pnl_window, price),
+    ma_cards = "".join(
+        _position_card(
+            timeframe,
+            by_timeframe.get(timeframe),
+            denomination,
+            price,
+            levels.get(timeframe),
+            cooldowns[timeframe],
         )
+        for timeframe in TIMEFRAMES
     )
-    signal_rows_by_tf = {timeframe: _signals(db_path, tf=timeframe)[:5] for timeframe in TIMEFRAMES}
+    strategy_board = (
+        '<div class="strategy-board">'
+        '<section class="strategy-group ma-group"><header><b>MA cross</b><span>1d / 4h</span></header>'
+        f'<div class="ma-slots">{ma_cards}</div></section>'
+        + (
+            '<section class="strategy-group breakout-group"><header><b>Breakout</b>'
+            "<span>1d campaign</span></header>"
+            + _breakout_card(breakout, denomination, price)
+            + "</section>"
+            if breakout_enabled
+            else ""
+        )
+        + '<section class="strategy-group account-group"><header><b>Account</b>'
+        "<span>shared wallet</span></header>"
+        + _pnl_card(pnl, denomination, pnl_window, price)
+        + "</section></div>"
+    )
     paper = _historical_paper_position(breakout, price) if breakout_enabled else None
-    breakout_signals = _breakout_activity_rows(db_path, breakout_state, paper)[:5]
+    recent_signals: list[dict[str, object]] = []
+    per_stream: dict[tuple[str, str], int] = {}
+    for signal in _signal_timeline_rows(db_path, None, breakout_state, paper):
+        stream = (
+            str(signal["strategy"]),
+            str(signal["slot"]) if signal["strategy"] == "MA cross" else "campaign",
+        )
+        if per_stream.get(stream, 0) >= 4:
+            continue
+        recent_signals.append(signal)
+        per_stream[stream] = per_stream.get(stream, 0) + 1
+        if len(recent_signals) == 10:
+            break
     funding_rows = [
         dict(row)
         for row in _query(
@@ -2249,7 +2602,7 @@ def _overview(
     funding_display = [
         {
             "ts": row["ts"],
-            "strategy": owners.get(str(row["trade_id"]), ("unknown", "-"))[0],
+            "strategy": _strategy_label(owners.get(str(row["trade_id"]), ("unknown", "-"))[0]),
             "slot": owners.get(str(row["trade_id"]), ("unknown", "-"))[1],
             "funding": _format_signed_amount(row["fee_sats"], denomination, price, invert=True),
         }
@@ -2257,9 +2610,9 @@ def _overview(
     ]
     return "".join(
         (
-            "<h1>Operational overview</h1><div class=cards>",
-            cards,
-            "</div><div class=overview-grid><div class=full-width>",
+            "<h1>Operational overview</h1>",
+            strategy_board,
+            "<div class=overview-grid><div class=full-width>",
             _table(
                 "Active positions",
                 _position_status_rows(
@@ -2270,42 +2623,28 @@ def _overview(
                     "slot",
                     "side",
                     "entry_ts",
-                    "contracts",
-                    "leverage",
+                    "exposure",
                     "entry_price",
-                    "exit_trigger",
-                    "margin",
-                    "funding",
                     "mark_pnl",
+                    "funding",
+                    "exit_watch",
                 ),
             ),
             "</div><div class=activity-grid>",
+            '<div class="signals-activity">',
             _table(
-                "Latest MA 1d signals",
-                signal_rows_by_tf["1d"],
-                ("ts", "kind", "reason"),
+                "Recent signals",
+                recent_signals,
+                ("signal_ts", "strategy", "slot", "event", "detail"),
             ),
-            _table(
-                "Latest MA 4h signals",
-                signal_rows_by_tf["4h"],
-                ("ts", "kind", "reason"),
-            ),
-            '<div class="breakout-activity">',
-            _table(
-                "Latest breakout signals",
-                breakout_signals,
-                (
-                    "action_ts", "slot", "source", "reason",
-                ),
-            ),
-            '<a class="activity-more" href="/signals?tf=breakout">All breakout signals →</a>',
+            '<a class="activity-more" href="/signals">All signals →</a>',
+            "<p class=muted>* Historical paper campaign decision.</p>"
+            if any(signal["strategy"] == "Breakout*" for signal in recent_signals)
+            else "",
             "</div>",
             _table("Latest funding", funding_display, ("ts", "strategy", "slot", "funding")),
             "</div></div>",
             _portfolio_panel(),
-            _strategy_accounting_panel(
-                db_path, denomination, price, breakout_enabled=breakout_enabled
-            ),
         )
     )
 
@@ -2320,6 +2659,125 @@ def _sidebar_status(run: dict[str, object], last_bar: datetime | None) -> str:
     )
 
 
+def _execution_alignment(
+    db_path: Path,
+    positions: list[dict[str, object]],
+    exchange: ExchangeSnapshot | None,
+    *,
+    breakout_enabled: bool = False,
+) -> tuple[str, str, str]:
+    """Summarize current reconciliation evidence without journaling a signal."""
+    if _table_columns(db_path, "execution_commands"):
+        unresolved = _query(
+            db_path,
+            "SELECT COUNT(*) AS n FROM execution_commands WHERE action='entry' AND status IN ('submitted','received')",
+        )
+        count = int(unresolved[0]["n"])
+        if count:
+            return (
+                "Action needed",
+                f"{count} entry outcome(s) unresolved; new entries blocked",
+                "alert",
+            )
+    try:
+        rows = _query(
+            db_path,
+            "SELECT state_json FROM strategy_state_snapshots "
+            "WHERE mode = 'live' AND strategy_name IN (?, ?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+            ("ma_cross_primary", MA_STRATEGY_NAME, "ma_cross_primary"),
+        )
+    except sqlite3.Error:
+        rows = []
+    if not rows:
+        return "Unknown", "No MA state snapshot", "unknown"
+
+    ma_state = _metadata(rows[0]["state_json"])
+    pending: list[str] = []
+    issues: list[str] = []
+    ma_positions = {
+        str(position["slot"]): position
+        for position in positions
+        if position.get("strategy") in {"legacy_ma", "ma_cross_primary"}
+    }
+    timeframes = _metadata(ma_state.get("timeframes"))
+    if any(slot not in timeframes for slot in TIMEFRAMES):
+        return "Unknown", "Incomplete MA state snapshot", "unknown"
+    for slot in TIMEFRAMES:
+        verdict = _metadata(timeframes.get(slot)).get("verdict")
+        expected_side = {"UP_TRUE": "long", "DOWN_TRUE": "short"}.get(verdict)
+        actual_side = ma_positions.get(slot, {}).get("side")
+        if expected_side and actual_side and actual_side != expected_side:
+            issues.append(f"MA {slot} opposes {_verdict_label(verdict)} verdict")
+    for slot, target in _metadata(ma_state.get("pending_position_reconciliation")).items():
+        if target:
+            pending.append(f"MA {slot} → {target}")
+
+    breakout_state = _persisted_breakout_state(db_path)
+    breakout_owned = {
+        str(position["slot"])
+        for position in positions
+        if position.get("strategy") == BREAKOUT_INSTANCE_ID
+    }
+    if breakout_state is None and breakout_owned:
+        issues.append("Funded breakout units lack a saved strategy state")
+    elif breakout_state is None and breakout_enabled:
+        return "Unknown", "No breakout state snapshot", "unknown"
+    if breakout_state is not None:
+        machine = _metadata(breakout_state.get("machine"))
+        campaign = machine.get("campaign")
+        complete = machine.get(
+            "historical_model_complete",
+            not isinstance(campaign, dict) or campaign.get("origin") != "historical",
+        )
+        if not complete or not machine.get("historical_funding_available", complete):
+            issues.append(
+                "Historical occupancy needs verified reconstruction; new breakout entries blocked"
+            )
+        closing = set(breakout_state.get("closing_slots") or [])
+        if closing:
+            pending.append("Breakout closing " + ", ".join(sorted(closing)))
+        if isinstance(campaign, dict) and campaign.get("origin") == "live":
+            units = campaign.get("units")
+            expected = (
+                {
+                    f"k{unit['k']}"
+                    for unit in units
+                    if isinstance(unit, dict) and unit.get("origin") == "live"
+                }
+                if isinstance(units, list)
+                else set()
+            )
+            if expected != breakout_owned and not closing:
+                issues.append("Breakout units disagree with saved campaign")
+        elif breakout_owned and not closing:
+            issues.append("Funded breakout units lack a live campaign")
+
+    venue_fresh = exchange is not None and datetime.now(UTC) - exchange.fetched_at <= timedelta(
+        seconds=60
+    )
+    if venue_fresh and exchange is not None:
+        recorded_ids = {
+            str(position["trade_id"]) for position in positions if position.get("trade_id")
+        }
+        missing = {trade_id for trade_id in recorded_ids if trade_id not in exchange.trades}
+        if missing:
+            issues.append(f"{len(missing)} recorded trade(s) absent at venue")
+        untracked = set(exchange.trades) - recorded_ids
+        if untracked:
+            issues.append(f"{len(untracked)} venue trade(s) absent from bot ledger")
+    if issues:
+        return "Action needed", "; ".join(issues), "alert"
+    if pending:
+        return "Pending", "; ".join(pending), "pending"
+    if not venue_fresh:
+        return (
+            "Venue unchecked",
+            "Local state has no pending action; venue data unavailable or stale",
+            "unknown",
+        )
+    return "Aligned", f"{len(positions)} recorded position(s) verified at venue", "healthy"
+
+
 def _topbar(
     db_path: Path, run: dict[str, object], denomination: str, exchange: ExchangeSnapshot | None
 ) -> str:
@@ -2329,7 +2787,7 @@ def _topbar(
         "SELECT ts, balance_sats, equity_sats, margin_used_sats FROM account_snapshots ORDER BY id DESC LIMIT 1",
     )
     snapshot = dict(snapshots[0]) if snapshots else {}
-    positions = _open_positions(db_path, _orders(db_path), price, exchange)
+    positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
     local_unrealized = sum(
         int(position["estimated_unrealized_sats"])
         for position in positions
@@ -2340,6 +2798,15 @@ def _topbar(
     total = exchange.total_sats if exchange else balance + local_margin + local_unrealized
     available = exchange.available_sats if exchange else balance
     running_pl = exchange.running_pl_sats if exchange else local_unrealized
+    alignment, alignment_detail, alignment_class = _execution_alignment(
+        db_path,
+        positions,
+        exchange,
+        breakout_enabled=(
+            bool(_metadata(run.get("config_json")).get("strategy_breakout_enabled"))
+            or BREAKOUT_INSTANCE_ID in _metadata(run.get("strategy_params_json"))
+        ),
+    )
     change_html = (
         "".join(
             f"<span><b>{row['period']}</b> {_signed_percent_html(str(row['change']).rstrip('%'))}</span>"
@@ -2358,6 +2825,9 @@ def _topbar(
         '<div class="equity-main"><span>Mark P&amp;L</span><strong>'
         f"{_signed_amount_html(running_pl, denomination, price)}</strong></div>"
         f"<small>available {_amount_html(available, denomination, price)}</small></div>"
+        f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
+        f"<strong>{html.escape(alignment)}</strong>"
+        f"<small>{html.escape(alignment_detail)}</small></div>"
     )
 
 
@@ -2507,7 +2977,9 @@ def _strategy_explainer(run: dict[str, object]) -> str:
             "distance cap. Campaign exits are the original range close, day-85 peak recovery, "
             "day-120 cap, or isolated liquidation. The configured unit is "
             f"${float(params.get('unit_notional_usd', 0)):,.0f} at "
-            f"{float(params.get('leverage', 0)):g}x.</p>"
+            f"{float(params.get('leverage', 0)):g}x. New funded entries: "
+            f"{_breakout_mode_label(params.get('direction_mode', 'both'))}. "
+            "Existing campaigns retain their exits.</p>"
         )
     return (
         "<section class=strategy-explainer><h2>How the active strategies behave</h2>"
@@ -2535,6 +3007,8 @@ def _presentation_style() -> str:
 .page-header{display:none}:root{--sidebar-width:176px}html,body{font-size:12px}.brand{font-size:1.15rem}.brand-sub,.nav-label{font-size:.72rem}.nav-link{font-size:.9rem}.content{padding-top:1.7rem}h1{font-size:1.7rem}.cards{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.card strong{font-size:1.45rem}.card p,.card small{font-size:.8rem}table{font-size:.9rem}th{font-size:.72rem}.sat-symbol{font-style:normal;margin-left:.08em}.market-changes{display:flex;gap:.35rem;flex-wrap:wrap;color:var(--muted);font-size:.7rem;margin:.4rem 0}.market-changes b{color:var(--text);margin-right:.1rem}.sidebar-controls{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;padding:0 .5rem}.sidebar-control-group{display:flex;flex-direction:column;gap:.35rem}.denom-controls{display:flex;gap:.35rem}.denom-toggle,.pnl-toggle,.period-toggle{border:1px solid var(--border-hover);border-radius:4px;color:var(--muted);padding:.18rem .42rem;text-decoration:none;font-size:.74rem}.denom-toggle:hover,.denom-toggle.active,.pnl-toggle:hover,.pnl-toggle.active,.period-toggle:hover,.period-toggle.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}.position-card.long{border-color:var(--accent)}.position-card.short{border-color:#f87171}.position-card.short strong{color:#f87171}.position-card.flat{opacity:.62}.pnl-card small{display:flex;gap:.3rem;align-items:center;flex-wrap:wrap}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1.2rem}.overview-grid .full-width{grid-column:1/-1}.overview-grid .full-width .table-wrap{width:100%}.activity-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 1.2rem}.activity-grid .table-wrap{width:100%}.compact-table .table-wrap{width:max-content;max-width:100%}.compact-table table{width:auto}.copy-id{border:1px solid var(--border-hover);border-radius:3px;background:var(--surface-2);color:var(--muted);font:inherit;font-size:.72rem;padding:.08rem .3rem;cursor:pointer}.copy-id:hover{border-color:var(--accent);color:var(--accent)}.period-controls{display:flex;gap:.35rem;flex-wrap:wrap;margin:-.15rem 0 1rem}.pagination{display:flex;align-items:center;gap:.65rem;margin-top:.65rem;color:var(--muted)}.pagination a{color:var(--accent);text-decoration:none}.topbar{display:flex;align-items:center;gap:1.4rem;flex-wrap:wrap;border-bottom:1px solid var(--border);padding:0 0 1rem;margin-bottom:1.7rem}.topbar-status,.topbar-metric,.topbar-market{display:flex;flex-direction:column;gap:.1rem}.topbar-status{flex-direction:row;align-items:center;gap:.55rem;margin-right:auto}.topbar span{color:var(--muted);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase}.topbar b,.topbar strong{font-size:.92rem}.topbar small{color:var(--muted);font-size:.7rem}.status-dot{width:.58rem;height:.58rem;border-radius:99px;background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.12)}.status-dot.healthy{background:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:.8rem}.config-group{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.9rem}.config-group h2{margin:0 0 .6rem;font-size:.72rem}.config-group dl{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.38rem .7rem;font-size:.8rem}.config-group dt{color:var(--muted)}.config-group dd{text-align:right}.strategy-explainer{max-width:76rem}.strategy-explainer p{color:var(--muted);margin:.65rem 0;line-height:1.7}.strategy-explainer b{color:var(--text)}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.overview-grid,.config-grid{grid-template-columns:1fr}.topbar-status{margin-right:0;width:100%}}@media(max-width:700px){html,body{font-size:12px}.content{padding:1.25rem}.topbar{gap:.9rem}.topbar-status{width:100%}}
 .pnl-page-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.25rem}.pnl-page-heading h1{margin:0}.pnl-basis-actions{display:flex;align-items:center;justify-content:flex-end;gap:.4rem;flex-wrap:wrap}@media(max-width:700px){.pnl-page-heading{align-items:flex-start;flex-direction:column}.pnl-basis-actions{justify-content:flex-start}}
 .config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+.activity-grid{grid-template-columns:minmax(0,2fr) minmax(240px,1fr);gap:0 1.2rem;align-items:start}.signals-activity{min-width:0}.signals-activity .table-wrap{max-width:100%}.topbar-alignment{display:flex;flex-direction:column;gap:.12rem;min-width:150px;max-width:290px;border-left:1px solid var(--border);padding-left:1rem}.topbar-alignment strong{font-size:.88rem}.topbar-alignment.healthy strong{color:var(--accent)}.topbar-alignment.alert strong{color:#f87171}.topbar-alignment.pending strong{color:#fbbf24}.topbar-alignment small{line-height:1.25}.signals-activity td:nth-child(5){white-space:normal;min-width:12rem}.stack-summary-row td:last-child{white-space:normal;min-width:11rem}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.topbar-alignment{border-left:0;padding-left:0}}
+.strategy-board{display:grid;grid-template-columns:minmax(390px,2fr) minmax(220px,1fr) minmax(220px,1fr);gap:.8rem;align-items:stretch}.strategy-group{min-width:0;display:flex;flex-direction:column}.strategy-group header{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;margin:0 0 .45rem;padding:0 .15rem;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}.strategy-group header b{color:var(--text)}.strategy-group .card{flex:1}.ma-slots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;flex:1}.ma-slots .card{min-width:0}@media(max-width:1300px){.strategy-board{grid-template-columns:repeat(2,minmax(0,1fr))}.ma-group{grid-column:1/-1}}@media(max-width:800px){.strategy-board{grid-template-columns:1fr}.ma-group{grid-column:auto}}@media(max-width:520px){.ma-slots{grid-template-columns:1fr}}
 </style>"""
 
 
@@ -2554,23 +3028,23 @@ def _detail_page(
     if page == "signals":
         breakout_state = _persisted_breakout_state(db_path)
         btc_price, _, _ = _market_context(db_path)
-        positions = _open_positions(db_path, _orders(db_path), btc_price, exchange)
+        positions = _open_positions(db_path, _orders(db_path, limit=None), btc_price, exchange)
         context = _breakout_context(breakout_state, positions)
         paper = _historical_paper_position(context, btc_price)
-        return _table(
-            "Signals" + suffix,
-            _signal_timeline_rows(db_path, tf, breakout_state, paper),
-            (
-                "signal_ts",
-                "action_ts",
-                "source",
-                "strategy",
-                "slot",
-                "kind",
-                "side",
-                "reason",
-                "metrics",
-            ),
+        return (
+            _table(
+                "Signals" + suffix,
+                _signal_timeline_rows(db_path, tf, breakout_state, paper),
+                (
+                    "signal_ts",
+                    "strategy",
+                    "slot",
+                    "event",
+                    "detail",
+                    "qualifiers",
+                ),
+            )
+            + "<p class=muted>* Historical paper campaign decision; no funded order.</p>"
         )
     if page == "trades":
         price, _, _ = _market_context(db_path)
@@ -2596,11 +3070,11 @@ def _detail_page(
         )
     if page == "funding":
         price, _, _ = _market_context(db_path)
-        owners = _trade_owners(_orders(db_path))
+        owners = _trade_owners(_orders(db_path, limit=None))
         rows = [
             {
                 **dict(row),
-                "strategy": owners.get(str(row["trade_id"]), ("unknown", "-"))[0],
+                "strategy": _strategy_label(owners.get(str(row["trade_id"]), ("unknown", "-"))[0]),
                 "slot": owners.get(str(row["trade_id"]), ("unknown", "-"))[1],
                 "funding_pnl": _format_signed_amount(
                     row["fee_sats"], denomination, price, invert=True
@@ -2625,7 +3099,7 @@ def _detail_page(
         )
     if page == "pnl":
         price, _, _ = _market_context(db_path)
-        positions = _open_positions(db_path, _orders(db_path), price, exchange)
+        positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
         constant = pnl_basis == "constant"
         nominal_usd = CONSTANT_NOTIONAL_USD
         raw_summary = (
@@ -2744,18 +3218,19 @@ def _detail_page(
                 compact=True,
             )
             + _table(
-                "Account profitability · actual",
+                "Account equity vs listed external transfers",
                 _account_profitability_rows(exchange, denomination, price),
                 (
                     "equity",
                     "deposits",
                     "withdrawals",
                     "net_deposits",
-                    "cashflow_adjusted_pnl",
-                    "return_on_net_deposits",
+                    "equity_less_listed_flows",
+                    "ratio_to_listed_net_flows",
                 ),
                 compact=True,
             )
+            + '<p class="note">Transfer scope: Lightning and on-chain only. Internal transfers and other account adjustments are excluded. This comparison is not strategy P&amp;L or a time-weighted return.</p>'
         )
     if page == "runs":
         active_details = [
@@ -2917,12 +3392,12 @@ def _render(
         ".stack-unit-row{display:none;background:var(--surface-2)}"
         ".stack-unit-row.stack-visible{display:table-row}"
         ".stack-unit-row td:nth-child(2){padding-left:1.5rem;color:var(--muted)}"
-        ".stack-summary-row td:nth-child(8){white-space:normal;min-width:11rem}</style>",
+        ".stack-summary-row td:nth-child(9){white-space:normal;min-width:11rem}</style>",
     )
     template = template.replace(
         "</style>",
-        ".activity-grid .breakout-activity{grid-column:1/-1;min-width:0}"
-        ".activity-grid .breakout-activity .table-wrap{max-width:100%}"
+        ".activity-grid .signals-activity{min-width:0}"
+        ".activity-grid .signals-activity .table-wrap{max-width:100%}"
         ".activity-more{display:inline-block;margin:.45rem 0;color:var(--accent);font-size:.75rem;text-decoration:none}</style>",
     )
     refresh_script = """<script>

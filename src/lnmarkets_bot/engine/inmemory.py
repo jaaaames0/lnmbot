@@ -6,41 +6,46 @@ transactions, which dominates runtime (~14 min for the 6m fixture).
 
 This module runs the SAME strategy and executor code in memory, accumulates
 all events into Python lists, and bulk-inserts at the end in a single
-transaction. Target: ~5× speedup on 6m, more on 2y.
+transaction. Target: ~5x speedup on 6m, more on 2y.
 
 API-compatible with `run_backtest` — same args, same return (run_id).
 The strategy and executor code is unchanged.
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import insert, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from ..config import BotConfig
 from ..control.kill import KillSwitch
 from ..control.lifecycle import run_session
-from ..data.source import DataSource
 from ..persistence.db import init_schema, make_engine, make_session_factory
 from ..persistence.models import (
     account_snapshots,
     bars,
-    daily_pnl,
     fills,
-    orders as orders_t,
     risk_events,
-    runs as runs_t,
+)
+from ..persistence.models import (
+    orders as orders_t,
+)
+from ..persistence.models import (
     signals as signals_t,
 )
 from ..persistence.recorder import Recorder
 from ..risk.guard import RiskGuard
 from ..risk.limits import from_config as limits_from_config
-from ..strategy import OrderIntent, Strategy, StrategyState, intents_to_list
+from ..strategy import Strategy, StrategyState, intents_to_list
 from .fills import PaperFillExecutor
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from ..config import BotConfig
+    from ..data.source import DataSource
 
 _log = logging.getLogger("lnmarkets_bot.engine.inmemory")
 
@@ -49,6 +54,7 @@ _log = logging.getLogger("lnmarkets_bot.engine.inmemory")
 class _Buffer:
     """In-memory buffer for all event types. Filled during the run,
     flushed in a single transaction at the end."""
+
     bars: list[dict] = field(default_factory=list)
     signals: list[dict] = field(default_factory=list)
     orders: list[dict] = field(default_factory=list)
@@ -104,15 +110,11 @@ class BufferedRecorder:
         # Insert the run row immediately so the lifecycle helper can use the
         # run_id. Other events are buffered.
         # We delegate to the regular Recorder for the single start_run insert.
-        raise NotImplementedError(
-            "BufferedRecorder needs run_id from outside; use run_inmemory()"
-        )
+        raise NotImplementedError("BufferedRecorder needs run_id from outside; use run_inmemory()")
 
     def end_run(self, run_id: int, *, status: str, ended_at: datetime) -> None:
         # End_run is delegated to the regular recorder for this run row.
-        raise NotImplementedError(
-            "BufferedRecorder end_run is handled by run_inmemory()"
-        )
+        raise NotImplementedError("BufferedRecorder end_run is handled by run_inmemory()")
 
     def record_bar(
         self,
@@ -125,11 +127,17 @@ class BufferedRecorder:
         close: float,
         volume: float,
     ) -> None:
-        self._buf.bars.append({
-            "run_id": run_id, "ts": ts,
-            "open": open, "high": high, "low": low,
-            "close": close, "volume": volume,
-        })
+        self._buf.bars.append(
+            {
+                "run_id": run_id,
+                "ts": ts,
+                "open": open,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }
+        )
 
     def record_signal(
         self,
@@ -144,14 +152,19 @@ class BufferedRecorder:
         metadata: dict[str, Any] | None = None,
     ) -> int:
         sid = self._buf.alloc_signal_id()
-        self._buf.signals.append({
-            "id": sid, "run_id": run_id, "ts": ts,
-            "kind": kind, "side": side,
-            "target_size_usd": target_size_usd,
-            "target_leverage": target_leverage,
-            "reason": reason,
-            "metadata_json": metadata or {},
-        })
+        self._buf.signals.append(
+            {
+                "id": sid,
+                "run_id": run_id,
+                "ts": ts,
+                "kind": kind,
+                "side": side,
+                "target_size_usd": target_size_usd,
+                "target_leverage": target_leverage,
+                "reason": reason,
+                "metadata_json": metadata or {},
+            }
+        )
         return sid
 
     def record_order(
@@ -171,15 +184,23 @@ class BufferedRecorder:
         metadata: dict[str, Any] | None = None,
     ) -> int:
         oid = self._buf.alloc_order_id()
-        self._buf.orders.append({
-            "id": oid, "run_id": run_id, "signal_id": signal_id,
-            "ts": ts, "trigger_tf": trigger_tf, "side": side,
-            "qty_sats": qty_sats, "leverage": leverage,
-            "price_usd": price_usd, "status": status,
-            "lnm_order_id": lnm_order_id,
-            "rejection_reason": rejection_reason,
-            "metadata_json": metadata or {},
-        })
+        self._buf.orders.append(
+            {
+                "id": oid,
+                "run_id": run_id,
+                "signal_id": signal_id,
+                "ts": ts,
+                "trigger_tf": trigger_tf,
+                "side": side,
+                "qty_sats": qty_sats,
+                "leverage": leverage,
+                "price_usd": price_usd,
+                "status": status,
+                "lnm_order_id": lnm_order_id,
+                "rejection_reason": rejection_reason,
+                "metadata_json": metadata or {},
+            }
+        )
         return oid
 
     def update_order_status(
@@ -204,11 +225,16 @@ class BufferedRecorder:
         fee_sats: int,
     ) -> int:
         fid = self._buf.alloc_fill_id()
-        self._buf.fills.append({
-            "id": fid, "order_id": order_id, "ts": ts,
-            "qty_sats": qty_sats, "price_usd": price_usd,
-            "fee_sats": fee_sats,
-        })
+        self._buf.fills.append(
+            {
+                "id": fid,
+                "order_id": order_id,
+                "ts": ts,
+                "qty_sats": qty_sats,
+                "price_usd": price_usd,
+                "fee_sats": fee_sats,
+            }
+        )
         return fid
 
     def record_account_snapshot(
@@ -221,12 +247,16 @@ class BufferedRecorder:
         margin_used_sats: int,
         unrealized_pnl_sats: int,
     ) -> None:
-        self._buf.account_snapshots.append({
-            "run_id": run_id, "ts": ts,
-            "balance_sats": balance_sats, "equity_sats": equity_sats,
-            "margin_used_sats": margin_used_sats,
-            "unrealized_pnl_sats": unrealized_pnl_sats,
-        })
+        self._buf.account_snapshots.append(
+            {
+                "run_id": run_id,
+                "ts": ts,
+                "balance_sats": balance_sats,
+                "equity_sats": equity_sats,
+                "margin_used_sats": margin_used_sats,
+                "unrealized_pnl_sats": unrealized_pnl_sats,
+            }
+        )
 
     def record_risk_event(
         self,
@@ -239,11 +269,16 @@ class BufferedRecorder:
     ) -> None:
         rid = self._buf.next_risk_event_id
         self._buf.next_risk_event_id += 1
-        self._buf.risk_events.append({
-            "id": rid, "run_id": run_id, "ts": ts,
-            "kind": kind, "signal_id": signal_id,
-            "detail_json": detail or {},
-        })
+        self._buf.risk_events.append(
+            {
+                "id": rid,
+                "run_id": run_id,
+                "ts": ts,
+                "kind": kind,
+                "signal_id": signal_id,
+                "detail_json": detail or {},
+            }
+        )
 
     def upsert_daily_pnl(
         self,
@@ -265,8 +300,9 @@ def flush_buffer(engine, buf: _Buffer) -> None:
     risk_events to avoid collisions with rows that may already exist in the
     DB (e.g. when reusing a fixture across runs).
     """
-    if not any([buf.bars, buf.signals, buf.orders, buf.fills,
-                buf.account_snapshots, buf.risk_events]):
+    if not any(
+        [buf.bars, buf.signals, buf.orders, buf.fills, buf.account_snapshots, buf.risk_events]
+    ):
         return
     # Offset buffered IDs by the current max in each table so we don't
     # collide with existing rows. The order's signal_id and fill's order_id
@@ -277,25 +313,49 @@ def flush_buffer(engine, buf: _Buffer) -> None:
         fill_offset = 0
         risk_offset = 0
         if buf.signals:
-            sig_offset = conn.execute(
-                select(__import__('sqlalchemy').func.coalesce(
-                    __import__('sqlalchemy').func.max(signals_t.c.id), 0))
-            ).scalar() or 0
+            sig_offset = (
+                conn.execute(
+                    select(
+                        __import__("sqlalchemy").func.coalesce(
+                            __import__("sqlalchemy").func.max(signals_t.c.id), 0
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
         if buf.orders:
-            ord_offset = conn.execute(
-                select(__import__('sqlalchemy').func.coalesce(
-                    __import__('sqlalchemy').func.max(orders_t.c.id), 0))
-            ).scalar() or 0
+            ord_offset = (
+                conn.execute(
+                    select(
+                        __import__("sqlalchemy").func.coalesce(
+                            __import__("sqlalchemy").func.max(orders_t.c.id), 0
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
         if buf.fills:
-            fill_offset = conn.execute(
-                select(__import__('sqlalchemy').func.coalesce(
-                    __import__('sqlalchemy').func.max(fills.c.id), 0))
-            ).scalar() or 0
+            fill_offset = (
+                conn.execute(
+                    select(
+                        __import__("sqlalchemy").func.coalesce(
+                            __import__("sqlalchemy").func.max(fills.c.id), 0
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
         if buf.risk_events:
-            risk_offset = conn.execute(
-                select(__import__('sqlalchemy').func.coalesce(
-                    __import__('sqlalchemy').func.max(risk_events.c.id), 0))
-            ).scalar() or 0
+            risk_offset = (
+                conn.execute(
+                    select(
+                        __import__("sqlalchemy").func.coalesce(
+                            __import__("sqlalchemy").func.max(risk_events.c.id), 0
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
 
         if buf.bars:
             conn.execute(insert(bars), buf.bars)
@@ -304,15 +364,19 @@ def flush_buffer(engine, buf: _Buffer) -> None:
             conn.execute(insert(signals_t), rows)
         if buf.orders:
             rows = [
-                {**r, "id": r["id"] + ord_offset,
-                 "signal_id": (r["signal_id"] + sig_offset) if r["signal_id"] is not None else None}
+                {
+                    **r,
+                    "id": r["id"] + ord_offset,
+                    "signal_id": (r["signal_id"] + sig_offset)
+                    if r["signal_id"] is not None
+                    else None,
+                }
                 for r in buf.orders
             ]
             conn.execute(insert(orders_t), rows)
         if buf.fills:
             rows = [
-                {**r, "id": r["id"] + fill_offset,
-                 "order_id": r["order_id"] + ord_offset}
+                {**r, "id": r["id"] + fill_offset, "order_id": r["order_id"] + ord_offset}
                 for r in buf.fills
             ]
             conn.execute(insert(fills), rows)
@@ -320,8 +384,13 @@ def flush_buffer(engine, buf: _Buffer) -> None:
             conn.execute(insert(account_snapshots), buf.account_snapshots)
         if buf.risk_events:
             rows = [
-                {**r, "id": r["id"] + risk_offset,
-                 "signal_id": (r["signal_id"] + sig_offset) if r["signal_id"] is not None else None}
+                {
+                    **r,
+                    "id": r["id"] + risk_offset,
+                    "signal_id": (r["signal_id"] + sig_offset)
+                    if r["signal_id"] is not None
+                    else None,
+                }
                 for r in buf.risk_events
             ]
             conn.execute(insert(risk_events), rows)
@@ -335,7 +404,7 @@ async def run_inmemory(
     duration_seconds: float | None = None,
     install_signal_handlers: bool = True,
 ) -> int:
-    """Same as `run_backtest` but with in-memory recorder. ~5× faster.
+    """Same as `run_backtest` but with in-memory recorder. ~5x faster.
 
     Returns the run_id. Strategy and executor behavior is identical to
     `run_backtest`; only the persistence layer changes.
@@ -352,11 +421,13 @@ async def run_inmemory(
     kill = KillSwitch(cfg=cfg)
 
     state = StrategyState()
-    state.balance_sats = int(cfg.initial_balance_usd * 1e8)
+    # BTC cash is initialized from the first observed mark, before decisions.
+    state.balance_sats = 0
     subscribed_tfs = getattr(type(strategy), "DEFAULTS", {}).get("tfs", ("1d", "4h"))
     if hasattr(strategy, "tfs"):
         subscribed_tfs = strategy.tfs
     from lnmarkets_bot.strategy.base import TfPosition
+
     for tf in subscribed_tfs:
         state.positions.setdefault(tf, TfPosition())
     strategy.on_startup(state)
@@ -385,7 +456,9 @@ async def run_inmemory(
                 if kill.is_halted():
                     log.warning("inmemory.kill_switch run_id=%d", run_id)
                     recorder.record_risk_event(
-                        run_id, ts=bar.ts, kind="kill",
+                        run_id,
+                        ts=bar.ts,
+                        kind="kill",
                         detail={"reason": "halt_file_or_env"},
                     )
                     break
@@ -393,11 +466,18 @@ async def run_inmemory(
                 is_exec_bar = bar.timeframe == "1m"
                 if is_exec_bar:
                     recorder.record_bar(
-                        run_id, ts=bar.ts,
-                        open=bar.open, high=bar.high, low=bar.low,
-                        close=bar.close, volume=bar.volume,
+                        run_id,
+                        ts=bar.ts,
+                        open=bar.open,
+                        high=bar.high,
+                        low=bar.low,
+                        close=bar.close,
+                        volume=bar.volume,
                     )
                 executor.update_price(bar.close)
+                executor.initialize_balance(cfg.initial_balance_usd, bar.close)
+                state.balance_sats = executor.balance_sats or 0
+                state.equity_sats = executor.equity_sats()
                 guard.current_price_usd = bar.close
 
                 intents = intents_to_list(strategy.on_bar(bar, state))
@@ -406,7 +486,9 @@ async def run_inmemory(
                 n_intents += len(intents)
                 for intent in intents:
                     sig_id = recorder.record_signal(
-                        run_id, ts=bar.ts, kind=intent.kind.value,
+                        run_id,
+                        ts=bar.ts,
+                        kind=intent.kind.value,
                         side=intent.side.value if intent.side else None,
                         target_size_usd=intent.size_usd or None,
                         target_leverage=intent.leverage or None,
@@ -414,7 +496,10 @@ async def run_inmemory(
                         metadata={**intent.metadata, "trigger_tf": intent.trigger_tf},
                     )
                     decision = await guard.submit(
-                        intent=intent, signal_id=sig_id, run_id=run_id, ts=bar.ts,
+                        intent=intent,
+                        signal_id=sig_id,
+                        run_id=run_id,
+                        ts=bar.ts,
                     )
                     if decision.decision.value == "rejected":
                         strategy.on_intent_rejected(intent)
@@ -433,14 +518,16 @@ async def run_inmemory(
                         pos.leverage = exec_pos.leverage
                     total_qty_sats += pos.qty_sats
                 strategy.reconcile_execution_state(state)
-                state.equity_sats = int(state.balance_sats + total_qty_sats * bar.close)
+                state.balance_sats = executor.balance_sats or 0
+                state.equity_sats = executor.equity_sats()
                 if is_exec_bar:
                     recorder.record_account_snapshot(
-                        run_id, ts=bar.ts,
+                        run_id,
+                        ts=bar.ts,
                         balance_sats=state.balance_sats,
                         equity_sats=state.equity_sats,
-                        margin_used_sats=abs(total_qty_sats) * 1,
-                        unrealized_pnl_sats=0,
+                        margin_used_sats=executor.margin_used_sats(),
+                        unrealized_pnl_sats=executor.unrealized_pnl_sats(),
                     )
         finally:
             strategy.on_shutdown(state)
@@ -448,8 +535,10 @@ async def run_inmemory(
         # Flush all buffered events to DB in a single transaction
         flush_buffer(engine, buf)
         log.info(
-            "inmemory.done", run_id=run_id,
-            n_bars=n_bars, n_intents=n_intents,
+            "inmemory.done",
+            run_id=run_id,
+            n_bars=n_bars,
+            n_intents=n_intents,
             buffered=len(buf.bars) + len(buf.signals) + len(buf.orders) + len(buf.fills),
             status="done",
         )

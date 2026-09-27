@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import UTC, timedelta
 from typing import TYPE_CHECKING, Any
 
 from ..control.kill import KillSwitch
@@ -35,7 +35,7 @@ class StrategyBinding:
 
     @property
     def state_name(self) -> str:
-        return f"{type(self.strategy).__module__}.{type(self.strategy).__name__}"
+        return self.instance_id
 
     @property
     def subscribed_timeframes(self) -> tuple[str, ...]:
@@ -67,6 +67,28 @@ def _mirror_positions(binding: StrategyBinding, state: StrategyState, executor: 
             pos.entry_ts = exec_pos.entry_ts
 
 
+def _deliver_external(binding, state, events, recorder, run_id):
+    """Commit callback state and delivery acknowledgement as one local unit."""
+    batch_hook = getattr(binding.strategy, "on_external_positions_closed", None)
+    hook = getattr(binding.strategy, "on_external_position_closed", None)
+    if batch_hook is not None:
+        batch_hook(events, state)
+    elif hook is not None:
+        for event in events:
+            hook(event, state)
+    with recorder.atomic():
+        snapshot = binding.strategy.persistent_state()
+        if snapshot is not None:
+            recorder.save_strategy_state(
+                run_id,
+                mode="live",
+                strategy_name=binding.state_name,
+                ts=max(e.observed_at for e in events),
+                state=snapshot,
+            )
+        recorder.acknowledge_commands([f"close:{e.trade_id}" for e in events])
+
+
 async def run_portfolio_live(
     *,
     cfg: BotConfig,
@@ -78,6 +100,8 @@ async def run_portfolio_live(
     account_balance_provider: Any,
     duration_seconds: float | None = None,
     install_signal_handlers: bool = True,
+    historical_funding_provider=None,
+    historical_hydrator=None,
 ) -> int:
     """Run several strategies through one serialized live execution path."""
     if not bindings:
@@ -102,6 +126,10 @@ async def run_portfolio_live(
             state.positions[slot] = TfPosition()
         _mirror_positions(binding, state, executor)
         snapshot = recorder.latest_strategy_state(mode="live", strategy_name=binding.state_name)
+        if snapshot is None:
+            legacy_name = f"{type(binding.strategy).__module__}.{type(binding.strategy).__name__}"
+            if sum(type(b.strategy) is type(binding.strategy) for b in bindings) == 1:
+                snapshot = recorder.latest_strategy_state(mode="live", strategy_name=legacy_name)
         if snapshot is not None:
             if binding.strategy.restore_persistent_state(snapshot["state"]):
                 get_logger("live").info(
@@ -114,9 +142,24 @@ async def run_portfolio_live(
                 raise RuntimeError(
                     f"strategy {binding.instance_id} rejected its persisted live state"
                 )
+        machine = getattr(binding.strategy, "machine", None)
+        if (
+            machine is not None
+            and not machine.historical_model_complete
+            and historical_hydrator is not None
+        ):
+            try:
+                await historical_hydrator(machine)
+            except Exception as exc:
+                # Keep admission blocked and continue funded exposure management.
+                get_logger("live").error("live.historical_rebuild_required", error=str(exc))
         binding.strategy.reconcile_execution_state(state)
-        binding.strategy.on_startup(state)
         states[binding.instance_id] = state
+        pending = getattr(executor, "pending_external_events", lambda: [])()
+        owned_events = [e for e in pending if e.strategy_instance_id == binding.instance_id]
+        if owned_events:
+            _deliver_external(binding, state, owned_events, recorder, executor.run_id)
+        binding.strategy.on_startup(state)
 
     portfolio_params = {
         binding.instance_id: {
@@ -171,33 +214,26 @@ async def run_portfolio_live(
                         for binding in bindings:
                             _mirror_positions(binding, states[binding.instance_id], executor)
                         bindings_by_id = {value.instance_id: value for value in bindings}
-                        for event in external_events:
-                            owner_binding = bindings_by_id.get(event.strategy_instance_id)
-                            if owner_binding is None:
-                                raise RuntimeError(
-                                    "externally closed trade has no owning strategy binding"
-                                )
-                            hook = getattr(
-                                owner_binding.strategy, "on_external_position_closed", None
+                        if any(
+                            e.strategy_instance_id not in bindings_by_id for e in external_events
+                        ):
+                            raise RuntimeError(
+                                "externally closed trade has no owning strategy binding"
                             )
-                            if hook is None:
-                                log.critical(
-                                    "live.external_close_unhandled",
-                                    strategy_instance_id=event.strategy_instance_id,
-                                    position_key=event.position_key,
-                                    trade_id=event.trade_id,
+                        for binding in bindings:
+                            owned_events = [
+                                e
+                                for e in external_events
+                                if e.strategy_instance_id == binding.instance_id
+                            ]
+                            if owned_events:
+                                _deliver_external(
+                                    binding,
+                                    states[binding.instance_id],
+                                    owned_events,
+                                    recorder,
+                                    run_id,
                                 )
-                            else:
-                                hook(event, states[owner_binding.instance_id])
-                                persistent = owner_binding.strategy.persistent_state()
-                                if persistent is not None:
-                                    recorder.save_strategy_state(
-                                        run_id,
-                                        mode="live",
-                                        strategy_name=owner_binding.state_name,
-                                        ts=bar.ts,
-                                        state=persistent,
-                                    )
 
                 retry_pending_exits = getattr(executor, "retry_pending_exits", None)
                 if retry_pending_exits is not None and not bar.warmup:
@@ -237,11 +273,64 @@ async def run_portfolio_live(
                 for binding in bindings:
                     strategy = binding.strategy
                     state = states[binding.instance_id]
+                    machine = getattr(strategy, "machine", None)
+                    campaign = getattr(machine, "campaign", None)
+                    historical_health_before = (
+                        getattr(machine, "historical_model_complete", True),
+                        getattr(machine, "historical_funding_available", True),
+                    )
+                    if (
+                        machine is not None
+                        and campaign is not None
+                        and campaign.origin == "historical"
+                        and machine.historical_model_complete
+                    ):
+                        boundary = bar.ts.astimezone(UTC).replace(
+                            hour=(bar.ts.hour // 8) * 8, minute=0, second=0, microsecond=0
+                        )
+                        last = machine.last_historical_funding_ts
+                        if last is None or last < boundary:
+                            try:
+                                if historical_funding_provider is None:
+                                    raise RuntimeError("historical funding provider unavailable")
+                                rows = await historical_funding_provider(
+                                    last or campaign.entry_ts, boundary
+                                )
+                                expected = (last or campaign.entry_ts) + timedelta(hours=8)
+                                for row in sorted(rows, key=lambda value: value[0]):
+                                    stamp, rate, fixing = row
+                                    if last is not None and stamp <= last:
+                                        continue
+                                    if stamp != expected:
+                                        raise RuntimeError("historical funding gap")
+                                    machine.apply_historical_funding(stamp, rate, fixing)
+                                    expected += timedelta(hours=8)
+                                machine.historical_funding_available = (
+                                    machine.last_historical_funding_ts is not None
+                                    and machine.last_historical_funding_ts >= boundary
+                                )
+                                if not machine.historical_funding_available:
+                                    raise RuntimeError("historical funding source incomplete")
+                            except Exception as exc:
+                                # Prices skipped while funding is unknown cannot
+                                # be certified by a later quote. Rebuild from
+                                # complete evidence before reopening admission.
+                                machine.historical_model_complete = False
+                                machine.historical_funding_available = False
+                                log.warning(
+                                    "live.historical_funding_unavailable",
+                                    error_type=type(exc).__name__,
+                                )
                     intents = intents_to_list(strategy.on_bar(bar, state))
                     snapshot_due = not bar.warmup and (
                         bar.timeframe in binding.subscribed_timeframes
                         or bool(intents)
                         or not strategy_snapshot_saved[binding.instance_id]
+                        or historical_health_before
+                        != (
+                            getattr(machine, "historical_model_complete", True),
+                            getattr(machine, "historical_funding_available", True),
+                        )
                     )
                     # Persist the decision state before any remote submission.
                     # A restart must never rediscover the same transition from

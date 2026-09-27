@@ -41,6 +41,10 @@ class CloseRangeLive(Strategy):
         super().__init__(params)
         self.unit_notional_usd = float(self.params.get("unit_notional_usd", 100.0))
         self.entries_enabled = bool(self.params.get("entries_enabled", True))
+        self.direction_mode = str(self.params.get("direction_mode", "both"))
+        if self.direction_mode not in CloseRangeMachine.DIRECTION_MODES:
+            raise ValueError(f"unsupported breakout direction mode: {self.direction_mode!r}")
+        self.direction_mode_changed_at: str | None = None
         # The seeded, unowned campaign is marked at the size used when it was
         # first modeled. Changing the size of future funded entries must not
         # retroactively revalue that paper history.
@@ -57,6 +61,8 @@ class CloseRangeLive(Strategy):
         ):
             raise ValueError("breakout size and leverage must be positive")
         self.machine = machine or CloseRangeMachine()
+        if self.machine.campaign is not None and self.machine.campaign.origin == "live":
+            self.machine.historical_model_complete = True
         self._recent_decisions: deque[dict[str, Any]] = deque(maxlen=256)
         self._urgent_intents: deque[OrderIntent] = deque()
         self._closing_campaign_id: str | None = None
@@ -137,10 +143,31 @@ class CloseRangeLive(Strategy):
                 raise RuntimeError("owned breakout slot is absent from campaign state")
 
     def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
-        urgent = [] if bar.warmup else list(self._urgent_intents)
+        historical = []
+        if bar.timeframe == "1m":
+            for decision in self.machine.observe_historical_prices(
+                bar.ts, bar.open, bar.low, bar.high
+            ):
+                self._recent_decisions.append(self._decision_dict(decision))
+                if not bar.warmup:
+                    historical.append(
+                        OrderIntent.noop(
+                            "1m",
+                            reason=decision.reason,
+                            metadata={"historical": True, "campaign_id": decision.campaign_id},
+                        )
+                    )
+        urgent = [] if bar.warmup else [*self._urgent_intents, *historical]
         if not bar.warmup:
             self._urgent_intents.clear()
             if not self.entries_enabled and self._pending_reversal:
+                self._abandon_pending_reversal()
+            if self._pending_reversal and not self.machine._direction_allowed(
+                self.direction_mode, int(self._pending_reversal["side"])
+            ):
+                self._record_reversal_status(
+                    bar.ts.astimezone(UTC), "reject", "reversal_direction_mode"
+                )
                 self._abandon_pending_reversal()
             if bar.timeframe == "1m":
                 urgent.extend(
@@ -181,6 +208,7 @@ class CloseRangeLive(Strategy):
             # market fill replaces the modeled value.
             next_open_price=bar.close,
             activation_ts=self.activation_ts,
+            direction_mode=self.direction_mode,
         )
         for decision in decisions:
             self._recent_decisions.append(self._decision_dict(decision))
@@ -222,6 +250,7 @@ class CloseRangeLive(Strategy):
                 "campaign_id": decision.campaign_id,
                 "k": decision.k,
                 "decision_kind": decision.kind,
+                "direction_mode": self.direction_mode,
             }
             if decision.kind in {"paper_parent", "paper_addon"} and decision.k is not None:
                 if self._aborting_slots:
@@ -232,7 +261,11 @@ class CloseRangeLive(Strategy):
                     ):
                         self.machine.discard_unfilled_addon(decision.k)
                     continue
-                if not self.entries_enabled:
+                if (
+                    not self.entries_enabled
+                    or not self.machine.historical_model_complete
+                    or not self.machine.historical_funding_available
+                ):
                     if decision.kind == "paper_parent":
                         self._abandon_unfunded_parent(decision.campaign_id)
                     elif (
@@ -338,6 +371,12 @@ class CloseRangeLive(Strategy):
             )
         ]
 
+    def on_external_positions_closed(self, events, state: StrategyState) -> None:
+        # Remove closed children before ending the parent campaign. All venue
+        # positions were mirrored together, so only true survivors are queued.
+        for event in sorted(events, key=lambda e: e.position_key == "k0"):
+            self.on_external_position_closed(event, state)
+
     def on_external_position_closed(self, event: Any, state: StrategyState) -> None:
         """Fold venue liquidation into campaign state and close surviving children."""
         k = int(str(event.position_key).removeprefix("k"))
@@ -352,7 +391,9 @@ class CloseRangeLive(Strategy):
         if self.machine.campaign is None:
             raise RuntimeError("externally closed breakout unit has no campaign")
         if k == 0:
-            outcome = self.machine.parent_liquidated(event.observed_at, event.price_usd)
+            outcome = self.machine.parent_liquidated(
+                event.observed_at, event.price_usd, reason=getattr(event, "reason", "liquidation")
+            )
             self._recent_decisions.append(self._decision_dict(outcome))
             self._closing_campaign_id = outcome.campaign_id
             for slot in self.position_slots[1:]:
@@ -361,14 +402,19 @@ class CloseRangeLive(Strategy):
                     self._urgent_intents.append(
                         self._exit_intent(
                             slot,
-                            "parent_liquidation",
+                            "parent_liquidation"
+                            if getattr(event, "liquidated", True)
+                            else "parent_external_close",
                             outcome.campaign_id,
                             {"parent_trade_id": event.trade_id},
                         )
                     )
         else:
             outcome = self.machine.child_liquidated(
-                k=k, ts=event.observed_at, price=event.price_usd
+                k=k,
+                ts=event.observed_at,
+                price=event.price_usd,
+                reason=getattr(event, "reason", "liquidation"),
             )
             self._recent_decisions.append(self._decision_dict(outcome))
             self._aborting_slots.discard(event.position_key)
@@ -394,6 +440,8 @@ class CloseRangeLive(Strategy):
             "unit_notional_usd": self.unit_notional_usd,
             "historical_unit_notional_usd": self.historical_unit_notional_usd,
             "leverage": self.leverage,
+            "direction_mode": self.direction_mode,
+            "direction_mode_changed_at": self.direction_mode_changed_at,
             "machine": self.machine.persistent_state(),
             "recent_decisions": list(self._recent_decisions),
             "closing_campaign_id": self._closing_campaign_id,
@@ -417,10 +465,37 @@ class CloseRangeLive(Strategy):
             return False
         if previous_leverage != self.leverage:
             return False
+        previous_mode = str(snapshot.get("direction_mode", "both"))
+        if previous_mode not in CloseRangeMachine.DIRECTION_MODES:
+            return False
         self.historical_unit_notional_usd = historical_unit
         self.activation_ts = datetime.fromisoformat(snapshot["activation_ts"]).astimezone(UTC)
         self.machine = CloseRangeMachine.restore(snapshot["machine"])
         self._recent_decisions = deque(snapshot.get("recent_decisions", []), maxlen=256)
+        if previous_mode != self.direction_mode:
+            changed_at = datetime.now(UTC)
+            self.direction_mode_changed_at = changed_at.isoformat()
+            self._recent_decisions.append(
+                self._decision_dict(
+                    BreakoutDecision(
+                        ts=changed_at,
+                        kind="control",
+                        reason="direction_mode_changed",
+                        campaign_id=self.machine.campaign.campaign_id
+                        if self.machine.campaign
+                        else None,
+                        k=None,
+                        side=None,
+                        price=None,
+                        metadata={
+                            "previous_mode": previous_mode,
+                            "direction_mode": self.direction_mode,
+                        },
+                    )
+                )
+            )
+        else:
+            self.direction_mode_changed_at = snapshot.get("direction_mode_changed_at")
         self._closing_campaign_id = snapshot.get("closing_campaign_id")
         self._closing_slots = set(snapshot.get("closing_slots", []))
         self._aborting_slots = set(snapshot.get("aborting_slots", []))
@@ -476,6 +551,8 @@ class CloseRangeLive(Strategy):
                 "k": 0,
                 "decision_kind": pending["kind"],
                 "deferred_reversal": True,
+                "intended_entry_ts": pending["ts"],
+                "direction_mode": self.direction_mode,
             },
         )
 

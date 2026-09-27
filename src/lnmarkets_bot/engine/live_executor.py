@@ -14,10 +14,13 @@ symbol.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from ..api.client import LnmApiError
 from ..api.isolated import (
     IsolatedCloseResponse,
     IsolatedTradesApi,
@@ -56,6 +59,7 @@ class _Position:
     strategy_instance_id: str = ""
     position_key: str = ""
     trigger_tf: str = ""
+    collateral_sats: int | None = None
 
 
 @dataclass(frozen=True)
@@ -78,9 +82,11 @@ class ExternalClose:
     trade_id: str
     observed_at: datetime
     reason: str
-    liquidated: bool
+    liquidated: bool | None
     price_usd: float
     net_pl_sats: int
+    entry_price_usd: float | None = None
+    side: str | None = None
 
 
 class LiveExecutor:
@@ -98,7 +104,12 @@ class LiveExecutor:
         run_id: int,
         symbol: str = "BTCUSD",
         legacy_strategy_instance_id: str | None = None,
+        max_entry_age_seconds: float | None = None,
+        clock=None,
     ) -> None:
+        self.authoritative_accounting = True
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.max_entry_age_seconds = max_entry_age_seconds
         self._api = trades_api
         self._recorder = recorder
         self.run_id = run_id
@@ -111,6 +122,9 @@ class LiveExecutor:
         self._unreported_realized_pnl_usd = 0.0
         self._last_funding_sync_at: datetime | None = None
         self._pending_exits: dict[str, _PendingExit] = {}
+        self._unknown_remote: set[str] = set()
+        self._missing_remote: set[str] = set()
+        self._inventory_unavailable = False
 
     def update_price(self, price_usd: float) -> None:
         self._last_close = price_usd
@@ -153,6 +167,9 @@ class LiveExecutor:
                 leverage=leverage,
             )
 
+        blocked = self.entry_admission_reason(intent, ts)
+        if blocked:
+            return -1, {"noop": True, "reason": blocked}
         # Entry / resize
         return await self._do_entry(
             pos=pos,
@@ -208,6 +225,17 @@ class LiveExecutor:
         closed_trade_id = pos.trade_id
         closed_strategy_id = pos.strategy_instance_id or intent.strategy_instance_id
         closed_position_key = pos.position_key or intent.position_key or intent.trigger_tf
+        closed_leverage = pos.leverage
+        command_key = f"close:{closed_trade_id}"
+        self._recorder.begin_command(
+            command_key,
+            "close",
+            {
+                "trade_id": closed_trade_id,
+                "execution_key": tf,
+                "ts": ts.isoformat(),
+            },
+        )
         try:
             resp: IsolatedCloseResponse = await self._api.close_trade(closed_trade_id)
         except Exception as exc:
@@ -229,62 +257,34 @@ class LiveExecutor:
         pos.entry_ts = None
         pos.trade_id = None
 
+        exit_price = float(resp.raw.get("exitPrice") or fill_price)
+        close_ts = _parse_lnm_timestamp(resp.raw.get("closedAt")) or (
+            self._clock() if self.max_entry_age_seconds is not None else ts
+        )
+        result = self._execution_result(
+            pos_owner=(closed_strategy_id, closed_position_key, intent.trigger_tf),
+            run_id=run_id,
+            signal_id=signal_id,
+            ts=close_ts,
+            side=side,
+            quantity=close_qty_sats,
+            leverage=closed_leverage,
+            price=exit_price,
+            trade_id=closed_trade_id,
+            action="close",
+            fee=resp.closing_fee,
+            amount=resp.pl - resp.closing_fee,
+            metadata={"gross_pl_sats": resp.pl, "closing_fee_sats": resp.closing_fee},
+        )
         try:
-            order_id = self._recorder.record_order(
-                run_id,
-                signal_id=signal_id,
-                ts=ts,
-                trigger_tf=intent.trigger_tf,
-                strategy_instance_id=intent.strategy_instance_id,
-                position_key=intent.position_key or intent.trigger_tf,
-                side=side,
-                qty_sats=close_qty_sats,
-                leverage=leverage,
-                status="filled",
-                price_usd=fill_price,
-                lnm_order_id=closed_trade_id,
-                metadata={
-                    "isolated_action": "close",
-                    "lnm_trade_id": closed_trade_id,
-                    "gross_pl_sats": resp.pl,
-                    "closing_fee_sats": resp.closing_fee,
-                },
-            )
-            exit_price = float(resp.raw.get("exitPrice") or fill_price)
-            fill_id = self._recorder.record_fill(
-                order_id,
-                ts=ts,
-                qty_sats=close_qty_sats,
-                price_usd=exit_price,
-                fee_sats=resp.closing_fee,
-            )
-            net_pl_sats = resp.pl - resp.closing_fee
-            self._recorder.upsert_daily_pnl(
-                run_id,
-                date_str=ts.date().isoformat(),
-                realized_delta_sats=net_pl_sats,
-            )
-            self._recorder.record_strategy_pnl_event(
-                run_id,
-                event_key=f"close:{closed_trade_id}",
-                strategy_instance_id=closed_strategy_id,
-                position_key=closed_position_key,
-                trade_id=closed_trade_id,
-                ts=ts,
-                kind="close_net_pl",
-                amount_sats=net_pl_sats,
-                metadata={"gross_pl_sats": resp.pl, "closing_fee_sats": resp.closing_fee},
-            )
-            self._unreported_realized_pnl_usd += net_pl_sats * exit_price / 1e8
+            self._recorder.command_result(command_key, result)
+            order_id, fill_id = self._recorder.apply_command(command_key)
         except Exception as exc:
-            _log.critical(
-                "live.closed_trade_persistence_failed",
-                trade_id=closed_trade_id,
-                error=str(exc),
-            )
             raise UnsafeLiveStateError(
-                "remote trade closed but local close persistence failed"
+                "remote close accepted; durable result must be recovered"
             ) from exc
+        net_pl_sats = resp.pl - resp.closing_fee
+        self._unreported_realized_pnl_usd += net_pl_sats * exit_price / 1e8
         return order_id, {
             "fill_id": fill_id,
             "price_usd": exit_price,
@@ -336,6 +336,53 @@ class LiveExecutor:
                 return -1, close_meta
 
         try:
+            running = await self._api.get_running_trades()
+            pending_api = getattr(self._api, "get_open_trades", None)
+            pending = await pending_api() if pending_api is not None else []
+            self._inventory_unavailable = False
+        except Exception:
+            self._inventory_unavailable = True
+            return -1, {"noop": True, "reason": "venue_inventory_unavailable"}
+        known = {value.trade_id for value in self.positions.values() if value.trade_id}
+        self._unknown_remote = {t.id for t in [*running, *pending]} - known
+        if self.entries_blocked_reason():
+            return -1, {"noop": True, "reason": self.entries_blocked_reason()}
+        identity = [
+            intent.strategy_instance_id,
+            intent.position_key or intent.trigger_tf,
+            ts.isoformat(),
+            intent.kind.value,
+            intent.reason,
+            intent.metadata,
+        ]
+        command_key = (
+            "entry:"
+            + hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+        )
+        request = {
+            "strategy_instance_id": intent.strategy_instance_id,
+            "position_key": intent.position_key or intent.trigger_tf,
+            "quantity": quantity_contracts,
+            "leverage": leverage,
+            "side": side,
+            "ts": ts.isoformat(),
+            "trigger_tf": intent.trigger_tf,
+            "run_id": run_id,
+            "signal_id": signal_id,
+            "decision_metadata": intent.metadata,
+            "reason": intent.reason,
+        }
+        snapshot = self._recorder.latest_strategy_state(
+            mode="live", strategy_name=intent.strategy_instance_id
+        )
+        if snapshot is not None:
+            request["strategy_state_before_submission"] = snapshot["state"]
+        blocked = self.entry_admission_reason(intent, ts)
+        if blocked:
+            return -1, {"noop": True, "reason": blocked}
+        if not self._recorder.begin_command(command_key, "entry", request):
+            return -1, {"noop": True, "reason": "decision_already_submitted"}
+        try:
             trade = await self._api.new_trade(
                 NewIsolatedTradeParams(
                     type="market",
@@ -345,88 +392,80 @@ class LiveExecutor:
                 )
             )
         except Exception as exc:
-            _log.warning("live.entry_failed", reason=str(exc))
-            await self._fail_closed_if_entry_is_ambiguous(exc)
-            return -1, {"noop": True, "reason": f"order_failed: {exc}"}
-
-        actual_entry_price = float(trade.entry_price or trade.price or fill_price)
-        try:
-            order_id = self._recorder.record_order(
-                run_id,
-                signal_id=signal_id,
-                ts=ts,
-                trigger_tf=intent.trigger_tf,
-                strategy_instance_id=intent.strategy_instance_id,
-                position_key=intent.position_key or intent.trigger_tf,
-                side=side,
-                qty_sats=quantity_contracts,
-                leverage=leverage,
-                status="filled",
-                price_usd=actual_entry_price,
-                lnm_order_id=trade.id,
-                metadata={
-                    "isolated_action": "open",
-                    "lnm_trade_id": trade.id,
-                    "quantity_contracts": quantity_contracts,
-                    "opening_fee_sats": trade.opening_fee or 0,
-                },
-            )
-            opening_fee_sats = trade.opening_fee or 0
-            fill_id = self._recorder.record_fill(
-                order_id,
-                ts=ts,
-                qty_sats=quantity_contracts,
-                price_usd=actual_entry_price,
-                fee_sats=opening_fee_sats,
-            )
-            if opening_fee_sats:
-                self._recorder.upsert_daily_pnl(
-                    run_id,
-                    date_str=ts.date().isoformat(),
-                    realized_delta_sats=-opening_fee_sats,
-                )
-                self._unreported_realized_pnl_usd -= opening_fee_sats * actual_entry_price / 1e8
-            self._recorder.record_strategy_pnl_event(
-                run_id,
-                event_key=f"open:{trade.id}",
-                strategy_instance_id=intent.strategy_instance_id,
-                position_key=intent.position_key or intent.trigger_tf,
-                trade_id=trade.id,
-                ts=ts,
-                kind="opening_fee",
-                amount_sats=-opening_fee_sats,
-            )
-        except Exception as exc:
-            # The remote trade is live but absent from local reconciliation
-            # state. Compensate immediately; leaving it open would be unsafe.
-            try:
-                await self._api.close_trade(trade.id)
-            except Exception as close_exc:
-                _log.critical(
-                    "live.unrecorded_trade_open",
-                    trade_id=trade.id,
-                    persistence_error=str(exc),
-                    close_error=str(close_exc),
-                )
-                raise UnsafeLiveStateError(
-                    "remote trade opened but local persistence and compensating close failed"
-                ) from close_exc
+            # Only a definitive rejection is reusable. A timeout, 429 or 5xx
+            # stays unresolved, even if a single read shows no new position.
+            if isinstance(exc, LnmApiError) and exc.status in {
+                400,
+                401,
+                403,
+                404,
+                405,
+                406,
+                412,
+                413,
+                415,
+                422,
+            }:
+                self._recorder.reject_command(command_key)
             _log.error(
-                "live.persistence_failed_trade_closed",
-                trade_id=trade.id,
-                error=str(exc),
+                "live.entry_not_accepted", command_key=command_key, error_type=type(exc).__name__
             )
             return -1, {
                 "noop": True,
-                "reason": f"persistence_failed_trade_closed: {exc}",
-                "lnm_trade_id": trade.id,
+                "reason": "entry_rejected"
+                if isinstance(exc, LnmApiError)
+                and exc.status in {400, 401, 403, 404, 405, 406, 412, 413, 415, 422}
+                else "entry_outcome_unresolved",
             }
+        if not trade.id:
+            return -1, {"noop": True, "reason": "entry_outcome_unresolved"}
+        actual_entry_price = float(trade.entry_price or trade.price or fill_price)
+        quantity_contracts = int(trade.quantity or quantity_contracts)
+        leverage = float(trade.leverage or leverage)
+        opening_fee_sats = trade.opening_fee or 0
+        result = self._execution_result(
+            pos_owner=(
+                intent.strategy_instance_id,
+                intent.position_key or intent.trigger_tf,
+                intent.trigger_tf,
+            ),
+            run_id=run_id,
+            signal_id=signal_id,
+            ts=trade.filled_at or trade.created_at or ts,
+            side=side,
+            quantity=quantity_contracts,
+            leverage=leverage,
+            price=actual_entry_price,
+            trade_id=trade.id,
+            action="open",
+            fee=opening_fee_sats,
+            amount=-opening_fee_sats,
+            metadata={
+                "quantity_contracts": quantity_contracts,
+                "opening_fee_sats": opening_fee_sats,
+            },
+        )
+        try:
+            self._recorder.command_result(command_key, result)
+            order_id, fill_id = self._recorder.apply_command(command_key)
+        except Exception as exc:
+            # Never issue an unrecorded compensating trade. Recovery replays
+            # the authoritative result; if its write failed, admission remains blocked.
+            raise UnsafeLiveStateError(
+                "remote entry accepted; durable result must be recovered"
+            ) from exc
+        self._unreported_realized_pnl_usd -= opening_fee_sats * actual_entry_price / 1e8
         pos.side = "long" if side == "buy" else "short"
         # The shared strategy-state field retains its legacy name, but for
         # isolated live trades it stores signed USD-contract quantity.
         pos.qty_sats = quantity_contracts if side == "buy" else -quantity_contracts
         pos.entry_price_usd = actual_entry_price
-        pos.entry_ts = ts
+        pos.entry_ts = trade.filled_at or trade.created_at or ts
+        pos.collateral_sats = (
+            int(trade.margin) + int(trade.maintenance_margin or 0)
+            if trade.margin is not None
+            else int(quantity_contracts / actual_entry_price / leverage * 1e8)
+        )
         pos.leverage = leverage
         pos.trade_id = trade.id
         pos.strategy_instance_id = intent.strategy_instance_id
@@ -440,36 +479,101 @@ class LiveExecutor:
             "fee_sats": opening_fee_sats,
         }
 
-    async def _fail_closed_if_entry_is_ambiguous(self, cause: Exception) -> None:
-        """Stop execution if a failed entry request might have reached LNM.
+    def entry_admission_reason(self, intent, ts) -> str | None:
+        blocked = self.entries_blocked_reason()
+        if blocked:
+            return blocked
+        if self.max_entry_age_seconds is not None:
+            intended = _parse_lnm_timestamp(intent.metadata.get("intended_entry_ts")) or ts
+            age = (_as_utc(self._clock()) - _as_utc(intended)).total_seconds()
+            if age < -60 or age > self.max_entry_age_seconds:
+                return "entry_expired"
+            quote_age = (_as_utc(self._clock()) - _as_utc(ts)).total_seconds()
+            if quote_age > 90:
+                return "quote_stale"
+        return None
 
-        A connection timeout is not proof that LNM rejected the order.  Query
-        running isolated trades immediately; any trade not already mirrored by
-        this executor is unsafe ambiguity.  Do not close it automatically:
-        it could be a user-managed trade.  Crash instead, so systemd restart
-        reconciliation refuses to resume until the operator resolves it.
-        """
-        known_trade_ids = {pos.trade_id for pos in self.positions.values() if pos.trade_id}
-        try:
-            running = await self._api.get_running_trades()
-        except Exception as reconcile_exc:
-            _log.critical(
-                "live.entry_ambiguous_reconcile_failed",
-                error=str(reconcile_exc),
-            )
-            raise UnsafeLiveStateError(
-                "entry submission failed and running-trade reconciliation also failed"
-            ) from cause
-        unknown_ids = [trade.id for trade in running if trade.id not in known_trade_ids]
-        if unknown_ids:
-            _log.critical(
-                "live.entry_ambiguous_remote_trade",
-                trade_ids=unknown_ids,
-                submission_error=str(cause),
-            )
-            raise UnsafeLiveStateError(
-                "entry submission outcome is ambiguous; untracked remote trade present"
-            ) from cause
+    def entries_blocked_reason(self) -> str | None:
+        if self._inventory_unavailable:
+            return "venue_inventory_unavailable"
+        if self._missing_remote:
+            return "owned_trade_outcome_unresolved"
+        if self._unknown_remote:
+            return "unowned_remote_exposure"
+        if any(
+            row["action"] == "entry" for row in self._recorder.commands(["submitted", "received"])
+        ):
+            return "entry_outcome_unresolved"
+        return None
+
+    @staticmethod
+    def _execution_result(
+        *,
+        pos_owner,
+        run_id,
+        signal_id,
+        ts,
+        side,
+        quantity,
+        leverage,
+        price,
+        trade_id,
+        action,
+        fee,
+        amount,
+        metadata,
+        external_event=None,
+    ):
+        owner, slot, timeframe = pos_owner
+        stamp = _as_utc(ts).isoformat()
+        return {
+            "order": dict(
+                run_id=run_id,
+                signal_id=signal_id,
+                ts=stamp,
+                trigger_tf=timeframe,
+                strategy_instance_id=owner,
+                position_key=slot,
+                side=side,
+                qty_sats=quantity,
+                leverage=leverage,
+                status="filled",
+                price_usd=price,
+                lnm_order_id=trade_id,
+                metadata={"isolated_action": action, "lnm_trade_id": trade_id, **metadata},
+            ),
+            "fill": dict(ts=stamp, qty_sats=quantity, price_usd=price, fee_sats=fee),
+            "pnl": dict(
+                run_id=run_id,
+                event_key=("open:" if action == "open" else "close:") + trade_id,
+                strategy_instance_id=owner,
+                position_key=slot,
+                trade_id=trade_id,
+                ts=stamp,
+                kind=(
+                    "opening_fee"
+                    if action == "open"
+                    else "liquidation"
+                    if metadata.get("liquidated")
+                    else "external_close_net_pl"
+                    if action == "external_close"
+                    else "close_net_pl"
+                ),
+                amount_sats=amount,
+                metadata=metadata,
+            ),
+            "external_event": external_event,
+        }
+
+    def pending_external_events(self) -> list[ExternalClose]:
+        events = []
+        for row in self._recorder.commands(["applied"], undelivered=True):
+            raw = row["result_json"].get("external_event")
+            if raw:
+                raw = dict(raw)
+                raw["observed_at"] = _parse_lnm_timestamp(raw["observed_at"])
+                events.append(ExternalClose(**raw))
+        return events
 
     async def sync_funding(self, ts: datetime, *, force: bool = False) -> None:
         """Best-effort funding persistence for locally managed running trades.
@@ -484,15 +588,14 @@ class LiveExecutor:
                 and ts - self._last_funding_sync_at < timedelta(minutes=15)
             ):
                 return
-            self._last_funding_sync_at = ts
-            managed = {pos.trade_id: pos for pos in self.positions.values() if pos.trade_id}
+            # Query from immutable opening history, including closed trades.
+            # Full-history overlap is deliberate: no bounded lookback silently
+            # drops a delayed settlement. IDs make replay exactly once.
+            managed = self._recorder.owned_trade_history()
             managed_ids = set(managed)
             if not managed_ids:
                 return
-            from_ts = min(
-                (pos.entry_ts or ts for pos in self.positions.values() if pos.trade_id),
-                default=ts,
-            ) - timedelta(minutes=1)
+            from_ts = min(_as_utc(row["ts"]) for row in managed.values()) - timedelta(minutes=1)
             async for row in self._api.iter_funding_fees(from_ts, ts):
                 trade_id = str(row.get("tradeId", row.get("trade_id", ""))) or None
                 if trade_id not in managed_ids:
@@ -503,39 +606,43 @@ class LiveExecutor:
                     _log.warning("live.funding_row_invalid", raw=row)
                     continue
                 fee_sats = int(row.get("fee", 0))
-                if self._recorder.record_funding_fee(
-                    self.run_id,
-                    trade_id=trade_id,
-                    settlement_id=settlement_id,
-                    ts=fee_ts,
-                    fee_sats=fee_sats,
-                    raw=row,
-                ):
-                    self._recorder.upsert_daily_pnl(
+                with self._recorder.atomic():
+                    if self._recorder.record_funding_fee(
                         self.run_id,
-                        date_str=fee_ts.date().isoformat(),
-                        # LN Markets reports a paid funding fee as positive and
-                        # received funding as negative. P&L uses the inverse:
-                        # received funding increases account value.
-                        funding_delta_sats=-fee_sats,
-                    )
-                    pos = managed[trade_id]
-                    self._recorder.record_strategy_pnl_event(
-                        self.run_id,
-                        event_key=f"funding:{trade_id}:{settlement_id}",
-                        strategy_instance_id=pos.strategy_instance_id,
-                        position_key=pos.position_key,
                         trade_id=trade_id,
+                        settlement_id=settlement_id,
                         ts=fee_ts,
-                        kind="funding",
-                        amount_sats=-fee_sats,
-                    )
+                        fee_sats=fee_sats,
+                        raw=row,
+                    ):
+                        self._recorder.upsert_daily_pnl(
+                            self.run_id,
+                            date_str=fee_ts.date().isoformat(),
+                            # LN Markets reports a paid funding fee as positive and
+                            # received funding as negative. P&L uses the inverse:
+                            # received funding increases account value.
+                            funding_delta_sats=-fee_sats,
+                        )
+                        pos = managed[trade_id]
+                        self._recorder.record_strategy_pnl_event(
+                            self.run_id,
+                            event_key=f"funding:{trade_id}:{settlement_id}",
+                            strategy_instance_id=pos["strategy_instance_id"]
+                            or self.legacy_strategy_instance_id
+                            or "",
+                            position_key=pos["position_key"] or pos["trigger_tf"],
+                            trade_id=trade_id,
+                            ts=fee_ts,
+                            kind="funding",
+                            amount_sats=-fee_sats,
+                        )
                     _log.info(
                         "live.funding_recorded",
                         trade_id=trade_id,
                         settlement_id=settlement_id,
                         fee_sats=fee_sats,
                     )
+            self._last_funding_sync_at = ts
         except Exception as exc:
             _log.warning("live.funding_sync_failed", error=str(exc))
 
@@ -544,16 +651,17 @@ class LiveExecutor:
 
         Every remotely running trade must have a locally recorded opening
         action with a timeframe. Unknown trades are an unsafe ambiguity, so
-        startup fails closed instead of opening a duplicate position.
+        new entries are blocked while exits for known positions remain active.
         """
+        for command in self._recorder.commands(["received"]):
+            self._recorder.apply_command(command["command_key"])
         running = await self._api.get_running_trades()
         running_by_id = {trade.id: trade for trade in running}
         by_id = self._recorder.latest_locally_open_lnm_trades()
+        self._missing_remote = set(by_id) - set(running_by_id)
+        self._inventory_unavailable = False
         unknown_remote = set(running_by_id) - set(by_id)
-        if unknown_remote:
-            raise RuntimeError(
-                f"unreconciled isolated trades {sorted(unknown_remote)}; refusing live startup"
-            )
+        self._unknown_remote = unknown_remote
         restored: dict[str, _Position] = {}
         for trade_id, local in by_id.items():
             trade = running_by_id.get(trade_id)
@@ -584,6 +692,11 @@ class LiveExecutor:
                 strategy_instance_id=strategy_instance_id,
                 position_key=position_key,
                 trigger_tf=str(local["trigger_tf"] or ""),
+                collateral_sats=(
+                    int(trade.margin) + int(trade.maintenance_margin or 0)
+                    if trade is not None and trade.margin is not None
+                    else int(quantity / float(local["price_usd"]) / float(local["leverage"]) * 1e8)
+                ),
             )
         self.positions = restored
 
@@ -591,32 +704,62 @@ class LiveExecutor:
         self, *, run_id: int, ts: datetime
     ) -> list[ExternalClose]:
         """Persist venue-side liquidation/manual closure and clear local state."""
-        running_ids = {trade.id for trade in await self._api.get_running_trades()}
+        try:
+            running_trades = await self._api.get_running_trades()
+        except Exception as exc:
+            self._inventory_unavailable = True
+            _log.warning("live.inventory_unavailable", error_type=type(exc).__name__)
+            return self.pending_external_events()
+        self._inventory_unavailable = False
+        running_ids = {trade.id for trade in running_trades}
+        remote = {trade.id: trade for trade in running_trades}
+        for pos in self.positions.values():
+            trade = remote.get(pos.trade_id)
+            if trade is not None and trade.margin is not None:
+                pos.collateral_sats = int(trade.margin) + int(trade.maintenance_margin or 0)
+        known_ids = {pos.trade_id for pos in self.positions.values() if pos.trade_id}
+        self._unknown_remote = running_ids - known_ids
         missing = {
             key: pos
             for key, pos in self.positions.items()
             if pos.trade_id is not None and pos.trade_id not in running_ids
         }
+        self._missing_remote = {pos.trade_id for pos in missing.values()}
         if not missing:
-            return []
-        closed = {trade.id: trade for trade in await self._api.get_closed_trades()}
-        events: list[ExternalClose] = []
+            return self.pending_external_events()
+        try:
+            closed = {trade.id: trade for trade in await self._api.get_closed_trades()}
+        except Exception as exc:
+            _log.warning("live.closed_history_unavailable", error_type=type(exc).__name__)
+            return self.pending_external_events()
         for key, pos in missing.items():
             assert pos.trade_id is not None
             trade = closed.get(pos.trade_id)
             if trade is None:
-                raise UnsafeLiveStateError(
-                    f"managed trade {pos.trade_id} absent from running and closed venue lists"
-                )
+                # Venue history may lag an accepted close. Preserve ownership,
+                # block admission and keep managing other owned exposure.
+                _log.warning("live.owned_trade_outcome_unresolved", trade_id=pos.trade_id)
+                continue
             raw_reason = str(
                 trade.raw.get("closeReason")
                 or trade.raw.get("close_reason")
                 or trade.raw.get("reason")
-                or trade.status
-                or "external_close"
+                or ""
             )
-            liquidated = "liquid" in raw_reason.lower() or bool(trade.raw.get("liquidated"))
-            reason = "liquidation" if liquidated else "external_close"
+            flag = trade.raw.get("liquidated")
+            if "liquid" in raw_reason.lower() or trade.status == "liquidated" or flag is True:
+                liquidated = True
+            elif raw_reason or flag is False:
+                liquidated = False
+            else:
+                # The real v3 closed-trade schema has a numeric `liquidation`
+                # price, not a cause flag. `closed=True` proves flatness only.
+                liquidated = None
+            reason = (
+                "liquidation" if liquidated is True else
+                "external_close" if liquidated is False else "external_close_unclassified"
+            )
+            raw_reason = raw_reason or reason
             exit_price = float(
                 trade.raw.get("exitPrice")
                 or trade.raw.get("exit_price")
@@ -632,69 +775,63 @@ class LiveExecutor:
             gross_pl = int(trade.pl or 0)
             net_pl = gross_pl - closing_fee
             side = "sell" if pos.side == "long" else "buy"
-            order_id = self._recorder.record_order(
-                run_id,
-                signal_id=None,
-                ts=ts,
-                trigger_tf=pos.trigger_tf,
+            event_ts = trade.closed_at or (
+                self._clock() if self.max_entry_age_seconds is not None else ts
+            )
+            event = ExternalClose(
+                execution_key=key,
                 strategy_instance_id=pos.strategy_instance_id,
                 position_key=pos.position_key,
-                side=side,
-                qty_sats=abs(pos.qty_sats),
-                leverage=pos.leverage,
-                status="filled",
+                trigger_tf=pos.trigger_tf,
+                trade_id=pos.trade_id,
+                observed_at=_as_utc(event_ts),
+                reason=reason,
+                liquidated=liquidated,
                 price_usd=exit_price,
-                lnm_order_id=pos.trade_id,
+                net_pl_sats=net_pl,
+                entry_price_usd=pos.entry_price_usd,
+                side=pos.side,
+            )
+            event_data = asdict(event)
+            event_data["observed_at"] = event.observed_at.isoformat()
+            command_key = f"close:{pos.trade_id}"
+            self._recorder.begin_command(
+                command_key,
+                "close",
+                {
+                    "trade_id": pos.trade_id,
+                    "execution_key": key,
+                    "ts": ts.isoformat(),
+                },
+            )
+            result = self._execution_result(
+                pos_owner=(pos.strategy_instance_id, pos.position_key, pos.trigger_tf),
+                run_id=run_id,
+                signal_id=None,
+                ts=event_ts,
+                side=side,
+                quantity=abs(pos.qty_sats),
+                leverage=pos.leverage,
+                price=exit_price,
+                trade_id=pos.trade_id,
+                action="external_close",
+                fee=closing_fee,
+                amount=net_pl,
                 metadata={
-                    "isolated_action": "external_close",
-                    "lnm_trade_id": pos.trade_id,
                     "external_reason": raw_reason,
                     "liquidated": liquidated,
                     "gross_pl_sats": gross_pl,
                     "closing_fee_sats": closing_fee,
                 },
+                external_event=event_data,
             )
-            self._recorder.record_fill(
-                order_id,
-                ts=ts,
-                qty_sats=abs(pos.qty_sats),
-                price_usd=exit_price,
-                fee_sats=closing_fee,
-            )
-            self._recorder.upsert_daily_pnl(
-                run_id,
-                date_str=ts.date().isoformat(),
-                realized_delta_sats=net_pl,
-            )
-            self._recorder.record_strategy_pnl_event(
-                run_id,
-                event_key=f"external_close:{pos.trade_id}",
-                strategy_instance_id=pos.strategy_instance_id,
-                position_key=pos.position_key or key,
-                trade_id=pos.trade_id,
-                ts=ts,
-                kind="liquidation" if liquidated else "external_close_net_pl",
-                amount_sats=net_pl,
-                metadata={"gross_pl_sats": gross_pl, "closing_fee_sats": closing_fee},
-            )
+            self._recorder.command_result(command_key, result)
+            self._recorder.apply_command(command_key)
             self._unreported_realized_pnl_usd += net_pl * exit_price / 1e8
-            events.append(
-                ExternalClose(
-                    execution_key=key,
-                    strategy_instance_id=pos.strategy_instance_id,
-                    position_key=pos.position_key,
-                    trigger_tf=pos.trigger_tf,
-                    trade_id=pos.trade_id,
-                    observed_at=ts,
-                    reason=reason,
-                    liquidated=liquidated,
-                    price_usd=exit_price,
-                    net_pl_sats=net_pl,
-                )
-            )
+            self._missing_remote.discard(pos.trade_id)
             self.positions[key] = _Position()
             self._pending_exits.pop(key, None)
-        return events
+        return self.pending_external_events()
 
     def total_realized_pnl_usd(self) -> float:
         """Cumulative realized P&L is not retained after it is consumed."""
@@ -725,9 +862,13 @@ class LiveExecutor:
         )
 
     def open_margin_usd(self, *, exclude_tf: str | None = None) -> float:
-        """Approximate current isolated margin from contract notional/leverage."""
+        """Value recorded BTC collateral at the current mark, including reserves."""
         return sum(
-            abs(pos.qty_sats) / pos.leverage
+            (
+                pos.collateral_sats * self._last_close / 1e8
+                if pos.collateral_sats is not None and self._last_close is not None
+                else abs(pos.qty_sats) / pos.leverage
+            )
             for tf, pos in self.positions.items()
             if tf != exclude_tf and pos.qty_sats and pos.leverage > 0
         )

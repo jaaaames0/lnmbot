@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -67,6 +68,7 @@ class CampaignUnit:
     entry_ts: datetime
     entry_price: float
     origin: str
+    collateral_btc_per_contract: float | None = None
 
 
 @dataclass
@@ -113,6 +115,7 @@ class CloseRangeMachine:
     RECOVERY_START_DAY: ClassVar[int] = 85
     RECOVERY_FRACTION: ClassVar[float] = 0.97
     MAX_HOLD_DAYS: ClassVar[int] = 120
+    DIRECTION_MODES: ClassVar[frozenset[str]] = frozenset({"both", "long_only", "short_only"})
 
     def __init__(self) -> None:
         self.closes: deque[float] = deque(maxlen=256)
@@ -126,6 +129,10 @@ class CloseRangeMachine:
         self.campaign: CampaignState | None = None
         self.pending_exit: str | None = None
         self.pending_candidate: BreakoutCandidate | None = None
+        self.historical_model_complete = True
+        self.last_historical_funding_ts: datetime | None = None
+        self.last_historical_price_ts: datetime | None = None
+        self.historical_funding_available = True
 
     def warmup(self, candles: list[DailyCandle]) -> None:
         """Load indicators and retain the latest completed candle's signal.
@@ -169,16 +176,45 @@ class CloseRangeMachine:
                 CampaignUnit(k=0, entry_ts=entry_ts, entry_price=entry_price, origin="historical")
             ],
         )
+        details = value.get("units")
+        if isinstance(details, list) and len(details) == units:
+            self.campaign.units = [
+                CampaignUnit(
+                    k=int(u["k"]),
+                    entry_ts=_utc(datetime.fromisoformat(u["entry_ts"])),
+                    entry_price=float(u["entry_price"]),
+                    origin="historical",
+                    collateral_btc_per_contract=float(u["collateral_btc_per_contract"]),
+                )
+                for u in details
+            ]
+            if [u.k for u in self.campaign.units] != sorted({u.k for u in self.campaign.units}):
+                raise ValueError("invalid historical unit identities")
+            if self.campaign.units[0].k != 0:
+                raise ValueError("historical campaign lacks parent")
+            self.campaign.lifetime_units = int(value.get("lifetime_units", units))
+            self.last_historical_funding_ts = (
+                _utc(datetime.fromisoformat(value["funding_complete_through"]))
+                if value.get("funding_complete_through")
+                else None
+            )
+        self.historical_model_complete = (
+            bool(details) and self.last_historical_funding_ts is not None
+        )
+        self.last_historical_price_ts = self.last_bar_ts + DAY if self.last_bar_ts else entry_ts
+        self._validate_restored()
         pending = value.get("pending_exit")
         if pending not in (None, "range_close", "recover", "maximum_hold"):
             raise ValueError("invalid seeded pending exit")
         self.pending_exit = pending
 
-    def advance(self, candle: DailyCandle, *, activation_ts: datetime) -> list[BreakoutDecision]:
+    def advance(
+        self, candle: DailyCandle, *, activation_ts: datetime, direction_mode: str = "both"
+    ) -> list[BreakoutDecision]:
         """Apply the open, then evaluate this completed candle for the next open."""
         activation_ts = _utc(activation_ts)
         self._require_next(candle.ts)
-        decisions = self._apply_open(_utc(candle.ts), candle.open, activation_ts)
+        decisions = self._apply_open(_utc(candle.ts), candle.open, activation_ts, direction_mode)
         decisions.extend(self._observe_close(candle))
         return decisions
 
@@ -189,6 +225,7 @@ class CloseRangeMachine:
         next_open_ts: datetime,
         next_open_price: float,
         activation_ts: datetime,
+        direction_mode: str = "both",
     ) -> list[BreakoutDecision]:
         """Evaluate a just-completed candle and act at the live next open.
 
@@ -203,13 +240,18 @@ class CloseRangeMachine:
         if next_open_ts != candle.ts + DAY:
             raise ValueError("next daily open must immediately follow the completed candle")
         decisions = self._observe_close(candle)
-        decisions.extend(self._apply_open(next_open_ts, float(next_open_price), activation_ts))
+        decisions.extend(
+            self._apply_open(next_open_ts, float(next_open_price), activation_ts, direction_mode)
+        )
         return decisions
 
     def _observe_close(self, candle: DailyCandle) -> list[BreakoutDecision]:
         decisions: list[BreakoutDecision] = []
 
         candidate = self._candidate(candle)
+        decisions.extend(
+            self.observe_historical_prices(candle.ts, candle.open, candle.low, candle.high)
+        )
         if self.campaign is not None:
             campaign = self.campaign
             campaign.held_days += 1
@@ -276,7 +318,112 @@ class CloseRangeMachine:
         campaign.units.pop()
         campaign.lifetime_units -= 1
 
-    def parent_liquidated(self, ts: datetime, price: float) -> BreakoutDecision:
+    def apply_historical_funding(self, ts: datetime, rate: float, fixing_price: float) -> None:
+        """Apply a causal settlement to hypothetical collateral only.
+
+        Per-contract collateral is independent of reference notional. Received
+        funding is wallet cash and must never raise isolated liquidation margin.
+        """
+        ts = _utc(ts)
+        if fixing_price <= 0 or not math.isfinite(fixing_price) or not math.isfinite(rate):
+            raise ValueError("invalid funding fixing")
+        if self.last_historical_funding_ts is not None and ts <= self.last_historical_funding_ts:
+            return
+        campaign = self.campaign
+        if (
+            campaign is not None
+            and campaign.origin == "historical"
+            and self.historical_model_complete
+        ):
+            debit = min(-campaign.side * rate / fixing_price, 0.0)
+            for unit in campaign.units:
+                if unit.entry_ts < ts and unit.collateral_btc_per_contract is not None:
+                    unit.collateral_btc_per_contract += debit
+        self.last_historical_funding_ts = ts
+
+    def observe_historical_prices(
+        self, ts: datetime, opening: float, low: float, high: float
+    ) -> list[BreakoutDecision]:
+        campaign = self.campaign
+        if (
+            campaign is None
+            or campaign.origin != "historical"
+            or not self.historical_model_complete
+        ):
+            return []
+        ts = _utc(ts)
+        if ts < campaign.entry_ts or (
+            self.last_historical_price_ts is not None and ts < self.last_historical_price_ts
+        ):
+            return []
+        if not self.historical_funding_available:
+            return []
+        self.last_historical_price_ts = ts
+        hits = []
+        levels = {}
+        for unit in campaign.units:
+            margin = unit.collateral_btc_per_contract
+            if margin is None:
+                raise ValueError("historical collateral evidence missing")
+            denominator = (
+                margin + 1 / unit.entry_price
+                if campaign.side == 1
+                else 1 / unit.entry_price - margin
+            )
+            level = (1 + campaign.side * 0.001) / denominator if denominator > 0 else opening
+            levels[unit.k] = level
+            if denominator <= 0 or (low <= level if campaign.side == 1 else high >= level):
+                hits.append(
+                    (unit.k, min(opening, level) if campaign.side == 1 else max(opening, level))
+                )
+        decisions = []
+        # Match the selected replay's adverse-path ordering. A gap ties at
+        # the open; parent k0 wins that tie and closes remaining children.
+        for k, price in sorted(hits, key=lambda x: (-campaign.side * x[1], x[0])):
+            if k == 0:
+                survivors = []
+                for unit in list(campaign.units):
+                    if unit.k == 0:
+                        continue
+                    crossed = (
+                        price <= levels[unit.k] if campaign.side == 1 else price >= levels[unit.k]
+                    )
+                    if not crossed:
+                        survivors.append(unit.k)
+                    decisions.append(
+                        self.child_closed(
+                            k=unit.k,
+                            ts=ts,
+                            price=price,
+                            reason="child_liquidation" if crossed else "parent_forced_exit",
+                        )
+                    )
+                outcome = self.parent_liquidated(ts, price)
+                decisions.append(
+                    BreakoutDecision(
+                        outcome.ts,
+                        "historical_exit",
+                        outcome.reason,
+                        outcome.campaign_id,
+                        0,
+                        outcome.side,
+                        outcome.price,
+                        {
+                            **outcome.metadata,
+                            "owned": False,
+                            "surviving_units": survivors,
+                        },
+                    )
+                )
+                break
+            else:
+                outcome = self.child_liquidated(k=k, ts=ts, price=price)
+                decisions.append(outcome)
+        return decisions
+
+    def parent_liquidated(
+        self, ts: datetime, price: float, *, reason: str = "liquidation"
+    ) -> BreakoutDecision:
         """Apply an externally observed parent liquidation to campaign occupancy."""
         if self.campaign is None:
             raise ValueError("no active campaign")
@@ -286,7 +433,7 @@ class CloseRangeMachine:
         return BreakoutDecision(
             ts=_utc(ts),
             kind="campaign_exit",
-            reason="parent_liquidation",
+            reason="parent_liquidation" if reason == "liquidation" else "parent_external_close",
             campaign_id=campaign.campaign_id,
             k=0,
             side=campaign.side,
@@ -294,9 +441,16 @@ class CloseRangeMachine:
             metadata={"origin": campaign.origin, "owned": campaign.origin != "historical"},
         )
 
-    def child_liquidated(self, *, k: int, ts: datetime, price: float) -> BreakoutDecision:
+    def child_liquidated(
+        self, *, k: int, ts: datetime, price: float, reason: str = "liquidation"
+    ) -> BreakoutDecision:
         """Remove one liquidated add-on without replenishing its lifetime slot."""
-        return self.child_closed(k=k, ts=ts, price=price, reason="child_liquidation")
+        return self.child_closed(
+            k=k,
+            ts=ts,
+            price=price,
+            reason="child_liquidation" if reason == "liquidation" else "child_external_close",
+        )
 
     def child_closed(self, *, k: int, ts: datetime, price: float, reason: str) -> BreakoutDecision:
         """Remove a funded child that closed independently of the campaign."""
@@ -326,6 +480,14 @@ class CloseRangeMachine:
     def persistent_state(self) -> dict[str, Any]:
         return {
             "version": self.VERSION,
+            "historical_model_complete": self.historical_model_complete,
+            "historical_funding_available": self.historical_funding_available,
+            "last_historical_price_ts": self.last_historical_price_ts.isoformat()
+            if self.last_historical_price_ts
+            else None,
+            "last_historical_funding_ts": self.last_historical_funding_ts.isoformat()
+            if self.last_historical_funding_ts
+            else None,
             "closes": list(self.closes),
             "candles": [self._candle_dict(value) for value in self.candles],
             "true_ranges": list(self.true_ranges),
@@ -346,6 +508,25 @@ class CloseRangeMachine:
         if state.get("version") != cls.VERSION:
             raise ValueError("unsupported close-range state version")
         result = cls()
+        result.historical_model_complete = bool(
+            state.get(
+                "historical_model_complete",
+                not state.get("campaign") or state["campaign"].get("origin") != "historical",
+            )
+        )
+        result.historical_funding_available = bool(
+            state.get("historical_funding_available", result.historical_model_complete)
+        )
+        result.last_historical_price_ts = (
+            _utc(datetime.fromisoformat(state["last_historical_price_ts"]))
+            if state.get("last_historical_price_ts")
+            else None
+        )
+        result.last_historical_funding_ts = (
+            _utc(datetime.fromisoformat(state["last_historical_funding_ts"]))
+            if state.get("last_historical_funding_ts")
+            else None
+        )
         result.closes = deque((float(value) for value in state["closes"]), maxlen=256)
         result.candles = deque(
             (DailyCandle(**cls._restore_times(value, "ts")) for value in state["candles"]),
@@ -378,6 +559,7 @@ class CloseRangeMachine:
                         entry_ts=_utc(datetime.fromisoformat(unit["entry_ts"])),
                         entry_price=float(unit["entry_price"]),
                         origin=str(unit["origin"]),
+                        collateral_btc_per_contract=unit.get("collateral_btc_per_contract"),
                     )
                     for unit in value["units"]
                 ],
@@ -391,11 +573,18 @@ class CloseRangeMachine:
         return result
 
     def _apply_open(
-        self, ts: datetime, raw_open: float, activation_ts: datetime
+        self, ts: datetime, raw_open: float, activation_ts: datetime, direction_mode: str
     ) -> list[BreakoutDecision]:
+        if direction_mode not in self.DIRECTION_MODES:
+            raise ValueError(f"unsupported breakout direction mode: {direction_mode!r}")
         decisions: list[BreakoutDecision] = []
+        recovery_exit_side: int | None = None
+        recovery_campaign_id: str | None = None
         if self.campaign is not None and self.pending_exit is not None:
             campaign = self.campaign
+            if self.pending_exit == "recover":
+                recovery_exit_side = campaign.side
+                recovery_campaign_id = campaign.campaign_id
             decisions.append(
                 BreakoutDecision(
                     ts=ts,
@@ -420,6 +609,26 @@ class CloseRangeMachine:
             if not candidate.structure_pass:
                 decisions.append(self._reject(ts, "parent_structure", candidate, meta))
                 return decisions
+            if candidate.side == recovery_exit_side:
+                decisions.append(
+                    self._reject(
+                        ts,
+                        "recovery_same_open",
+                        candidate,
+                        {**meta, "recovery_campaign_id": recovery_campaign_id},
+                    )
+                )
+                return decisions
+            if ts >= activation_ts and not self._direction_allowed(direction_mode, candidate.side):
+                decisions.append(
+                    self._reject(
+                        ts,
+                        "parent_direction_mode",
+                        candidate,
+                        {**meta, "direction_mode": direction_mode},
+                    )
+                )
+                return decisions
             origin = "paper" if ts >= activation_ts else "historical"
             price = raw_open * (1 + candidate.side * self.ENTRY_SLIPPAGE)
             campaign_id = ts.strftime("%Y%m%d") + ("L" if candidate.side == 1 else "S")
@@ -432,7 +641,17 @@ class CloseRangeMachine:
                 peak_favorable=0.0,
                 origin=origin,
                 lifetime_units=1,
-                units=[CampaignUnit(k=0, entry_ts=ts, entry_price=price, origin=origin)],
+                units=[
+                    CampaignUnit(
+                        k=0,
+                        entry_ts=ts,
+                        entry_price=price,
+                        origin=origin,
+                        collateral_btc_per_contract=1 / price / 5
+                        if origin == "historical"
+                        else None,
+                    )
+                ],
             )
             decisions.append(
                 BreakoutDecision(
@@ -451,6 +670,17 @@ class CloseRangeMachine:
         campaign = self.campaign
         if candidate.side != campaign.side:
             decisions.append(self._reject(ts, "occupied_opposite", candidate, meta))
+        elif campaign.origin != "historical" and not self._direction_allowed(
+            direction_mode, candidate.side
+        ):
+            decisions.append(
+                self._reject(
+                    ts,
+                    "addon_direction_mode",
+                    candidate,
+                    {**meta, "direction_mode": direction_mode},
+                )
+            )
         elif campaign.lifetime_units >= self.MAX_UNITS:
             decisions.append(self._reject(ts, "addon_cap", candidate, meta))
         else:
@@ -462,11 +692,19 @@ class CloseRangeMachine:
             elif displacement > self.MAX_ADDON_DISPLACEMENT + 1e-12:
                 decisions.append(self._reject(ts, "addon_distance", candidate, meta))
             else:
-                origin = "paper" if ts >= activation_ts else "historical"
+                origin = "historical" if campaign.origin == "historical" else "paper"
                 k = campaign.lifetime_units
                 campaign.lifetime_units += 1
                 campaign.units.append(
-                    CampaignUnit(k=k, entry_ts=ts, entry_price=price, origin=origin)
+                    CampaignUnit(
+                        k=k,
+                        entry_ts=ts,
+                        entry_price=price,
+                        origin=origin,
+                        collateral_btc_per_contract=1 / price / 5
+                        if origin == "historical"
+                        else None,
+                    )
                 )
                 decisions.append(
                     BreakoutDecision(
@@ -481,6 +719,14 @@ class CloseRangeMachine:
                     )
                 )
         return decisions
+
+    @staticmethod
+    def _direction_allowed(mode: str, side: int) -> bool:
+        return (
+            mode == "both"
+            or (mode == "long_only" and side == 1)
+            or (mode == "short_only" and side == -1)
+        )
 
     def _candidate(self, candle: DailyCandle) -> BreakoutCandidate | None:
         if len(self.candles) < self.MIN_HISTORY or len(self.true_ranges) < 14 or self.ema20 is None:

@@ -7,20 +7,21 @@ but they're optional — kwargs are the contract.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, insert, select
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from sqlalchemy.orm import Session, sessionmaker
 
 from .models import (
     account_snapshots,
     bars,
     daily_pnl,
+    execution_commands,
     fills,
     funding_fees,
     orders,
@@ -42,6 +43,7 @@ class Recorder:
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._factory = session_factory
+        self._active_session = None
 
     # ---- Run lifecycle ----
 
@@ -55,7 +57,7 @@ class Recorder:
         started_at: datetime,
         notes: str | None = None,
     ) -> int:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             result = session.execute(
                 insert(runs).values(
                     mode=mode,
@@ -70,7 +72,7 @@ class Recorder:
             return int(result.inserted_primary_key[0])
 
     def end_run(self, run_id: int, *, status: str, ended_at: datetime) -> None:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             session.execute(
                 runs.update().where(runs.c.id == run_id).values(status=status, ended_at=ended_at)
             )
@@ -88,7 +90,7 @@ class Recorder:
         close: float,
         volume: float,
     ) -> None:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             # Idempotent: if the (run_id, ts) pair exists already, update it.
             from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -127,7 +129,7 @@ class Recorder:
         position_key: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> int:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             result = session.execute(
                 insert(signals).values(
                     run_id=run_id,
@@ -168,7 +170,7 @@ class Recorder:
         """Atomically replace the durable snapshot after a completed TF bar."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             stmt = sqlite_insert(strategy_state_snapshots).values(
                 run_id=run_id,
                 mode=mode,
@@ -210,7 +212,7 @@ class Recorder:
         rejection_reason: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> int:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             result = session.execute(
                 insert(orders).values(
                     run_id=run_id,
@@ -240,7 +242,7 @@ class Recorder:
         lnm_order_id: str | None = None,
         rejection_reason: str | None = None,
     ) -> None:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             values: dict[str, Any] = {"status": status}
             if price_usd is not None:
                 values["price_usd"] = price_usd
@@ -259,7 +261,7 @@ class Recorder:
         price_usd: float,
         fee_sats: int,
     ) -> int:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             result = session.execute(
                 insert(fills).values(
                     order_id=order_id,
@@ -363,7 +365,7 @@ class Recorder:
         margin_used_sats: int,
         unrealized_pnl_sats: int,
     ) -> None:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             session.execute(
                 insert(account_snapshots).values(
                     run_id=run_id,
@@ -384,7 +386,7 @@ class Recorder:
         signal_id: int | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             session.execute(
                 insert(risk_events).values(
                     run_id=run_id,
@@ -407,7 +409,7 @@ class Recorder:
         """Add to the day's running totals (used by both backtest and live)."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             stmt = sqlite_insert(daily_pnl).values(
                 run_id=run_id,
                 date=date_str,
@@ -457,7 +459,7 @@ class Recorder:
         """Insert a funding settlement once; return whether it was new."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             stmt = sqlite_insert(funding_fees).values(
                 run_id=run_id,
                 trade_id=trade_id,
@@ -487,7 +489,7 @@ class Recorder:
         """Append one idempotent, strategy-attributed P&L contribution."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        with self._factory() as session, session.begin():
+        with self.atomic() as session:
             stmt = sqlite_insert(strategy_pnl_events).values(
                 run_id=run_id,
                 event_key=event_key,
@@ -501,3 +503,118 @@ class Recorder:
             )
             result = session.execute(stmt.on_conflict_do_nothing(index_elements=["event_key"]))
             return bool(result.rowcount)
+
+    @contextmanager
+    def atomic(self):
+        """Compose recorder writes in one transaction. Never hold across await."""
+        if self._active_session is not None:
+            yield self._active_session
+            return
+        with self._factory() as session, session.begin():
+            self._active_session = session
+            try:
+                yield session
+            finally:
+                self._active_session = None
+
+    def begin_command(self, key: str, action: str, request: dict) -> bool:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        with self.atomic() as session:
+            result = session.execute(
+                sqlite_insert(execution_commands)
+                .values(
+                    command_key=key,
+                    action=action,
+                    status="submitted",
+                    request_json=request,
+                    notified=0,
+                )
+                .on_conflict_do_nothing(index_elements=["command_key"])
+            )
+            return bool(result.rowcount)
+
+    def command_result(self, key: str, result: dict) -> None:
+        with self.atomic() as session:
+            session.execute(
+                execution_commands.update()
+                .where(
+                    execution_commands.c.command_key == key,
+                    execution_commands.c.status != "applied",
+                )
+                .values(status="received", result_json=result)
+            )
+
+    def reject_command(self, key: str) -> None:
+        with self.atomic() as session:
+            session.execute(
+                execution_commands.update()
+                .where(execution_commands.c.command_key == key)
+                .values(status="rejected", notified=1)
+            )
+
+    def commands(self, statuses=None, *, undelivered=False):
+        query = select(execution_commands)
+        if statuses:
+            query = query.where(execution_commands.c.status.in_(statuses))
+        if undelivered:
+            query = query.where(execution_commands.c.notified == 0)
+        with self._factory() as session:
+            return [dict(r._mapping) for r in session.execute(query).all()]
+
+    def apply_command(self, key: str) -> tuple[int, int]:
+        """Commit execution facts and aggregates exactly once with command state."""
+        with self.atomic() as session:
+            row = session.execute(
+                select(execution_commands).where(execution_commands.c.command_key == key)
+            ).one()
+            data = row.result_json
+            if row.status == "applied":
+                return int(data["order_id"]), int(data["fill_id"])
+            if row.status != "received":
+                raise RuntimeError("command has no authoritative execution result")
+            order = dict(data["order"])
+            order["ts"] = datetime.fromisoformat(order["ts"])
+            order_id = self.record_order(**order)
+            fill = dict(data["fill"])
+            fill["ts"] = datetime.fromisoformat(fill["ts"])
+            fill_id = self.record_fill(order_id, **fill)
+            pnl = dict(data["pnl"])
+            pnl["ts"] = datetime.fromisoformat(pnl["ts"])
+            if self.record_strategy_pnl_event(**pnl):
+                self.upsert_daily_pnl(
+                    order["run_id"],
+                    date_str=order["ts"].date().isoformat(),
+                    realized_delta_sats=pnl["amount_sats"],
+                )
+            data = {**data, "order_id": order_id, "fill_id": fill_id}
+            session.execute(
+                execution_commands.update()
+                .where(execution_commands.c.command_key == key)
+                .values(
+                    status="applied",
+                    result_json=data,
+                    notified=0 if data.get("external_event") else 1,
+                )
+            )
+            return order_id, fill_id
+
+    def acknowledge_commands(self, keys) -> None:
+        with self.atomic() as session:
+            session.execute(
+                execution_commands.update()
+                .where(execution_commands.c.command_key.in_(keys))
+                .values(notified=1)
+            )
+
+    def owned_trade_history(self) -> dict[str, dict]:
+        """Immutable opening ownership also remains available after closure."""
+        with self._factory() as session:
+            rows = session.execute(
+                select(orders).where(orders.c.lnm_order_id.is_not(None)).order_by(orders.c.id)
+            ).all()
+        return {
+            r.lnm_order_id: dict(r._mapping)
+            for r in rows
+            if (r.metadata_json or {}).get("isolated_action") == "open"
+        }

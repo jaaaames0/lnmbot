@@ -317,7 +317,7 @@ async def test_successful_remote_close_is_not_retried_when_persistence_fails(rec
         "record_order",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
     )
-    with pytest.raises(UnsafeLiveStateError, match="local close persistence failed"):
+    with pytest.raises(UnsafeLiveStateError, match="durable result must be recovered"):
         await executor.submit(
             intent=OrderIntent.exit("1d", reason="exit"),
             signal_id=signal_id,
@@ -404,28 +404,30 @@ async def test_live_executor_records_actual_trade_fees_and_net_daily_pnl(recorde
     assert executor.consume_realized_pnl_usd() == pytest.approx(0.0025)
 
 
-async def test_live_executor_closes_remote_trade_when_order_persistence_fails():
-    class FailingRecorder:
-        def record_order(self, *args, **kwargs):
-            raise RuntimeError("database unavailable")
-
+async def test_live_executor_replays_remote_entry_after_accounting_failure(recorder, monkeypatch):
     api = FakeIsolatedTradesApi()
-    executor = LiveExecutor(trades_api=api, recorder=FailingRecorder(), run_id=1)
-    executor.update_price(50_000.0)
-
-    order_id, meta = await executor.submit(
-        intent=OrderIntent.enter_long("1d", 1, 1),
-        signal_id=1,
-        run_id=1,
-        ts=datetime.now(UTC),
-        size_usd=1,
-        leverage=1,
+    executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    executor.update_price(50_000)
+    original = recorder.record_fill
+    monkeypatch.setattr(
+        recorder, "record_fill", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk"))
     )
-
-    assert order_id == -1
-    assert meta["reason"].startswith("persistence_failed_trade_closed")
-    assert api.closes == ["iso-1"]
-    assert api.running == {}
+    with pytest.raises(UnsafeLiveStateError):
+        await executor.submit(
+            intent=OrderIntent.enter_long("1d", 100, 5),
+            signal_id=1,
+            run_id=1,
+            ts=datetime.now(UTC),
+            size_usd=100,
+            leverage=5,
+        )
+    assert list(api.running) == ["iso-1"]
+    assert not api.closes
+    monkeypatch.setattr(recorder, "record_fill", original)
+    restored = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    await restored.reconcile()
+    assert restored.position_qty_sats("1d") == 100
+    assert len(api.trades) == 1
 
 
 async def test_same_direction_entry_is_idempotent(recorder):
@@ -459,27 +461,31 @@ async def test_same_direction_entry_is_idempotent(recorder):
     assert len(api.trades) == 1
 
 
-async def test_ambiguous_entry_submission_fails_closed_when_remote_trade_exists(recorder):
+async def test_ambiguous_entry_blocks_new_admission_after_restart(recorder):
     class ResponseLostApi(FakeIsolatedTradesApi):
         async def new_trade(self, params):
             await super().new_trade(params)
-            raise TimeoutError("response lost after remote acceptance")
+            raise TimeoutError("accepted then lost response")
 
     api = ResponseLostApi()
     executor = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
-    executor.update_price(50_000.0)
-
-    with pytest.raises(UnsafeLiveStateError, match="untracked remote trade"):
-        await executor.submit(
-            intent=OrderIntent.enter_long("1d", 1, 1),
-            signal_id=1,
-            run_id=1,
-            ts=datetime.now(UTC),
-            size_usd=1,
-            leverage=1,
-        )
-
-    assert list(api.running) == ["iso-1"]
+    executor.update_price(50_000)
+    args = dict(
+        intent=OrderIntent.enter_long("1d", 100, 5),
+        signal_id=1,
+        run_id=1,
+        ts=datetime.now(UTC),
+        size_usd=100,
+        leverage=5,
+    )
+    _, detail = await executor.submit(**args)
+    assert detail["reason"] == "entry_outcome_unresolved"
+    restored = LiveExecutor(trades_api=api, recorder=recorder, run_id=1)
+    await restored.reconcile()
+    restored.update_price(50_000)
+    _, detail = await restored.submit(**args)
+    assert detail["reason"] == "unowned_remote_exposure"
+    assert len(api.trades) == 1
 
 
 async def test_live_executor_per_tf_isolation(recorder, tmp_path):

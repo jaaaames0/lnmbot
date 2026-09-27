@@ -26,6 +26,117 @@ def candle(ts: datetime, price: float, *, close: float | None = None) -> DailyCa
     )
 
 
+def _qualifying_candidate(ts: datetime, side: int) -> BreakoutCandidate:
+    return BreakoutCandidate(
+        signal_ts=ts,
+        side=side,
+        boundary=105.0 if side == 1 else 95.0,
+        signal_close=110.0 if side == 1 else 90.0,
+        ema20=100.0,
+        atr14=2.0,
+        average_overlap10=0.4,
+        distance_ema_atr=3.0,
+        structure_pass=True,
+    )
+
+
+@pytest.mark.parametrize("side", [1, -1])
+def test_recovery_blocks_only_same_side_parent_at_exit_open(side: int) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.seed_campaign(
+        {
+            "parent_id": "old",
+            "side": "long" if side == 1 else "short",
+            "entry_ts": (start + timedelta(days=30)).isoformat(),
+            "entry_price": 100.0,
+            "boundary": 90.0 if side == 1 else 110.0,
+            "held_days": 90,
+            "peak_favorable_pct": 0.2,
+            "active_units": 1,
+            "pending_exit": "recover",
+        }
+    )
+    machine.pending_candidate = _qualifying_candidate(start + timedelta(days=119), side)
+    first = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=120),
+    )
+    assert [(decision.kind, decision.reason) for decision in first] == [
+        ("historical_exit", "recover"),
+        ("reject", "recovery_same_open"),
+    ]
+    assert first[1].metadata["recovery_campaign_id"] == "old"
+    assert machine.campaign is None
+
+    machine.pending_candidate = _qualifying_candidate(start + timedelta(days=120), side)
+    next_open = machine.advance(
+        candle(start + timedelta(days=121), 100),
+        activation_ts=start + timedelta(days=120),
+    )
+    assert next_open[0].kind == "paper_parent"
+    assert machine.campaign is not None and machine.campaign.side == side
+
+
+@pytest.mark.parametrize("exit_reason", ["range_close", "maximum_hold"])
+def test_other_exit_reasons_keep_same_open_parent_admission(exit_reason: str) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.seed_campaign(
+        {
+            "parent_id": "old",
+            "side": "long",
+            "entry_ts": (start + timedelta(days=30)).isoformat(),
+            "entry_price": 100.0,
+            "boundary": 90.0,
+            "held_days": 90,
+            "peak_favorable_pct": 0.2,
+            "active_units": 1,
+            "pending_exit": exit_reason,
+        }
+    )
+    machine.pending_candidate = _qualifying_candidate(start + timedelta(days=119), 1)
+    decisions = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=120),
+    )
+    assert [(decision.kind, decision.reason) for decision in decisions[:2]] == [
+        ("historical_exit", exit_reason),
+        ("paper_parent", "structure_parent"),
+    ]
+
+
+def test_recovery_exit_does_not_block_opposite_side_parent() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.seed_campaign(
+        {
+            "parent_id": "old",
+            "side": "long",
+            "entry_ts": (start + timedelta(days=30)).isoformat(),
+            "entry_price": 100.0,
+            "boundary": 90.0,
+            "held_days": 90,
+            "peak_favorable_pct": 0.2,
+            "active_units": 1,
+            "pending_exit": "recover",
+        }
+    )
+    machine.pending_candidate = _qualifying_candidate(start + timedelta(days=119), -1)
+    decisions = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="both",
+    )
+    assert [(decision.kind, decision.reason) for decision in decisions[:2]] == [
+        ("historical_exit", "recover"),
+        ("paper_parent", "structure_parent"),
+    ]
+
+
 def test_feature_calculation_matches_frozen_research_matrix():
     pd = pytest.importorskip("pandas")
     from scripts.investigate_btc_broad_features import daily_features
@@ -147,11 +258,135 @@ def test_ordinary_rules_apply_to_seeded_addon_without_funded_policy():
     decisions = machine.advance(
         candle(start + timedelta(days=120), 110),
         activation_ts=start + timedelta(days=120),
+        direction_mode="short_only",
     )
     addon = decisions[0]
-    assert addon.kind == "paper_addon"
+    assert addon.kind == "historical_addon"
     assert addon.metadata["owned"] is False
-    assert machine.campaign is not None and machine.campaign.units[1].origin == "paper"
+    assert machine.campaign is not None and machine.campaign.units[1].origin == "historical"
+
+
+def test_direction_mode_rejects_parent_without_occupying_next_signal():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.pending_candidate = BreakoutCandidate(
+        signal_ts=start + timedelta(days=119),
+        side=-1,
+        boundary=105,
+        signal_close=94,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    first = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="long_only",
+    )
+    assert [(decision.kind, decision.reason) for decision in first] == [
+        ("reject", "parent_direction_mode")
+    ]
+    assert first[0].metadata["direction_mode"] == "long_only"
+    assert machine.campaign is None
+
+    machine.pending_candidate = BreakoutCandidate(
+        signal_ts=start + timedelta(days=120),
+        side=1,
+        boundary=95,
+        signal_close=106,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    second = machine.advance(
+        candle(start + timedelta(days=121), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="long_only",
+    )
+    assert [decision.kind for decision in second] == ["paper_parent"]
+    assert machine.campaign is not None and machine.campaign.side == 1
+
+
+def test_direction_mode_does_not_rewrite_pre_activation_reference_parent():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.pending_candidate = BreakoutCandidate(
+        signal_ts=start + timedelta(days=119),
+        side=-1,
+        boundary=105,
+        signal_close=94,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    decisions = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=121),
+        direction_mode="long_only",
+    )
+    assert [decision.kind for decision in decisions] == ["historical_parent"]
+    assert machine.campaign is not None and machine.campaign.origin == "historical"
+
+
+def test_direction_mode_blocks_addon_but_keeps_open_campaign_exit():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    machine = CloseRangeMachine()
+    machine.warmup([candle(start + timedelta(days=i), 100) for i in range(120)])
+    machine.pending_candidate = BreakoutCandidate(
+        signal_ts=start + timedelta(days=119),
+        side=-1,
+        boundary=105,
+        signal_close=94,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    parent = machine.advance(
+        candle(start + timedelta(days=120), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="both",
+    )
+    assert [decision.kind for decision in parent] == ["paper_parent"]
+    machine.pending_candidate = BreakoutCandidate(
+        signal_ts=start + timedelta(days=120),
+        side=-1,
+        boundary=105,
+        signal_close=94,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    blocked = machine.advance(
+        candle(start + timedelta(days=121), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="long_only",
+    )
+    assert [(decision.kind, decision.reason) for decision in blocked] == [
+        ("reject", "addon_direction_mode")
+    ]
+    assert machine.campaign is not None and machine.campaign.lifetime_units == 1
+    machine.pending_exit = "range_close"
+    exited = machine.advance(
+        candle(start + timedelta(days=122), 100),
+        activation_ts=start + timedelta(days=120),
+        direction_mode="long_only",
+    )
+    assert [(decision.kind, decision.reason) for decision in exited] == [
+        ("campaign_exit", "range_close")
+    ]
+    assert machine.campaign is None
 
 
 def test_persistent_state_round_trip_and_contiguous_days():

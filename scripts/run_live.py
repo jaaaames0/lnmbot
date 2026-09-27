@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
+import hashlib
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lnmarkets_bot.api.account import AccountApi
 from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTradesApi
+from lnmarkets_bot.api.market import MarketApi
 from lnmarkets_bot.config import BotConfig
 from lnmarkets_bot.data.live import LnmLiveStream
 from lnmarkets_bot.data.multitimeframe import MultiTimeframeDataSource
@@ -33,6 +37,7 @@ from lnmarkets_bot.persistence.db import init_schema, make_engine, make_session_
 from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
 from lnmarkets_bot.strategy.close_range_live import CloseRangeLive, load_seed_machine
+from lnmarkets_bot.strategy.historical import hydrate_historical
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
 
@@ -53,7 +58,12 @@ def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime
         return utc.replace(hour=0, minute=0, second=0, microsecond=0)
 
     for name in names:
-        snapshot = recorder.latest_strategy_state(mode="live", strategy_name=name)
+        snapshot = recorder.latest_strategy_state(
+            mode="live",
+            strategy_name=(
+                "ma_cross_primary" if name.endswith(".MaCross") else "btc_close_range_v1"
+            ),
+        ) or recorder.latest_strategy_state(mode="live", strategy_name=name)
         if snapshot is None:
             # A cold strategy needs its entire warmup history to be sound.
             return None
@@ -153,6 +163,19 @@ async def main() -> int:
     # cross-margin API here: it exposes one net position per symbol.
     trades_api = IsolatedTradesApi(client)
 
+    # Hold one executor lock for this database through process lifetime.
+    # Acquire before migrations or any trading request.
+    executor_lock = None
+    if args.allow_orders:
+        lock_path = Path(str(cfg.storage_db_path.resolve()) + ".executor.lock")
+        executor_lock = lock_path.open("a")
+        try:
+            fcntl.flock(executor_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            executor_lock.close()
+            await client.aclose()
+            log.error("live.executor_already_running")
+            return 1
     # Initialize DB
     engine = make_engine(cfg.storage_db_path)
     init_schema(engine)
@@ -221,6 +244,7 @@ async def main() -> int:
             run_id=-1,
             symbol="BTCUSD",
             legacy_strategy_instance_id="ma_cross_primary",
+            max_entry_age_seconds=300,
         )
         account_balance_provider = LiveAccountBalanceProvider(
             account_api=AccountApi(client), isolated_trades_api=trades_api, recorder=recorder
@@ -267,6 +291,7 @@ async def main() -> int:
                         "leverage": cfg.strategy_breakout_leverage,
                         "activation_ts": datetime.now(UTC).isoformat(),
                         "entries_enabled": cfg.strategy_breakout_enabled,
+                        "direction_mode": cfg.strategy_breakout_direction_mode,
                     },
                     machine=load_seed_machine(
                         cfg.strategy_breakout_seed_daily_path,
@@ -274,10 +299,46 @@ async def main() -> int:
                     ),
                 )
                 bindings.append(StrategyBinding("btc_close_range_v1", breakout))
+
+            async def historical_hydrator(machine):
+                root = Path(__file__).resolve().parents[1]
+                ref = json.loads(
+                    (root / "docs/btc-close-range-lnm-paper-reference-2026-09-13.json").read_text()
+                )
+                if (
+                    hashlib.sha256(
+                        cfg.strategy_breakout_seed_campaign_path.read_bytes()
+                    ).hexdigest()
+                    != ref["seed_sha256"]
+                    or hashlib.sha256(
+                        cfg.strategy_breakout_seed_daily_path.read_bytes()
+                    ).hexdigest()
+                    != ref["candles_sha256"]
+                ):
+                    raise ValueError("historical reference source hashes differ")
+                end = machine.last_bar_ts + timedelta(days=1)
+                rows = await historical_funding(
+                    machine.campaign.entry_ts, end + timedelta(seconds=1)
+                )
+                hydrate_historical(machine, ref, rows)
+
+            async def historical_funding(from_ts, to_ts):
+                rows = await MarketApi(client).funding_settlements(from_ts=from_ts, to_ts=to_ts)
+                return [
+                    (
+                        datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
+                        float(row["fundingRate"]),
+                        float(row["fixingPrice"]),
+                    )
+                    for row in rows
+                ]
+
             run_id = await run_portfolio_live(
                 cfg=cfg,
                 data_source=ds,
                 bindings=tuple(bindings),
+                historical_funding_provider=historical_funding,
+                historical_hydrator=historical_hydrator,
                 executor=executor,
                 recorder=recorder,
                 sizing_policy=sizing_policy,
@@ -305,6 +366,8 @@ async def main() -> int:
         return 1
     finally:
         await client.aclose()
+        if executor_lock is not None:
+            executor_lock.close()
 
 
 if __name__ == "__main__":

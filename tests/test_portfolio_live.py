@@ -186,10 +186,7 @@ async def test_portfolio_routes_same_timeframe_to_distinct_strategy_positions(cf
             .all()
         )
     assert rows == [("first", "1m"), ("second", "1m")]
-    # The two test instances intentionally share a class identity, so the
-    # durable snapshot key is replaced rather than duplicated. The assertion
-    # proves first-live-bar persistence occurs before a higher-TF boundary.
-    assert snapshots == [f"{_Entry.__module__}.{_Entry.__name__}"]
+    assert snapshots == ["first", "second"]
 
 
 @pytest.mark.asyncio

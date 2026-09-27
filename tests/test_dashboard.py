@@ -86,6 +86,13 @@ def test_signals_span_restart_runs_by_default(tmp_path):
                 json.dumps({"trigger_tf": "4h"}),
             ),
         )
+        connection.execute(
+            "INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                2, 3, "2026-07-16 08:01:00", "noop", None, 0.0, 1.0,
+                "restart_state_aligned", json.dumps({"trigger_tf": "4h"}),
+            ),
+        )
 
     dashboard = _dashboard_module()
 
@@ -93,6 +100,179 @@ def test_signals_span_restart_runs_by_default(tmp_path):
     assert [signal["reason"] for signal in all_signals] == ["verdict_flat"]
     assert dashboard._signals(db_path, run_id=3) == []
     assert dashboard._signals(db_path, tf="4h")[0]["timeframe"] == "4h"
+
+
+def test_cooloff_signal_shows_slot_number_and_verdict_transition(tmp_path):
+    db_path = tmp_path / "cooloff-signals.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE signals ("
+            "id INTEGER PRIMARY KEY, run_id INTEGER, ts TEXT, kind TEXT, side TEXT, "
+            "target_size_usd REAL, target_leverage REAL, reason TEXT, metadata_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO signals VALUES (1,1,'2026-09-24 00:00:00','noop',NULL,0,1,'cool_off',?)",
+            (json.dumps({
+                "trigger_tf": "1d", "previous_verdict": "UP_TRUE", "verdict": "FLAT",
+                "cooldown_types": ["winner"], "winner_remaining_before": 11,
+                "winner_remaining_after": 10, "winner_total": 12,
+                "loss_remaining_before": 0, "loss_remaining_after": 0, "loss_total": 3,
+            }),),
+        )
+
+    dashboard = _dashboard_module()
+    rows = dashboard._signal_timeline_rows(db_path, "1d", None, None)
+
+    assert len(rows) == 1
+    assert rows[0]["strategy"] == "MA cross"
+    assert rows[0]["signal_ts"] == "2026-09-23T00:00:00+00:00"
+    assert rows[0]["event"] == "Suppressed"
+    assert rows[0]["detail"] == "winner 2/12 · Up → Flat"
+
+
+def test_breakout_campaign_exit_displays_once_with_all_unit_slots(tmp_path):
+    db_path = tmp_path / "exit-signals.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE signals ("
+            "id INTEGER PRIMARY KEY, run_id INTEGER, ts TEXT, kind TEXT, side TEXT, "
+            "target_size_usd REAL, target_leverage REAL, reason TEXT, metadata_json TEXT, "
+            "strategy_instance_id TEXT, position_key TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO signals VALUES (?,1,'2026-09-24 00:00:00','exit',NULL,0,1,"
+            "'range_close',?,'btc_close_range_v1',?)",
+            [
+                (k + 1, json.dumps({"trigger_tf": "1d", "campaign_id": "20260822L"}), f"k{k}")
+                for k in range(4)
+            ],
+        )
+    dashboard = _dashboard_module()
+    state = {"recent_decisions": [{
+        "ts": "2026-09-24T00:00:00+00:00", "kind": "campaign_exit",
+        "reason": "range_close", "k": None,
+    }]}
+
+    rows = dashboard._signal_timeline_rows(db_path, "breakout", state, None)
+
+    assert len(dashboard._signals(db_path, tf="breakout")) == 4
+    assert len(rows) == 1
+    assert rows[0]["slot"] == "K0-K3"
+    assert rows[0]["event"] == "Exit"
+    assert rows[0]["detail"] == "Back inside parent range"
+    assert rows[0]["qualifiers"] == "-"
+
+
+def test_signal_timeline_shows_causal_order_and_only_signal_qualifiers(tmp_path):
+    db_path = tmp_path / "timeline.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE signals (id INTEGER PRIMARY KEY, run_id INTEGER, ts TEXT, kind TEXT, "
+            "side TEXT, target_size_usd REAL, target_leverage REAL, reason TEXT, "
+            "metadata_json TEXT, strategy_instance_id TEXT, position_key TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO signals VALUES (1,1,'2026-09-24 00:00:00','entry','long',250,5,"
+            "'ma daily',?,'ma_cross_primary','4h')",
+            (json.dumps({"trigger_tf": "4h", "chop_regime": "high", "chop_value": 65,
+                         "entry_size_multiplier": 0.5}),),
+        )
+    dashboard = _dashboard_module()
+    metadata = {"signal_ts": "2026-09-23T00:00:00+00:00", "signal_close": 85_000,
+                "boundary": 82_000, "distance_ema_atr": 1.2, "average_overlap10": 0.31}
+    state = {"recent_decisions": [
+        {"ts": "2026-09-24T00:00:00+00:00", "kind": "signal", "reason": "structure_pass",
+         "k": None, "metadata": metadata},
+        {"ts": "2026-09-24T00:00:00+00:00", "kind": "reject", "reason": "addon_cap",
+         "k": None, "metadata": metadata},
+    ]}
+    rows = dashboard._signal_timeline_rows(db_path, None, state, {"signal_trail": []})
+    assert [row["event"] for row in rows[:2]] == ["Breakout", "Blocked"]
+    assert [row["strategy"] for row in rows[:2]] == ["Breakout", "Breakout*"]
+    assert rows[0]["signal_ts"] == "2026-09-23T00:00:00+00:00"
+    assert rows[0]["qualifiers"] == "close $85,000.00 · range $82,000.00 · EMA ATR 1.20 · overlap 0.310"
+    assert rows[2]["signal_ts"] == "2026-09-23T20:00:00+00:00"
+    assert rows[2]["qualifiers"] == "chop high (65.00)"
+
+
+def test_execution_alignment_requires_current_venue_evidence(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    db_path = tmp_path / "alignment.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_state_snapshots ("
+            "mode TEXT, strategy_name TEXT, state_json TEXT, ts TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO strategy_state_snapshots VALUES ('live', ?, ?, '2026-09-24 00:00:00')",
+            (
+                "lnmarkets_bot.strategy.ma_cross.MaCross",
+                json.dumps({
+                    "timeframes": {"1d": {"verdict": "UP_TRUE"}, "4h": {"verdict": "FLAT"}},
+                    "pending_position_reconciliation": {"1d": None, "4h": None},
+                }),
+            ),
+        )
+    dashboard = _dashboard_module()
+    position = {"strategy": "ma_cross_primary", "slot": "1d", "side": "long", "trade_id": "ma-1"}
+    venue = SimpleNamespace(trades={"ma-1": object()}, fetched_at=datetime.now(UTC))
+
+    assert dashboard._execution_alignment(db_path, [position], venue)[0] == "Aligned"
+    assert dashboard._execution_alignment(
+        db_path, [position], venue, breakout_enabled=True
+    )[0] == "Unknown"
+    assert dashboard._execution_alignment(db_path, [position], None)[0] == "Venue unchecked"
+    assert dashboard._execution_alignment(
+        db_path, [position], SimpleNamespace(trades=venue.trades, fetched_at=datetime.now(UTC) - timedelta(minutes=2))
+    )[0] == "Venue unchecked"
+    assert dashboard._execution_alignment(
+        db_path, [position], SimpleNamespace(trades={}, fetched_at=datetime.now(UTC))
+    )[0] == "Action needed"
+    assert dashboard._execution_alignment(
+        db_path, [position],
+        SimpleNamespace(trades={"ma-1": object(), "unknown": object()}, fetched_at=datetime.now(UTC)),
+    )[0] == "Action needed"
+    assert dashboard._execution_alignment(db_path, [{**position, "side": "short"}], venue)[0] == "Action needed"
+
+
+def test_execution_alignment_checks_breakout_campaign_slots(tmp_path):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    db_path = tmp_path / "breakout-alignment.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_state_snapshots ("
+            "mode TEXT, strategy_name TEXT, state_json TEXT, ts TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO strategy_state_snapshots VALUES ('live', ?, ?, '2026-09-24 00:00:00')",
+            (
+                ("lnmarkets_bot.strategy.ma_cross.MaCross", json.dumps({
+                    "timeframes": {"1d": {"verdict": "FLAT"}, "4h": {"verdict": "FLAT"}},
+                    "pending_position_reconciliation": {},
+                })),
+                ("lnmarkets_bot.strategy.close_range_live.CloseRangeLive", json.dumps({
+                    "machine": {"campaign": {
+                        "origin": "live", "units": [
+                            {"k": 0, "origin": "live"}, {"k": 1, "origin": "live"},
+                        ],
+                    }},
+                    "closing_slots": [],
+                })),
+            ),
+        )
+    dashboard = _dashboard_module()
+    parent = {"strategy": "btc_close_range_v1", "slot": "k0", "side": "long", "trade_id": "bo-0"}
+    child = {**parent, "slot": "k1", "trade_id": "bo-1"}
+    venue = SimpleNamespace(
+        trades={"bo-0": object(), "bo-1": object()}, fetched_at=datetime.now(UTC)
+    )
+
+    assert dashboard._execution_alignment(db_path, [parent], venue)[0] == "Action needed"
+    assert dashboard._execution_alignment(db_path, [parent, child], venue)[0] == "Aligned"
 
 
 def test_market_context_spans_restart_runs_without_optional_binance_cache(tmp_path, monkeypatch):
@@ -268,6 +448,24 @@ def test_strategy_explainer_handles_portfolio_params_and_describes_breakout():
     assert "$100 at 5x" in explainer
 
 
+def test_breakout_direction_mode_is_visible_and_block_reasons_are_explained():
+    dashboard = _dashboard_module()
+    context = dashboard._breakout_context(
+        {"direction_mode": "long_only", "machine": {"campaign": None}}, []
+    )
+    assert context["direction_mode"] == "long_only"
+    assert "Daily campaign · Long only" in dashboard._breakout_card(context, "sats", None)
+    assert dashboard._signal_detail(
+        "parent_direction_mode", {"direction_mode": "long_only"}
+    ) == "Long only blocks this entry"
+    assert dashboard._signal_detail(
+        "direction_mode_changed", {"previous_mode": "both", "direction_mode": "short_only"}
+    ) == "Both directions → Short only"
+    assert dashboard._signal_detail("recovery_same_open") == (
+        "Recovery exit · same-open parent blocked"
+    )
+
+
 def test_strategy_accounting_panel_separates_shared_wallet_results(tmp_path):
     db_path = tmp_path / "accounting.sqlite"
     with sqlite3.connect(db_path) as connection:
@@ -287,8 +485,8 @@ def test_strategy_accounting_panel_separates_shared_wallet_results(tmp_path):
     dashboard = _dashboard_module()
     panel = dashboard._strategy_accounting_panel(db_path, "sats", None)
 
-    assert "ma_cross_primary" in panel
-    assert "btc_close_range_v1" in panel
+    assert "MA cross" in panel
+    assert "Breakout" in panel
     assert "class=positive>+100 " in panel
     assert "class=negative>-3 " in panel
 
@@ -689,31 +887,40 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "campaign · 4/4" in overview
     assert "stack-toggle" in overview
     assert "Recent breakout decisions" not in overview
-    assert "addon_cap" in overview
-    assert "Latest MA 1d signals" in overview
-    assert "Latest breakout signals" in overview
+    assert "Four-unit cap" in overview
+    assert "Recent signals" in overview
+    assert "Latest MA 1d signals" not in overview
+    assert "Latest breakout signals" not in overview
     assert "breakout parent" in overview
     assert "ma daily" in overview
-    assert "Live strategy attribution" in overview
-    assert "MA 1d position" in overview
-    assert "MA 4h position" in overview
-    assert "btc_close_range_v1" in overview
+    assert "Live strategy attribution" not in overview
+    assert "MA cross</b><span>1d / 4h" in overview
+    assert "Breakout</b><span>1d campaign" in overview
+    assert "Account</b><span>shared wallet" in overview
+    page = dashboard._render(db_path, "overview", None)
+    assert 'class="strategy-board"' in page
+    assert "<span>Execution</span>" in page
+    assert "Action needed" in page
+    assert "new breakout entries blocked" in page
+    assert "Breakout" in overview
     active_positions = overview.split("<h2>Active positions</h2>", 1)[1].split(
         "</div><div class=activity-grid>", 1
     )[0]
-    breakout_activity = overview.split("<h2>Latest breakout signals</h2>", 1)[1].split(
+    recent_activity = overview.split("<h2>Recent signals</h2>", 1)[1].split(
         "<h2>Latest funding</h2>", 1
     )[0]
     assert "Blocked by prior short" not in active_positions
-    assert "addon_cap" in breakout_activity
-    assert "All breakout signals →" in breakout_activity
+    assert "Four-unit cap" in recent_activity
+    assert "All signals →" in recent_activity
+    assert "MA cross" in recent_activity
+    assert "Breakout" in recent_activity
     assert active_positions.count("<table>") == 1
     assert active_positions.count('class="stack-unit-row"') == 4
     assert "<th>Status</th>" not in active_positions
     assert "paper" not in active_positions.lower()
     assert "range close $72,968.00" in active_positions
     assert "recovery close" not in active_positions
-    assert "<th>Signal close</th>" not in breakout_activity
+    assert "<th>Signal close</th>" not in recent_activity
 
     rows = dashboard._position_status_rows(
         [], {}, "sats", 85_000.0,

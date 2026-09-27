@@ -79,7 +79,8 @@ async def run_paper(
     kill = KillSwitch(cfg=cfg)
     state = StrategyState()
     # Same USD-sats convention as backtest — see engine/backtest.py.
-    state.balance_sats = int(cfg.initial_balance_usd * 1e8)
+    # BTC cash is initialized from the first observed mark, before decisions.
+    state.balance_sats = 0
     # v1.1 isolated margin: initialize per-TF position slots.
     from lnmarkets_bot.strategy.base import TfPosition
 
@@ -161,6 +162,10 @@ async def run_paper(
                         volume=bar.volume,
                     )
                 executor.update_price(bar.close)
+                if isinstance(executor, PaperFillExecutor):
+                    executor.initialize_balance(cfg.initial_balance_usd, bar.close)
+                    state.balance_sats = executor.balance_sats or 0
+                    state.equity_sats = executor.equity_sats()
                 guard.current_price_usd = bar.close
                 retry_pending_exits = getattr(executor, "retry_pending_exits", None)
                 if retry_pending_exits is not None and not bar.warmup:
@@ -264,6 +269,9 @@ async def run_paper(
                     exec_pos = executor.positions.get(tf)
                     if exec_pos is not None:
                         pos.leverage = exec_pos.leverage
+                if isinstance(executor, PaperFillExecutor):
+                    state.balance_sats = executor.balance_sats or 0
+                    state.equity_sats = executor.equity_sats()
                 strategy.reconcile_execution_state(state)
                 # The pre-order snapshot above makes the intended target
                 # crash-safe. Replace it after execution so confirmed targets
