@@ -1,6 +1,7 @@
 # Remediation release acceptance — 27 September 2026
 
-Status: source and copy-based acceptance passed; live switch pending. This is
+Status: **accepted live at 10:40 UTC on 27 September 2026**. Both services
+run normal production mode from the immutable release recorded below. This is
 an implementation/operations repair, not evidence of future profitability.
 The [initial audit](independent-audit-2026-09-26.md) and
 [source remediation report](remediation-2026-09-27.md) retain dated evidence.
@@ -27,6 +28,15 @@ second beyond the required settlement and filters back to the inclusive model
 boundary, so every eight-hour settlement precedes its modeled price observation. Operator classification is dry-run by
 default, requires a stopped trader for production application and refuses a
 later slot trade or outstanding execution command.
+
+## Additional confirmed defects from release preflight
+
+These are resolved in the deployed source; the initial audit remains frozen.
+
+| Severity / confidence | Trigger, intended versus observed behavior | Evidence and consequences | Repair, coverage and position care |
+|---|---|---|---|
+| High / confirmed | Real `createdAt` / `closedAt` strings reached code expecting datetime objects. Authoritative fills/closures should persist; receipt/reconciliation instead raised an attribute error. | `src/lnmarkets_bot/api/isolated.py:166`, `engine/live_executor.py:434` and `:787`; the real REST-shaped external-close test reproduced the crash. An accepted entry could remain ambiguous, or closure management fail. | Normalize UTC at the API boundary (`isolated.py:173`), prefer actual `filledAt` and reject malformed nonempty values. `tests/test_ma_external_closures.py:136` and `:198` cover receipt/closure, offset timestamps, replay, classification and malformed inputs. Legacy fill timestamps were corrected only with venue evidence; the account was flat at cutover. |
+| Medium / confirmed | At the eight-hour boundary, the runner queried history with `to` equal to that settlement. The model requires the boundary settlement first; the exclusive API end omitted it. | The authenticated GET-only preflight independently reproduced the omitted September 27 08:00 settlement. Paper completeness would fail and breakout admission stay blocked despite available data; known funded exits continued. | `scripts/run_live.py:44` requests one second past the boundary and filters out future settlements. `tests/test_live_funding_boundary.py:11` simulates the exclusive endpoint; a subsequent real GET preflight and live warmup verified coverage through 08:00. Preserve campaign state and verified funding checkpoints; no funded-order replay or parameter change. |
 
 ## Independent production evidence
 
@@ -64,7 +74,8 @@ is conservative, but venue inventory and available cash remain authoritative.
 
 ## Validation and release gates
 
-The actual dirty checkout's offline suite passed 368 tests in 69.96 seconds,
+After the timestamp/cause and real funding-boundary repairs, the actual dirty
+checkout's final offline suite passed **375 tests in 73.14 seconds**,
 from an empty environment and neutral directory. Authenticated/funded modules
 `test_isolated_positions.py` and `test_live_integration.py` are excluded.
 Subsequent focused checks cover UTC timestamp normalization/refusal and the
@@ -105,3 +116,78 @@ Historical OHLC ordering, slippage, liquidation book/reference differences and
 funding granularity remain model limitations. The linear generic paper engine
 is not a funded inverse-contract/shared-wallet simulator. Full-history funding
 and dashboard queries may need measured optimization as history grows.
+
+
+## Final live acceptance
+
+Source commits are `be69aae1e214` (execution/accounting/campaign repairs) and
+`c0cb72dac281` (confirmed exclusive funding endpoint correction). Both trader and
+dashboard now use `prod-20260927.2-gc0cb72dac281` in their separate
+`/usr/local/lib/lnmbot` and `/usr/local/lib/lnmbot-dashboard` directories.
+The allowlisted Git archive SHA-256 is
+`3b9a27b063a5697e3304fec503f5e98f14939ac76a5db8d17521ab329a686fb4`.
+All 64 exported input files match the commit-derived manifest. Frozen offline
+`uv.lock` builds and real service-user import checks passed. An earlier candidate
+was never activated and remains retained as preflight evidence.
+
+The protected checkpoint is
+`/data/security-backups/lnmbot-remediation-20260927T102913Z`. The critical-state
+fingerprint matched immediately before and after the SQL transaction. A
+mid-transaction diagnostic on a disposable copy proved full rollback; changed
+ledger and repeated application were refused. No live SQLite replacement or
+old-state restoration occurred. Venue GET checks before stop, at cutover, before
+admission and at acceptance all confirmed no running/pending trades and the
+same closed inventory. Exact protected evidence and source Git bundle are
+retained there; credentials remain outside source.
+
+Acceptance first used the compatible unit with a zero entry cap. After live
+warmup/restore checks passed, the normal unit restored the existing USD 2,500
+cap; the remaining settings were unchanged. The final funded run is 64, with
+trader PID 308202 and dashboard PID 306548, both active/running with zero
+automatic restarts at acceptance. Exactly one funded runner was observed.
+Current-run account and both strategy snapshots, fresh completed-minute bars,
+full historical funding through September 27 08:00 UTC and complete four-unit
+paper state passed. Opening candle timestamps can precede process start by
+part of a minute; current-run ownership and freshness establish post-restart
+observation rather than an incorrect strict timestamp-after-start comparison.
+
+The order journal stayed at **40 orders** and the repaired ledger at **351
+events / 325,969 net sats**. There were no startup or diagnostic orders.
+Daily/four-hour MA winner cooldowns stayed at **11/7**. Historical campaign
+`20260822L` remained at holding day 36, with four surviving historical units,
+no funded ownership and `long_only` preserved. New execution commands are
+empty; no ambiguous result or undelivered closure needs operator disposition.
+
+`/healthz`, `/health`, overview, signals, trades, funding, P&L and runs each
+returned HTTP 200 without a database error. The dashboard cannot write the DB
+or read the trader credential; the trader cannot read the dashboard credential;
+neither service can write its immutable code. Service identities, containment,
+listener and separate environments are retained. Core, LND and nginx process
+state matched the pre-switch checkpoint; they were not restarted. Existing
+monitor/watcher definitions retained their unit/identity/listener expectations.
+
+`lnmbot-backup.service` finished with `Result=success`, `ExecMainStatus=0`.
+The independent recovery timer was disarmed without execution after acceptance.
+Prior runtimes, backups and compatible zero-entry recovery unit remain retained;
+only a reviewed future transaction should use them. The topology, handbook and
+source/runtime inventory were updated. Changes and the production tag are local;
+no remote push occurred. Unrelated dirty research remains preserved, including
+corrected selected-model research scripts and generated evidence outside the
+runtime export. Authored reports refer to those retained workspace artifacts;
+they were not published as production inputs.
+
+The remaining limits are the real exchange/outage/partial-fill and model issues
+listed above, plus browser/UI behavior beyond server-rendered HTTP checks. No
+claim is made that every future venue response or failure will behave like a
+simulated test, or that a correct implementation guarantees profitability.
+
+
+Host privilege closeout: `sudo -k` invalidated cached authentication, but
+`sudo -n true` still succeeded for UID 1000 (`james`); read-only authorization
+inspection confirmed pre-existing `(ALL) NOPASSWD: ALL`. No sudo rule was
+introduced or changed by this deployment. The application release is accepted,
+but this host exception remains open. `/home/james/AGENTS.md` requires:
+“Temporary privilege exceptions must be explicit, attended and closed with an
+invalidated-credential `sudo -n true` failure.” Closing the pre-existing
+host-wide policy is separate from this application transaction and requires
+operator disposition; it must not be mistaken for a successful privilege reset.
