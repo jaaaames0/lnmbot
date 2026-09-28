@@ -2729,10 +2729,12 @@ def _execution_alignment(
             "historical_model_complete",
             not isinstance(campaign, dict) or campaign.get("origin") != "historical",
         )
-        if not complete or not machine.get("historical_funding_available", complete):
+        if not complete:
             issues.append(
                 "Historical occupancy needs verified reconstruction; new breakout entries blocked"
             )
+        elif not machine.get("historical_funding_available", complete):
+            pending.append("Historical funding pending; new breakout entries paused")
         closing = set(breakout_state.get("closing_slots") or [])
         if closing:
             pending.append("Breakout closing " + ", ".join(sorted(closing)))

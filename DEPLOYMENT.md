@@ -132,6 +132,18 @@ signals and existing exits follow their ordinary rules.
 The seeded historical campaign and order-incapable shadow book are references
 only; neither is a funded position or part of funded P&L. Review owned venue
 inventory and campaign state before changing breakout settings.
+At each eight-hour boundary, the trader verifies historical funding before
+advancing the seeded campaign. At the daily decision it waits up to three
+seconds for a newly published settlement. If funding remains late, the breakout
+model pauses and retries while the trader buffers its price bars. Once funding is
+complete, it replays those bars in order and resumes at the next live decision;
+missed entry signals are never placed late. The paused state survives a trader
+restart through its saved checkpoint and the live feed's candle backfill. If
+price evidence is missing or the buffer exceeds roughly three days, it needs
+verified reconstruction before new breakout entries. MA trading and owned
+breakout exits continue throughout. In that case, verify the missing funding
+and candle evidence, then restart only the trader to rebuild from its saved
+checkpoint; do not clear the model flags by hand.
 
 ## 4. First-time installation
 

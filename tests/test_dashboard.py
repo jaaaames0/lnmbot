@@ -961,6 +961,28 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "ma daily" in dashboard._render(db_path, "signals", None)
 
 
+def test_execution_shows_retrying_historical_funding_as_pending(tmp_path):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=False)
+    with sqlite3.connect(db_path) as connection:
+        row_id, raw = connection.execute(
+            "SELECT id, state_json FROM strategy_state_snapshots "
+            "WHERE strategy_name = 'lnmarkets_bot.strategy.close_range_live.CloseRangeLive'"
+        ).fetchone()
+        state = json.loads(raw)
+        state["machine"]["historical_model_complete"] = True
+        state["machine"]["historical_funding_available"] = False
+        connection.execute(
+            "UPDATE strategy_state_snapshots SET state_json = ? WHERE id = ?",
+            (json.dumps(state), row_id),
+        )
+
+    page = _dashboard_module()._render(db_path, "overview", None)
+    assert "Pending" in page
+    assert "Historical funding pending; new breakout entries paused" in page
+    assert "Historical occupancy needs verified reconstruction" not in page
+
+
 def test_historical_breakout_paper_mark_is_segregated_from_funded_totals(tmp_path):
     db_path = tmp_path / "portfolio.sqlite"
     _create_multistrategy_dashboard_db(db_path, funded=False)

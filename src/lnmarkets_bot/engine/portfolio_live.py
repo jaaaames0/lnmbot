@@ -8,9 +8,10 @@ unique ``strategy_instance_id:position_key`` address.
 from __future__ import annotations
 
 import asyncio
+import math
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from ..control.kill import KillSwitch
@@ -18,7 +19,7 @@ from ..control.lifecycle import run_session
 from ..logging import get_logger
 from ..risk.guard import RiskGuard
 from ..risk.limits import from_config as limits_from_config
-from ..strategy import StrategyState, intents_to_list
+from ..strategy import Bar, StrategyState, intents_to_list
 from ..strategy.base import TfPosition
 
 if TYPE_CHECKING:
@@ -26,6 +27,128 @@ if TYPE_CHECKING:
     from ..data.source import DataSource
     from ..persistence.recorder import Recorder
     from ..strategy import Strategy
+
+
+_HISTORICAL_FUNDING_RETRY_SECONDS = 30.0
+_HISTORICAL_FUNDING_INITIAL_TIMEOUT_SECONDS = 2.0
+_HISTORICAL_FUNDING_BACKGROUND_TIMEOUT_SECONDS = 10.0
+_HISTORICAL_FUNDING_DAILY_GRACE_SECONDS = 3.0
+_HISTORICAL_FUNDING_DAILY_RETRY_SECONDS = 1.0
+_MAX_HISTORICAL_CATCHUP_BARS = 4500  # About three days of minute and aggregate bars.
+_HISTORICAL_FUNDING_FAILURE_REASONS = frozenset(
+    {
+        "historical funding provider unavailable",
+        "historical funding gap",
+        "historical funding source incomplete",
+        "historical funding invalid",
+        "API pagination cursor did not advance",
+    }
+)
+
+
+def _funding_boundary(ts: datetime) -> datetime:
+    stamp = ts.astimezone(UTC)
+    return stamp.replace(hour=(stamp.hour // 8) * 8, minute=0, second=0, microsecond=0)
+
+
+async def _verified_historical_funding(
+    provider: Any, start: datetime, boundary: datetime
+) -> list[tuple[datetime, float, float]]:
+    if provider is None:
+        raise RuntimeError("historical funding provider unavailable")
+    rows = await provider(start, boundary)
+    expected = start + timedelta(hours=8)
+    verified = []
+    for stamp, rate, fixing in sorted(rows, key=lambda row: row[0]):
+        if stamp <= start:
+            continue
+        if stamp != expected:
+            raise RuntimeError("historical funding gap")
+        if not math.isfinite(rate) or not math.isfinite(fixing) or fixing <= 0:
+            raise ValueError("historical funding invalid")
+        verified.append((stamp, rate, fixing))
+        expected += timedelta(hours=8)
+    if expected <= boundary:
+        raise RuntimeError("historical funding source incomplete")
+    return verified
+
+
+async def _timed_historical_funding(
+    provider: Any, start: datetime, boundary: datetime, timeout: float
+) -> list[tuple[datetime, float, float]]:
+    return await asyncio.wait_for(
+        _verified_historical_funding(provider, start, boundary), timeout=timeout
+    )
+
+
+async def _initial_historical_funding(
+    provider: Any, start: datetime, boundary: datetime, *, daily_decision: bool
+) -> list[tuple[datetime, float, float]]:
+    if not daily_decision or provider is None:
+        return await _timed_historical_funding(
+            provider, start, boundary, _HISTORICAL_FUNDING_INITIAL_TIMEOUT_SECONDS
+        )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HISTORICAL_FUNDING_DAILY_GRACE_SECONDS
+    last_error: Exception | None = None
+    for attempt in range(3):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            return await _timed_historical_funding(
+                provider,
+                start,
+                boundary,
+                min(_HISTORICAL_FUNDING_INITIAL_TIMEOUT_SECONDS, remaining),
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2 and deadline - loop.time() > _HISTORICAL_FUNDING_DAILY_RETRY_SECONDS:
+                await asyncio.sleep(_HISTORICAL_FUNDING_DAILY_RETRY_SECONDS)
+            else:
+                break
+    if last_error is None:
+        raise TimeoutError("historical funding daily grace elapsed")
+    raise last_error
+
+
+def _apply_historical_funding(machine: Any, rows: list[tuple[datetime, float, float]]) -> None:
+    for stamp, rate, fixing in rows:
+        machine.apply_historical_funding(stamp, rate, fixing)
+    machine.historical_funding_available = True
+
+
+def _replay_historical_bars(
+    strategy: Any,
+    state: StrategyState,
+    bars: list[Bar],
+    rows: list[tuple[datetime, float, float]],
+) -> None:
+    machine = strategy.machine
+    last_minute = machine.last_historical_price_ts
+    row_index = 0
+    machine.historical_funding_available = True
+    for bar in bars:
+        boundary = _funding_boundary(bar.ts)
+        while row_index < len(rows) and rows[row_index][0] <= boundary:
+            machine.apply_historical_funding(*rows[row_index])
+            row_index += 1
+        if bar.timeframe == "1m":
+            if last_minute is not None and bar.ts > last_minute + timedelta(minutes=1):
+                raise RuntimeError("historical price gap during funding catch-up")
+            last_minute = bar.ts
+        # A missed decision is evidence for model state, never a late order.
+        if intents_to_list(strategy.on_bar(replace(bar, warmup=True), state)):
+            raise RuntimeError("historical catch-up emitted an order intent")
+
+
+@dataclass
+class _HistoricalFundingWait:
+    bars: list[Bar]
+    task: asyncio.Task[list[tuple[datetime, float, float]]] | None = None
+    requested_boundary: datetime | None = None
+    retry_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -185,6 +308,7 @@ async def run_portfolio_live(
             deadline = asyncio.get_running_loop().time() + duration_seconds
         last_account_snapshot_ts = None
         strategy_snapshot_saved = {binding.instance_id: False for binding in bindings}
+        historical_waits: dict[str, _HistoricalFundingWait] = {}
         try:
             async for bar in data_source.stream():
                 if deadline is not None and asyncio.get_running_loop().time() >= deadline:
@@ -279,49 +403,153 @@ async def run_portfolio_live(
                         getattr(machine, "historical_model_complete", True),
                         getattr(machine, "historical_funding_available", True),
                     )
+                    skip_strategy_bar = False
                     if (
                         machine is not None
                         and campaign is not None
                         and campaign.origin == "historical"
-                        and machine.historical_model_complete
                     ):
-                        boundary = bar.ts.astimezone(UTC).replace(
-                            hour=(bar.ts.hour // 8) * 8, minute=0, second=0, microsecond=0
-                        )
-                        last = machine.last_historical_funding_ts
-                        if last is None or last < boundary:
-                            try:
-                                if historical_funding_provider is None:
-                                    raise RuntimeError("historical funding provider unavailable")
-                                rows = await historical_funding_provider(
-                                    last or campaign.entry_ts, boundary
-                                )
-                                expected = (last or campaign.entry_ts) + timedelta(hours=8)
-                                for row in sorted(rows, key=lambda value: value[0]):
-                                    stamp, rate, fixing = row
-                                    if last is not None and stamp <= last:
-                                        continue
-                                    if stamp != expected:
-                                        raise RuntimeError("historical funding gap")
-                                    machine.apply_historical_funding(stamp, rate, fixing)
-                                    expected += timedelta(hours=8)
-                                machine.historical_funding_available = (
-                                    machine.last_historical_funding_ts is not None
-                                    and machine.last_historical_funding_ts >= boundary
-                                )
-                                if not machine.historical_funding_available:
-                                    raise RuntimeError("historical funding source incomplete")
-                            except Exception as exc:
-                                # Prices skipped while funding is unknown cannot
-                                # be certified by a later quote. Rebuild from
-                                # complete evidence before reopening admission.
-                                machine.historical_model_complete = False
-                                machine.historical_funding_available = False
-                                log.warning(
-                                    "live.historical_funding_unavailable",
-                                    error_type=type(exc).__name__,
-                                )
-                    intents = intents_to_list(strategy.on_bar(bar, state))
+                        skip_strategy_bar = True
+                        if machine.historical_model_complete:
+                            boundary = _funding_boundary(bar.ts)
+                            last = machine.last_historical_funding_ts or campaign.entry_ts
+                            wait = historical_waits.get(binding.instance_id)
+                            if (
+                                wait is None
+                                and machine.historical_funding_available
+                                and last < boundary
+                            ):
+                                try:
+                                    rows = await _initial_historical_funding(
+                                        historical_funding_provider,
+                                        last,
+                                        boundary,
+                                        daily_decision=bar.timeframe == "1d",
+                                    )
+                                    _apply_historical_funding(machine, rows)
+                                except Exception as exc:
+                                    machine.historical_funding_available = False
+                                    if historical_funding_provider is None:
+                                        machine.historical_model_complete = False
+                                    else:
+                                        wait = _HistoricalFundingWait([])
+                                        historical_waits[binding.instance_id] = wait
+                                    log.warning(
+                                        "live.historical_funding_unavailable",
+                                        error_type=type(exc).__name__,
+                                        reason=(
+                                            str(exc)
+                                            if str(exc) in _HISTORICAL_FUNDING_FAILURE_REASONS
+                                            else "funding read failed"
+                                        ),
+                                        boundary=boundary.isoformat(),
+                                        retrying=wait is not None,
+                                    )
+                            elif wait is None and not machine.historical_funding_available:
+                                # A restart restores the last verified model and
+                                # replays the missing interval from the live feed.
+                                wait = _HistoricalFundingWait([])
+                                historical_waits[binding.instance_id] = wait
+
+                            if wait is not None and bar.ts >= last + timedelta(hours=8):
+                                wait.bars.append(bar)
+                                if len(wait.bars) > _MAX_HISTORICAL_CATCHUP_BARS:
+                                    if wait.task is not None:
+                                        wait.task.cancel()
+                                        await asyncio.gather(wait.task, return_exceptions=True)
+                                    historical_waits.pop(binding.instance_id)
+                                    machine.historical_model_complete = False
+                                    machine.historical_funding_available = False
+                                    log.error(
+                                        "live.historical_rebuild_required",
+                                        error="historical catch-up exceeded buffered bar limit",
+                                    )
+                                else:
+                                    loop = asyncio.get_running_loop()
+                                    if wait.task is not None and wait.task.done():
+                                        task = wait.task
+                                        wait.task = None
+                                        try:
+                                            rows = task.result()
+                                        except Exception as exc:
+                                            wait.retry_at = (
+                                                loop.time() + _HISTORICAL_FUNDING_RETRY_SECONDS
+                                            )
+                                            log.warning(
+                                                "live.historical_funding_retry_failed",
+                                                error_type=type(exc).__name__,
+                                                reason=(
+                                                    str(exc)
+                                                    if str(exc)
+                                                    in _HISTORICAL_FUNDING_FAILURE_REASONS
+                                                    else "funding read failed"
+                                                ),
+                                                boundary=wait.requested_boundary.isoformat()
+                                                if wait.requested_boundary
+                                                else None,
+                                            )
+                                        else:
+                                            if (
+                                                wait.requested_boundary is not None
+                                                and wait.requested_boundary >= boundary
+                                            ):
+                                                checkpoint = strategy.persistent_state()
+                                                try:
+                                                    _replay_historical_bars(
+                                                        strategy, state, wait.bars, rows
+                                                    )
+                                                except Exception as exc:
+                                                    if (
+                                                        checkpoint is None
+                                                        or not strategy.restore_persistent_state(
+                                                            checkpoint
+                                                        )
+                                                    ):
+                                                        raise RuntimeError(
+                                                            "historical replay rollback failed"
+                                                        ) from exc
+                                                    machine = strategy.machine
+                                                    machine.historical_model_complete = False
+                                                    machine.historical_funding_available = False
+                                                    historical_waits.pop(binding.instance_id)
+                                                    log.error(
+                                                        "live.historical_rebuild_required",
+                                                        error_type=type(exc).__name__,
+                                                    )
+                                                else:
+                                                    historical_waits.pop(binding.instance_id)
+                                                    log.info(
+                                                        "live.historical_funding_recovered",
+                                                        boundary=boundary.isoformat(),
+                                                        replayed_bars=len(wait.bars),
+                                                    )
+                                            else:
+                                                wait.retry_at = loop.time()
+                                    if (
+                                        binding.instance_id in historical_waits
+                                        and wait.task is None
+                                        and loop.time() >= wait.retry_at
+                                    ):
+                                        wait.requested_boundary = boundary
+                                        wait.task = asyncio.create_task(
+                                            _timed_historical_funding(
+                                                historical_funding_provider,
+                                                last,
+                                                boundary,
+                                                _HISTORICAL_FUNDING_BACKGROUND_TIMEOUT_SECONDS,
+                                            ),
+                                        )
+                            if (
+                                wait is None
+                                and machine.historical_model_complete
+                                and machine.historical_funding_available
+                            ):
+                                skip_strategy_bar = False
+                        else:
+                            historical_waits.pop(binding.instance_id, None)
+                    intents = (
+                        [] if skip_strategy_bar else intents_to_list(strategy.on_bar(bar, state))
+                    )
                     snapshot_due = not bar.warmup and (
                         bar.timeframe in binding.subscribed_timeframes
                         or bool(intents)
@@ -429,6 +657,13 @@ async def run_portfolio_live(
                             )
                             strategy_snapshot_saved[binding.instance_id] = True
         finally:
+            pending_funding = [
+                wait.task for wait in historical_waits.values() if wait.task is not None
+            ]
+            for task in pending_funding:
+                task.cancel()
+            if pending_funding:
+                await asyncio.gather(*pending_funding, return_exceptions=True)
             with suppress(Exception):
                 await data_source.close()
             for binding in bindings:

@@ -5,14 +5,25 @@ source changes that have not been installed as a production release.
 
 ## Unreleased
 
+### Historical funding admission
+
+- Keep the historical breakout model at its last verified point when funding is
+  late. Give the daily decision a brief grace period, then retry in the
+  background. Replay missed price bars
+  in order after the settlement arrives, including across restarts, before
+  admitting future breakout entries. Expire missed entry signals instead of
+  placing late orders. Missing price evidence still requires reconstruction;
+  MA trading and funded exposure management continue. The dashboard distinguishes
+  a retrying funding delay from a model that needs operator attention.
+
 ### Repository and documentation
 
 - Keep local research and operations evidence under the Git-ignored `docs/`
   archive. The README and deployment guide now describe the funded breakout
   path and current service templates directly.
 - Make the default test suite self-contained and exclude archived research
-  checks that require local market data. The current default run passes 300
-  tests in about 30 seconds; it is not a live-venue or profitability test.
+  checks that require local market data. The default suite runs in about 30
+  seconds; it is not a live-venue or profitability test.
 
 ## 2026-09-27 — Funded multi-strategy remediation accepted
 
