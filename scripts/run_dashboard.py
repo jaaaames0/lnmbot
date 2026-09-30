@@ -1403,11 +1403,16 @@ def _persisted_range_state(db_path: Path) -> dict[str, object] | None:
 
 
 def _range_context(
-    state: dict[str, object] | None, positions: list[dict[str, object]], mark: float | None
+    state: dict[str, object] | None,
+    positions: list[dict[str, object]],
+    mark: float | None,
+    configured_mode: str | None = None,
 ) -> dict[str, object]:
     """Derive channel levels and the shadow book from the saved range state."""
     owned = [p for p in positions if p.get("strategy") == RANGE_INSTANCE_ID]
     state = state or {}
+    # Before the first snapshot, show the configured mode rather than guessing.
+    mode = str(state.get("mode") or configured_mode or "shadow")
     machine = _metadata(state.get("machine"))
     params = _metadata(machine.get("params"))
     channel = machine.get("channel")
@@ -1439,8 +1444,8 @@ def _range_context(
     trades = state.get("paper_trades")
     return {
         "available": bool(state),
-        "mode": state.get("mode", "shadow"),
-        "entries_enabled": state.get("mode") == "funded",
+        "mode": mode,
+        "entries_enabled": mode == "funded",
         "model_complete": state.get("model_complete", True),
         "incomplete_reason": state.get("incomplete_reason"),
         "closing": bool(state.get("closing")),
@@ -2918,9 +2923,12 @@ def _overview(
         or bool(breakout["owned"])
     )
     range_state = _persisted_range_state(db_path)
-    range_context = _range_context(range_state, positions, price)
+    range_mode = str(_metadata(run.get("config_json")).get("strategy_range_mode") or "off")
+    range_context = _range_context(
+        range_state, positions, price, None if range_mode == "off" else range_mode
+    )
     range_enabled = (
-        str(_metadata(run.get("config_json")).get("strategy_range_mode") or "off") != "off"
+        range_mode != "off"
         or range_state is not None
         or bool(range_context["owned"])
     )

@@ -207,3 +207,11 @@ def test_alignment_flags_incomplete_model_and_unmodelled_funded_position(tmp_pat
     assert "Model incomplete" in card
     row = dashboard._range_position_row(context, "sats", None)
     assert row["exposure"] == "$100 · 2.0x" and row["side"] == "long"
+
+
+def test_card_shows_configured_mode_before_first_snapshot():
+    dashboard = _dashboard_module()
+    context = dashboard._range_context(None, [], None, "funded")
+    card = dashboard._range_card(context, "sats", None)
+    assert "Impulse range · Funded" in card and "Awaiting state" in card
+    assert "Shadow" not in card
