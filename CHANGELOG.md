@@ -18,6 +18,12 @@ source changes that have not been installed as a production release.
 - `STRATEGY_RANGE_MODE` (`off`, `shadow`, `funded`) wires it into the funded
   live process with its own owned slot and fixed-notional sizing. It is `off` by
   default.
+- Add a dashboard range panel with the channel, entry, target and stop levels,
+  the efficiency ratio at confirmation, redraws, and the age taper. It also
+  shows the paper or funded position, the shadow book and recent range events.
+  The panel adds a Range signal scope, range settings in the run
+  configuration, and execution-alignment checks for an incomplete model or an
+  unmodelled funded position.
 
 ### Historical funding admission
 

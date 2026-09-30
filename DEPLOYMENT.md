@@ -181,6 +181,12 @@ trader was stopped is sent on the first live bar. A missing daily or 4h bar
 marks the model incomplete: new entries stop and owned exits continue. There is
 no automated rebuild yet; `incomplete_reason` in the saved state records the cause.
 
+The dashboard overview shows a Range card and position row whenever the mode
+is not `off`, a range snapshot exists, or a range trade is owned. It shows the
+current channel and levels, the shadow book (excluded from account totals),
+and recent range events. The Execution indicator reports an incomplete range
+model or an owned position that the saved range state does not record.
+
 ## 4. First-time installation
 
 For local checks, install dependencies in the checkout:

@@ -32,6 +32,7 @@ TIMEFRAMES = ("1d", "4h")
 MA_STRATEGY_NAME = "lnmarkets_bot.strategy.ma_cross.MaCross"
 BREAKOUT_STRATEGY_NAME = "lnmarkets_bot.strategy.close_range_live.CloseRangeLive"
 BREAKOUT_INSTANCE_ID = "btc_close_range_v1"
+RANGE_INSTANCE_ID = "btc_impulse_range_v1"
 CONSTANT_NOTIONAL_USD = 100.0
 BINANCE_HOURLY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1h_4y.parquet"
 BINANCE_DAILY_CACHE = Path(__file__).resolve().parents[1] / "data/cache/btcusdt_perp_1d_4y.parquet"
@@ -598,6 +599,8 @@ def _signals(
         strategy = item.get("strategy_instance_id") or "legacy_ma"
         if tf == "breakout" and strategy != BREAKOUT_INSTANCE_ID:
             continue
+        if tf == "range" and strategy != RANGE_INSTANCE_ID:
+            continue
         if tf in TIMEFRAMES and (
             trigger_tf != tf or strategy not in {"legacy_ma", "ma_cross_primary"}
         ):
@@ -657,6 +660,8 @@ def _orders(
         item = dict(row)
         strategy = item.get("strategy_instance_id") or "legacy_ma"
         if tf == "breakout" and strategy != BREAKOUT_INSTANCE_ID:
+            continue
+        if tf == "range" and strategy != RANGE_INSTANCE_ID:
             continue
         if tf in TIMEFRAMES and (
             item["trigger_tf"] != tf or strategy not in {"legacy_ma", "ma_cross_primary"}
@@ -1379,7 +1384,341 @@ def _breakout_activity_rows(
     return rows
 
 
+def _persisted_range_state(db_path: Path) -> dict[str, object] | None:
+    """Read the impulse-range strategy's own snapshot, if it exists."""
+    try:
+        rows = _query(
+            db_path,
+            "SELECT ts, state_json FROM strategy_state_snapshots "
+            "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
+            (RANGE_INSTANCE_ID,),
+        )
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    state = _metadata(rows[0]["state_json"])
+    state["snapshot_ts"] = rows[0]["ts"]
+    return state
+
+
+def _range_context(
+    state: dict[str, object] | None, positions: list[dict[str, object]], mark: float | None
+) -> dict[str, object]:
+    """Derive channel levels and the shadow book from the saved range state."""
+    owned = [p for p in positions if p.get("strategy") == RANGE_INSTANCE_ID]
+    state = state or {}
+    machine = _metadata(state.get("machine"))
+    params = _metadata(machine.get("params"))
+    channel = machine.get("channel")
+    channel = channel if isinstance(channel, dict) else None
+    setup = machine.get("setup")
+    setup = setup if isinstance(setup, dict) else None
+    levels = None
+    bar_ts = _parse_ts(machine.get("bar_ts"))
+    if channel is not None:
+        lo, hi = float(channel["lo"]), float(channel["hi"])
+        width = hi - lo
+        zone = float(params.get("zone", 0.15))
+        tol = float(params.get("tolerance", 0.10))
+        max_age = float(params.get("max_age_days", 120))
+        confirmed = _parse_ts(channel.get("confirmed_ts"))
+        age = (bar_ts - confirmed).total_seconds() / 86400 if bar_ts and confirmed else 0.0
+        levels = {
+            "lo": lo, "hi": hi, "mid": (lo + hi) / 2, "width_pct": (hi / lo - 1) * 100,
+            "buy": lo + zone * width, "sell": hi - zone * width,
+            "stop_lo": lo - tol * width, "stop_hi": hi + tol * width,
+            "age_days": max(0.0, age), "max_age_days": max_age,
+            "size_multiplier": max(0.0, 1 - age / max_age) if params.get("taper", True) else 1.0,
+        }
+    paper = state.get("paper_position")
+    paper = paper if isinstance(paper, dict) else None
+    paper_mark_pct = None
+    if paper is not None and mark:
+        paper_mark_pct = int(paper["side"]) * (mark / float(paper["entry"]) - 1) * 100
+    trades = state.get("paper_trades")
+    return {
+        "available": bool(state),
+        "mode": state.get("mode", "shadow"),
+        "entries_enabled": state.get("mode") == "funded",
+        "model_complete": state.get("model_complete", True),
+        "incomplete_reason": state.get("incomplete_reason"),
+        "closing": bool(state.get("closing")),
+        "state": machine.get("state", "idle"),
+        "params": params,
+        "channel": channel,
+        "setup": setup,
+        "levels": levels,
+        "machine_position": machine.get("position"),
+        "owned": owned,
+        "paper": paper,
+        "paper_mark_pct": paper_mark_pct,
+        "paper_trades": trades if isinstance(trades, list) else [],
+        "paper_totals": _metadata(state.get("paper_totals")),
+        "events": [e for e in state.get("events", []) if isinstance(e, dict)]
+        if isinstance(state.get("events"), list)
+        else [],
+        "last_daily": _metadata(machine.get("detector")).get("last_ts"),
+        "snapshot_ts": state.get("snapshot_ts"),
+    }
+
+
+def _range_status(context: dict[str, object]) -> tuple[str, str]:
+    channel, setup = context["channel"], context["setup"]
+    if not context["available"]:
+        return "Awaiting state", "No range strategy snapshot yet"
+    if context["state"] == "seek" and isinstance(setup, dict):
+        side = "up" if setup.get("side") == 1 else "down"
+        if setup.get("pulled"):
+            extreme, swing = float(setup["extreme"]), float(setup["swing"])
+            confirm = swing + (1 if setup.get("side") == 1 else -1) * abs(extreme - swing) / 3
+            return (
+                f"Forming after {side} impulse",
+                f"Swing {_format_price(swing)} · confirms on a 4h close past {_format_price(confirm)}",
+            )
+        pullback = float(setup["extreme"]) * (1 - float(context["params"].get("pullback", 0.08))
+                                              * (1 if setup.get("side") == 1 else -1))
+        return (
+            f"Impulse {side}",
+            f"Extreme {_format_price(setup['extreme'])} · waiting for pullback to {_format_price(pullback)}",
+        )
+    if context["state"] == "active" and isinstance(channel, dict):
+        levels = context["levels"]
+        assert isinstance(levels, dict)
+        if channel.get("expanding"):
+            below = channel["expanding"] == -1
+            return (
+                f"Range #{channel['id']} broken {'below' if below else 'above'}",
+                f"Flat · tracking new {'low' if below else 'high'} {_format_price(channel.get('new_extreme'))}"
+                f" · trend beyond {float(context['params'].get('max_width', 0.4)):.0%} width",
+            )
+        return (
+            f"Range #{channel['id']} active",
+            f"{_format_price(levels['lo'])} to {_format_price(levels['hi'])}"
+            f" · width {levels['width_pct']:.1f}%",
+        )
+    return "Idle", "Waiting for a structure-passing daily breakout"
+
+
+def _range_card(context: dict[str, object], denomination: str, btc_price: float | None) -> str:
+    status, detail = _range_status(context)
+    channel, levels = context["channel"], context["levels"]
+    mode = str(context["mode"])
+    lines: list[str] = [html.escape(detail)]
+    if isinstance(channel, dict) and isinstance(levels, dict) and not channel.get("expanding"):
+        er = channel.get("er_at_confirm")
+        er_text = f"{float(er):.2f}" if er is not None else "n/a"
+        filtered = channel.get("tradeable") is False
+        lines.append(
+            f"Buy ≤ {_format_price(levels['buy'])} · sell ≥ {_format_price(levels['sell'])}"
+            f" · target {_format_price(levels['mid'])}"
+        )
+        lines.append(
+            f"Stop on 4h close beyond {_format_price(levels['stop_lo'])} / {_format_price(levels['stop_hi'])}"
+        )
+        lines.append(
+            f"ER at confirmation {er_text}"
+            + (" · choppy start, not traded" if filtered else "")
+            + f" · {int(channel.get('redraws') or 0)} redraws"
+            + f" · day {levels['age_days']:.0f}/{levels['max_age_days']:.0f}"
+            + f" · size x{levels['size_multiplier']:.2f}"
+        )
+    if not context["model_complete"]:
+        lines.append(
+            "Model incomplete: " + str(context.get("incomplete_reason") or "evidence gap")
+            + " · new entries blocked"
+        )
+    owned = context["owned"]
+    assert isinstance(owned, list)
+    position = ""
+    card_class = "flat"
+    if owned:
+        pos = owned[0]
+        card_class = str(pos["side"])
+        pnl = pos.get("estimated_unrealized_sats")
+        position = (
+            f"<small>Funded {html.escape(str(pos['side']))} ${int(pos['contracts']):,}"
+            f" from {_format_price(pos.get('entry_price'))}"
+            + (f" · open P&amp;L {_signed_amount_html(pnl, denomination, btc_price)}"
+               if isinstance(pnl, int) else "")
+            + "</small>"
+        )
+    elif isinstance(context["paper"], dict):
+        paper = context["paper"]
+        card_class = "long" if paper["side"] == 1 else "short"
+        mark = context["paper_mark_pct"]
+        position = (
+            f"<small>Paper {'long' if paper['side'] == 1 else 'short'}"
+            f" from {_format_price(paper['entry'])}"
+            + (f" · mark {_signed_percent_html(f'{mark:.2f}')}" if mark is not None else "")
+            + "</small>"
+        )
+    totals = context["paper_totals"]
+    shadow = ""
+    if mode == "shadow" or totals.get("trades"):
+        n = int(totals.get("trades") or 0)
+        wins = int(totals.get("wins") or 0)
+        shadow = (
+            f"<small>Shadow book: {n} trades"
+            + (f" · {wins / n:.0%} winners · net " if n else "")
+            + (_signed_percent_html(f"{float(totals.get('net_pct_sum') or 0):.2f}") if n else "")
+            + " summed per trade · no funding · excluded from account totals</small>"
+        )
+    label = {"shadow": "Shadow · no orders", "funded": "Funded"}.get(mode, mode)
+    if mode == "funded" and not context["entries_enabled"]:
+        label = "Exits only"
+    return (
+        f'<article class="card position-card range-card {card_class}">'
+        f"<p>Impulse range · {html.escape(label)}</p>"
+        f"<strong>{html.escape(status)}</strong>"
+        + "".join(f"<small>{line}</small>" for line in lines)
+        + position
+        + shadow
+        + "</article>"
+    )
+
+
+def _range_trade_rows(context: dict[str, object], limit: int = 10) -> list[dict[str, object]]:
+    rows = []
+    for trade in reversed(context["paper_trades"][-limit:]):
+        rows.append(
+            {
+                "entry_ts": trade.get("entry_ts"),
+                "exit_ts": trade.get("exit_ts"),
+                "range": f"#{trade.get('range_id')}",
+                "side": "long" if trade.get("side") == 1 else "short",
+                "entry_price": _format_price(trade.get("entry")),
+                "exit_price": _format_price(trade.get("exit")),
+                "reason": _signal_detail(trade.get("reason")),
+                "net": _signed_percent_html(f"{float(trade.get('net_pct') or 0):.2f}"),
+                "source": "replayed" if trade.get("replayed") else "live",
+            }
+        )
+    return rows
+
+
+_RANGE_EVENT_LABELS = {
+    "impulse": "Impulse",
+    "impulse_ignored": "Impulse inside channel ignored",
+    "pullback": "Pullback",
+    "setup_cancel": "Setup cancelled",
+    "confirm": "Channel confirmed",
+    "chop_skip": "Choppy start, not traded",
+    "break": "Channel broken",
+    "redraw": "Channel redrawn",
+    "exit": "Exit",
+    "range_end": "Range ended",
+    "model_incomplete": "Model incomplete",
+    "entry_not_filled": "Entry not filled",
+    "external_close": "Closed at venue",
+    "mode_changed": "Mode changed",
+    "paper_position_dropped": "Paper position dropped",
+    "machine_position_cleared": "Position cleared",
+}
+
+
+def _range_event_rows(context: dict[str, object], limit: int = 10) -> list[dict[str, object]]:
+    # The daily candidate itself is noise here; its effect at the next open
+    # ("impulse" or "impulse ignored") is what the log shows.
+    shown = [e for e in context["events"] if e.get("kind") != "impulse_signal"]
+    rows = []
+    for event in reversed(shown[-limit:]):
+        detail = _metadata(event.get("detail"))
+        parts = []
+        for key in ("side", "id", "lo", "hi", "extreme", "swing", "er", "reason", "dir"):
+            if detail.get(key) is None:
+                continue
+            value = detail[key]
+            if key in {"lo", "hi", "extreme", "swing"}:
+                value = _format_price(value)
+            elif key == "er":
+                value = f"{float(value):.2f}"
+            elif key == "side":
+                value = "up" if value == 1 else "down"
+            elif key == "dir":
+                value = "below" if value == -1 else "above"
+            parts.append(f"{key} {value}")
+        rows.append(
+            {
+                "ts": event.get("ts") or "-",
+                "event": _RANGE_EVENT_LABELS.get(str(event.get("kind")), str(event.get("kind"))),
+                "detail": " · ".join(parts) or "-",
+            }
+        )
+    return rows
+
+
+def _range_position_row(
+    context: dict[str, object], denomination: str, btc_price: float | None
+) -> dict[str, object]:
+    owned = context["owned"]
+    assert isinstance(owned, list)
+    levels = context["levels"]
+    watch = "-"
+    if isinstance(levels, dict):
+        watch = SafeHtml(
+            f"target {html.escape(_format_price(levels['mid']))}<br>"
+            f"stop close {html.escape(_format_price(levels['stop_lo']))} / "
+            f"{html.escape(_format_price(levels['stop_hi']))}"
+        )
+    row: dict[str, object] = {
+        "strategy": "Range",
+        "slot": "r0",
+        "timeframe": "1m",
+        "side": "flat",
+        "contracts": "-",
+        "leverage": "-",
+        "entry_ts": "-",
+        "entry_price": "-",
+        "mark_pnl": "-",
+        "margin": "-",
+        "funding": "-",
+        "exit_trigger": watch,
+    }
+    if owned:
+        pos = owned[0]
+        row.update(
+            side=pos["side"],
+            contracts=f"${int(pos['contracts']):,}",
+            leverage=pos.get("leverage", "-"),
+            entry_ts=pos.get("entry_ts", "-"),
+            entry_price=_format_price(pos.get("entry_price")),
+            mark_pnl=_format_signed_amount(
+                pos.get("estimated_unrealized_sats"), denomination, btc_price
+            ),
+            margin=_format_amount(pos.get("margin_sats"), denomination, btc_price),
+            funding=_format_signed_amount(
+                pos.get("accumulated_funding_sats"), denomination, btc_price, invert=True
+            ),
+        )
+    elif isinstance(context["paper"], dict):
+        paper = context["paper"]
+        row.update(
+            strategy="Range*",
+            side="long" if paper["side"] == 1 else "short",
+            contracts=f"${int(paper['q']):,} paper",
+            entry_ts=paper.get("entry_ts", "-"),
+            entry_price=_format_price(paper.get("entry")),
+            mark_pnl=(
+                f"{context['paper_mark_pct']:+.2f}%"
+                if context["paper_mark_pct"] is not None
+                else "-"
+            ),
+        )
+        row["_row_title"] = "Shadow paper position; no venue trade or wallet P&L"
+    size, leverage = str(row["contracts"]), str(row["leverage"])
+    row["exposure"] = (
+        f"{size} · {leverage if leverage.endswith('x') else leverage + 'x'}"
+        if size != "-" and leverage != "-"
+        else size
+    )
+    row["exit_watch"] = row["exit_trigger"]
+    return row
+
+
 def _strategy_label(strategy_id: object) -> str:
+    if strategy_id == RANGE_INSTANCE_ID:
+        return "Range"
     if strategy_id == BREAKOUT_INSTANCE_ID:
         return "Breakout"
     if strategy_id in {"legacy_ma", "ma_cross_primary"}:
@@ -1440,6 +1779,10 @@ def _signal_event(kind: object, side: object, reason: object) -> str:
         return "Blocked"
     if kind == "signal":
         return "Breakout"
+    if reason == "shadow_entry":
+        return f"Paper enter {side}" if side in {"long", "short"} else "Paper entry"
+    if reason == "shadow_exit":
+        return "Paper exit"
     return str(kind or "Decision").replace("_", " ").capitalize()
 
 
@@ -1469,7 +1812,27 @@ def _signal_detail(reason: object, metadata: dict[str, object] | None = None) ->
         if verdict:
             remaining.append(_verdict_label(verdict))
         return "Pending entry · " + " · ".join(remaining) if remaining else "Pending entry"
+    if reason in {"shadow_entry", "shadow_exit", "range_edge"} and metadata.get("range_id") is not None:
+        parts = [f"range #{metadata['range_id']}"]
+        if reason == "range_edge" and metadata.get("level") is not None:
+            parts.append(f"edge {_format_price(metadata['level'])}")
+            parts.append(f"target {_format_price(metadata.get('target'))}")
+        if reason == "shadow_entry":
+            parts.append(f"at {_format_price(metadata.get('entry'))}")
+        if reason == "shadow_exit":
+            parts.append(_signal_detail(metadata.get("reason")))
+            if metadata.get("net_pct") is not None:
+                parts.append(f"{float(metadata['net_pct']):+.2f}%")
+        return " · ".join(parts)
     labels = {
+        "range_edge": "Range edge",
+        "target": "Midpoint target",
+        "stop": "4h close beyond channel",
+        "expiry": "Range expiry",
+        "new_impulse": "New impulse",
+        "mode_shadow_unwind": "Shadow mode unwinds funded position",
+        "unmodelled_owned_position": "Position without range state",
+        "entry_no_longer_admissible": "Range changed under entry",
         "structure_parent": "Structure passed",
         "raw_same_side_addon": "Same-side breakout",
         "structure_pass": "Structure passed",
@@ -1527,7 +1890,12 @@ def _signal_timeline_rows(
                     "slot": signal["slot"],
                     "kind": signal["kind"],
                     "side": signal["side"] or "-",
-                    "event": _signal_event(signal["kind"], signal["side"], signal["reason"]),
+                    "event": _signal_event(
+                        signal["kind"],
+                        signal["side"]
+                        or {1: "long", -1: "short"}.get(signal["metadata"].get("side")),
+                        signal["reason"],
+                    ),
                     "detail": _signal_detail(signal["reason"], signal["metadata"]),
                     "reason": signal["reason"],
                     "qualifiers": " · ".join(qualifiers) or "-",
@@ -2211,11 +2579,13 @@ def _strategy_performance_rows(
     def group(strategy: object, timeframe: object) -> str:
         if strategy == BREAKOUT_INSTANCE_ID:
             return "Breakout units"
+        if strategy == RANGE_INSTANCE_ID:
+            return "Range"
         if strategy in {"ma_cross_primary", "legacy_ma"} and timeframe in TIMEFRAMES:
             return f"MA {timeframe}"
         return str(strategy or "Other")
 
-    labels = ("MA 1d", "MA 4h", "Breakout units", "Combined")
+    labels = ("MA 1d", "MA 4h", "Breakout units", "Range", "Combined")
     open_started: dict[str, list[datetime]] = {label: [] for label in labels}
     grouped: dict[str, dict[str, dict[str, object]]] = {}
     for order in reversed(_orders(db_path, limit=None)):
@@ -2489,8 +2859,12 @@ def _strategy_accounting_panel(
     by_strategy = {str(row["strategy_instance_id"]): row for row in rows}
     display = []
     strategy_ids = (
-        ["ma_cross_primary", BREAKOUT_INSTANCE_ID]
-        + [name for name in by_strategy if name not in {"ma_cross_primary", BREAKOUT_INSTANCE_ID}]
+        ["ma_cross_primary", BREAKOUT_INSTANCE_ID, RANGE_INSTANCE_ID]
+        + [
+            name
+            for name in by_strategy
+            if name not in {"ma_cross_primary", BREAKOUT_INSTANCE_ID, RANGE_INSTANCE_ID}
+        ]
         if breakout_enabled
         else list(by_strategy)
     )
@@ -2543,6 +2917,13 @@ def _overview(
         or breakout_state is not None
         or bool(breakout["owned"])
     )
+    range_state = _persisted_range_state(db_path)
+    range_context = _range_context(range_state, positions, price)
+    range_enabled = (
+        str(_metadata(run.get("config_json")).get("strategy_range_mode") or "off") != "off"
+        or range_state is not None
+        or bool(range_context["owned"])
+    )
     pnl = _pnl_summary(db_path, positions)
     by_timeframe = {
         str(position["timeframe"]): position
@@ -2571,6 +2952,14 @@ def _overview(
             + _breakout_card(breakout, denomination, price)
             + "</section>"
             if breakout_enabled
+            else ""
+        )
+        + (
+            '<section class="strategy-group range-group"><header><b>Range</b>'
+            "<span>post-impulse channel</span></header>"
+            + _range_card(range_context, denomination, price)
+            + "</section>"
+            if range_enabled
             else ""
         )
         + '<section class="strategy-group account-group"><header><b>Account</b>'
@@ -2617,6 +3006,11 @@ def _overview(
                 "Active positions",
                 _position_status_rows(
                     positions, levels, denomination, price, breakout if breakout_enabled else None
+                )
+                + (
+                    [_range_position_row(range_context, denomination, price)]
+                    if range_enabled
+                    else []
                 ),
                 (
                     "strategy",
@@ -2644,6 +3038,19 @@ def _overview(
             "</div>",
             _table("Latest funding", funding_display, ("ts", "strategy", "slot", "funding")),
             "</div></div>",
+            (
+                "<div class=activity-grid>"
+                + _table(
+                    "Range shadow book",
+                    _range_trade_rows(range_context),
+                    ("entry_ts", "exit_ts", "range", "side", "entry_price", "exit_price",
+                     "reason", "net", "source"),
+                )
+                + _table("Range events", _range_event_rows(range_context), ("ts", "event", "detail"))
+                + "</div>"
+                if range_enabled
+                else ""
+            ),
             _portfolio_panel(),
         )
     )
@@ -2753,6 +3160,23 @@ def _execution_alignment(
                 issues.append("Breakout units disagree with saved campaign")
         elif breakout_owned and not closing:
             issues.append("Funded breakout units lack a live campaign")
+
+    range_state = _persisted_range_state(db_path)
+    range_owned = [p for p in positions if p.get("strategy") == RANGE_INSTANCE_ID]
+    if range_state is None and range_owned:
+        issues.append("Funded range position lacks a saved strategy state")
+    elif range_state is not None:
+        machine = _metadata(range_state.get("machine"))
+        if range_state.get("closing"):
+            pending.append("Range closing r0")
+        elif range_owned and not machine.get("position"):
+            issues.append("Funded range position is not in the saved range state")
+        if not range_state.get("model_complete", True):
+            issues.append(
+                "Range model incomplete ("
+                + str(range_state.get("incomplete_reason") or "evidence gap")
+                + "); new range entries blocked"
+            )
 
     venue_fresh = exchange is not None and datetime.now(UTC) - exchange.fetched_at <= timedelta(
         seconds=60
@@ -2915,6 +3339,21 @@ def _active_config(run: dict[str, object]) -> str:
                 ),
             ],
         )
+        + (
+            group(
+                "Impulse range",
+                [
+                    ("Mode", value("strategy_range_mode")),
+                    ("Unit notional", value("strategy_range_unit_notional_usd")),
+                    ("Leverage", value("strategy_range_leverage")),
+                    ("Direction", value("strategy_range_direction_mode")),
+                    ("Chop filter", value("strategy_range_chop_filter")),
+                    ("Chop threshold", value("strategy_range_chop_threshold")),
+                ],
+            )
+            if str(config.get("strategy_range_mode") or "off") != "off"
+            else ""
+        )
         + group(
             "Hard risk limits",
             [
@@ -2983,6 +3422,35 @@ def _strategy_explainer(run: dict[str, object]) -> str:
             f"{_breakout_mode_label(params.get('direction_mode', 'both'))}. "
             "Existing campaigns retain their exits.</p>"
         )
+    range_params = all_strategies.get(RANGE_INSTANCE_ID)
+    range_note = ""
+    if isinstance(range_params, dict) and isinstance(range_params.get("params"), dict):
+        params = range_params["params"]
+        mode = str(params.get("mode", "shadow"))
+        chop = (
+            f" Ranges whose 20-day efficiency ratio at confirmation is below "
+            f"{float(params.get('chop_threshold', 0.22)):.2f} are tracked but not traded."
+            if params.get("chop_filter", True)
+            else ""
+        )
+        range_note = (
+            "<p><b>Impulse range:</b> after a structure-passing daily breakout and an 8% "
+            "pullback, a 4h close retracing a third of the move confirms a channel between the "
+            "impulse extreme and the swing. A 1m close within 15% of an edge enters toward the "
+            "channel; the midpoint is the target. A 4h close beyond an edge by 10% of the width "
+            "exits and the channel is redrawn; beyond 40% width the range is abandoned, and size "
+            f"tapers to zero over 120 days.{chop} "
+            + (
+                "Shadow mode: paper fills only, no orders, excluded from account totals."
+                if mode == "shadow"
+                else f"Funded unit ${float(params.get('unit_notional_usd', 0)):,.0f} at "
+                f"{float(params.get('leverage', 0)):g}x; new entries: "
+                f"{_breakout_mode_label(params.get('direction_mode', 'both'))}"
+                + ("" if params.get("entries_enabled", True) else " (disabled; exits only)")
+                + "."
+            )
+            + "</p>"
+        )
     return (
         "<section class=strategy-explainer><h2>How the active strategies behave</h2>"
         "<p><b>MA strategy:</b> the 1d and 4h timeframes operate independently, "
@@ -2999,7 +3467,7 @@ def _strategy_explainer(run: dict[str, object]) -> str:
         f"{count('cooldown_signal_count', '1d')} winner or {count('loss_cooldown_signal_count', '1d')} loss changes on 1d, and "
         f"{count('cooldown_signal_count', '4h')} winner or {count('loss_cooldown_signal_count', '4h')} loss changes on 4h. "
         f"A slot is spent by {consumption}. An exposure-reducing close is still allowed during cool-off; only its replacement entry is suppressed.{chop_note}</p>"
-        f"{breakout_note}"
+        f"{breakout_note}{range_note}"
         "</section>"
     )
 
@@ -3368,7 +3836,12 @@ def _render(
         f'<a class="scope-link{" active" if tf is None else ""}" '
         f'href="{href(page, target_tf=None)}">All</a>'
     ]
-    for timeframe, label in (("1d", "MA 1d"), ("4h", "MA 4h"), ("breakout", "Breakout")):
+    for timeframe, label in (
+        ("1d", "MA 1d"),
+        ("4h", "MA 4h"),
+        ("breakout", "Breakout"),
+        ("range", "Range"),
+    ):
         target = page if page in filterable_pages else "signals"
         active = " active" if tf == timeframe else ""
         scope_links.append(
