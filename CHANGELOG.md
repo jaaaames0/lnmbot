@@ -5,7 +5,17 @@ source changes that have not been installed as a production release.
 
 ## Unreleased
 
-### Impulse-range strategy (source only; not deployed)
+- Dashboard: show the configured range mode before the first range snapshot
+  (it briefly read "Shadow · no orders" during the funded cutover).
+
+## 2026-09-30 — Impulse-range strategy funded
+
+Release `prod-20260930.1-g61c98f3592fd` for trader and dashboard, from commit
+`61c98f3`. Settings: `STRATEGY_RANGE_MODE=funded`, USD 100 at 5x, both
+directions, choppiness filter at 0.22. The shared `RISK_MAX_DAILY_LOSS_USD` was
+raised from 100 to 2,000 as an emergency-only brake. MA and breakout settings are
+unchanged. At acceptance the range model rebuilt the current channel as not
+tradeable (choppy start); no range trade had been placed.
 
 - Add a third strategy for post-impulse consolidations. It uses the breakout
   impulse rule, then a swing channel and edge-to-midpoint trades, with a
@@ -24,6 +34,14 @@ source changes that have not been installed as a production release.
   The panel adds a Range signal scope, range settings in the run
   configuration, and execution-alignment checks for an incomplete model or an
   unmodelled funded position.
+- A cold range strategy no longer makes the funded feed's whole 100-day
+  warmup strict, so a historical minute gap cannot stop the trader.
+- Releases are built `--no-editable` and now ship `config/seeds/`, which the
+  breakout historical rebuild reads.
+
+## 2026-09-28 — Historical funding admission
+
+Release `prod-20260928.1-g716fbee17776` (trader), from commit `716fbee`.
 
 ### Historical funding admission
 
