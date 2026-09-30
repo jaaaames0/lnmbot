@@ -28,6 +28,7 @@ from ..api.isolated import (
 )
 from ..logging import get_logger
 from ..strategy import OrderIntent, Side
+from ..strategy.intents import SignalKind
 
 _log = get_logger("lnmarkets_bot.engine.live_executor")
 
@@ -67,7 +68,7 @@ class _PendingExit:
     """An exposure-reducing close that failed and must be retried."""
 
     intent: OrderIntent
-    signal_id: int
+    signal_id: int | None
     leverage: float
 
 
@@ -125,6 +126,9 @@ class LiveExecutor:
         self._unknown_remote: set[str] = set()
         self._missing_remote: set[str] = set()
         self._inventory_unavailable = False
+        self.admissions_enabled = True
+        self.unbound_owners: set[str] = set()
+        self.data_health: dict[str, dict[str, str]] = {}
 
     def update_price(self, price_usd: float) -> None:
         self._last_close = price_usd
@@ -219,6 +223,14 @@ class LiveExecutor:
         """Close the LNM isolated trade for this TF."""
         if pos.qty_sats == 0 or pos.trade_id is None:
             return -1, {"noop": True, "reason": "no_position"}
+        expected_trade = intent.metadata.get("close_trade_id")
+        if expected_trade and expected_trade != pos.trade_id:
+            raise UnsafeLiveStateError("close obligation belongs to a different owned trade")
+        if (self._inventory_unavailable or pos.trade_id in self._missing_remote) and any(
+            c["command_key"] == f"close:{pos.trade_id}"
+            for c in self._recorder.commands(["submitted"])
+        ):
+            return -1, {"noop": True, "reason": "close_outcome_unresolved"}
         close_qty_sats = abs(pos.qty_sats)
         side = "sell" if pos.side == "long" else "buy"
         fill_price = self._last_close or 0.0
@@ -233,6 +245,9 @@ class LiveExecutor:
             {
                 "trade_id": closed_trade_id,
                 "execution_key": tf,
+                "signal_id": signal_id,
+                "reason": intent.reason,
+                "metadata": intent.metadata,
                 "ts": ts.isoformat(),
             },
         )
@@ -480,6 +495,8 @@ class LiveExecutor:
         }
 
     def entry_admission_reason(self, intent, ts) -> str | None:
+        if self.data_health.get(intent.strategy_instance_id):
+            return "market_evidence_incomplete"
         blocked = self.entries_blocked_reason()
         if blocked:
             return blocked
@@ -494,6 +511,10 @@ class LiveExecutor:
         return None
 
     def entries_blocked_reason(self) -> str | None:
+        if not self.admissions_enabled:
+            return "recovery_admissions_disabled"
+        if self.unbound_owners:
+            return "owned_position_without_binding"
         if self._inventory_unavailable:
             return "venue_inventory_unavailable"
         if self._missing_remote:
@@ -699,6 +720,27 @@ class LiveExecutor:
                 ),
             )
         self.positions = restored
+        for command in self._recorder.commands(["submitted"]):
+            if command["action"] != "close":
+                continue
+            request = command["request_json"]
+            key = request.get("execution_key")
+            pos = restored.get(key)
+            # Missing venue trades are recovered by authoritative external-close
+            # reconciliation before retries; never repeat an accepted remote close.
+            if pos and pos.trade_id in running_by_id:
+                self._pending_exits[key] = _PendingExit(
+                    intent=OrderIntent(
+                        kind=SignalKind.EXIT,
+                        trigger_tf=pos.trigger_tf,
+                        strategy_instance_id=pos.strategy_instance_id,
+                        position_key=pos.position_key,
+                        reason=request.get("reason", "resume_durable_close"),
+                        metadata=request.get("metadata", {}),
+                    ),
+                    signal_id=request.get("signal_id"),
+                    leverage=pos.leverage,
+                )
 
     async def reconcile_external_closures(
         self, *, run_id: int, ts: datetime
@@ -756,8 +798,11 @@ class LiveExecutor:
                 # price, not a cause flag. `closed=True` proves flatness only.
                 liquidated = None
             reason = (
-                "liquidation" if liquidated is True else
-                "external_close" if liquidated is False else "external_close_unclassified"
+                "liquidation"
+                if liquidated is True
+                else "external_close"
+                if liquidated is False
+                else "external_close_unclassified"
             )
             raw_reason = raw_reason or reason
             exit_price = float(

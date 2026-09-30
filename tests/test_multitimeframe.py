@@ -243,7 +243,7 @@ async def test_incremental_stream_closes_5m_without_waiting_for_next_base_bar() 
 
 
 @pytest.mark.asyncio
-async def test_funded_stream_rejects_missing_minute_in_completed_bucket() -> None:
+async def test_funded_stream_reports_missing_minute_without_stopping_management() -> None:
     base = datetime(2026, 1, 1, tzinfo=UTC)
     bars = [
         Bar(base + timedelta(minutes=i), 100, 101, 99, 100, 1, timeframe="1m")
@@ -253,8 +253,10 @@ async def test_funded_stream_rejects_missing_minute_in_completed_bucket() -> Non
     source = MultiTimeframeDataSource(
         _StreamingBars(bars), higher_timeframes=("5m",), require_complete_buckets=True
     )
-    with pytest.raises(ValueError, match="missing or repeated 1m candle"):
-        [bar async for bar in source.stream()]
+    emitted = [bar async for bar in source.stream()]
+    assert emitted[-1].timeframe == "5m"
+    assert not emitted[-1].complete
+    assert any(bar.evidence_gap for bar in emitted)
 
 
 @pytest.mark.asyncio
@@ -300,5 +302,5 @@ async def test_funded_stream_allows_committed_history_gap_but_checks_new_bars() 
         require_complete_buckets=True,
         strict_from_ts=base + timedelta(minutes=10),
     )
-    with pytest.raises(ValueError, match="missing or repeated 1m candle"):
-        [item async for item in source.stream()]
+    emitted = [item async for item in source.stream() if item.timeframe == "5m"]
+    assert [bar.complete for bar in emitted] == [True, False, False]

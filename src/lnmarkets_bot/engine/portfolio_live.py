@@ -188,6 +188,40 @@ def _mirror_positions(binding: StrategyBinding, state: StrategyState, executor: 
         if exec_pos is not None:
             pos.leverage = exec_pos.leverage
             pos.entry_ts = exec_pos.entry_ts
+            pos.trade_id = getattr(exec_pos, "trade_id", None)
+
+
+def _tf_delta(tf: str) -> timedelta:
+    return timedelta(**{{"d": "days", "h": "hours", "m": "minutes"}[tf[-1]]: int(tf[:-1])})
+
+
+def _next_boundary(ts: datetime, tf: str) -> datetime:
+    if tf.endswith("d"):
+        return ts.replace(hour=0, minute=0, second=0, microsecond=0) + _tf_delta(tf)
+    if tf.endswith("m"):
+        minutes = int(tf[:-1])
+        return ts.replace(
+            minute=ts.minute - ts.minute % minutes, second=0, microsecond=0
+        ) + _tf_delta(tf)
+    hours = int(tf[:-1])
+    return ts.replace(
+        hour=ts.hour - ts.hour % hours, minute=0, second=0, microsecond=0
+    ) + _tf_delta(tf)
+
+
+def _committed_bar(strategy, tf):
+    indicators = getattr(strategy, "tf_state", {})
+    if tf in indicators:
+        return indicators[tf].last_bar_ts
+    range_machine = getattr(strategy, "range_machine", None)
+    if range_machine is not None:
+        if tf == "4h":
+            return range_machine.bar_ts
+        day = range_machine.detector.last_ts
+        return day + timedelta(days=1) if day else None
+    machine = getattr(strategy, "machine", None)
+    day = getattr(machine, "last_bar_ts", None)
+    return day + timedelta(days=1) if day else None
 
 
 def _deliver_external(binding, state, events, recorder, run_id):
@@ -202,6 +236,9 @@ def _deliver_external(binding, state, events, recorder, run_id):
     with recorder.atomic():
         snapshot = binding.strategy.persistent_state()
         if snapshot is not None:
+            snapshot["engine_data_health"] = dict(
+                getattr(binding.strategy, "_engine_data_health", {})
+            )
             recorder.save_strategy_state(
                 run_id,
                 mode="live",
@@ -242,6 +279,22 @@ async def run_portfolio_live(
     )
     kill = KillSwitch(cfg=cfg)
     states: dict[str, StrategyState] = {}
+    data_health: dict[str, dict[str, str]] = {}
+    allowed_keys = {b.execution_key(slot) for b in bindings for slot in b.position_slots}
+    executor.unbound_owners = {
+        key for key, pos in executor.positions.items() if pos.qty_sats and key not in allowed_keys
+    }
+    executor.unbound_owners.update(
+        event.execution_key
+        for event in getattr(executor, "pending_external_events", lambda: [])()
+        if event.strategy_instance_id not in ids
+    )
+    executor.data_health = data_health
+    executor.admissions_enabled = cfg.live_entries_enabled
+    if executor.unbound_owners:
+        get_logger("live").error(
+            "live.owner_recovery_required", execution_keys=sorted(executor.unbound_owners)
+        )
     for binding in bindings:
         state = StrategyState()
         state.balance_sats = int(cfg.initial_balance_usd * 1e8)
@@ -253,6 +306,10 @@ async def run_portfolio_live(
             legacy_name = f"{type(binding.strategy).__module__}.{type(binding.strategy).__name__}"
             if sum(type(b.strategy) is type(binding.strategy) for b in bindings) == 1:
                 snapshot = recorder.latest_strategy_state(mode="live", strategy_name=legacy_name)
+        data_health[binding.instance_id] = dict(
+            snapshot["state"].get("engine_data_health", {}) if snapshot else {}
+        )
+        binding.strategy._engine_data_health = data_health[binding.instance_id]
         if snapshot is not None:
             if binding.strategy.restore_persistent_state(snapshot["state"]):
                 get_logger("live").info(
@@ -341,8 +398,14 @@ async def run_portfolio_live(
                         if any(
                             e.strategy_instance_id not in bindings_by_id for e in external_events
                         ):
-                            raise RuntimeError(
-                                "externally closed trade has no owning strategy binding"
+                            executor.unbound_owners.update(
+                                e.execution_key
+                                for e in external_events
+                                if e.strategy_instance_id not in bindings_by_id
+                            )
+                            log.error(
+                                "live.owner_recovery_required",
+                                reason="external closure has no binding",
                             )
                         for binding in bindings:
                             owned_events = [
@@ -403,7 +466,41 @@ async def run_portfolio_live(
                         getattr(machine, "historical_model_complete", True),
                         getattr(machine, "historical_funding_available", True),
                     )
-                    skip_strategy_bar = False
+                    health = data_health[binding.instance_id]
+                    committed = _committed_bar(strategy, bar.timeframe)
+                    already_committed = committed is not None and bar.ts <= committed
+                    if bar.timeframe in binding.subscribed_timeframes and not already_committed:
+                        expected = committed + _tf_delta(bar.timeframe) if committed else bar.ts
+                        if not bar.complete or bar.ts > expected:
+                            health.setdefault(bar.timeframe, min(expected, bar.ts).isoformat())
+                            log.error(
+                                "live.market_evidence_incomplete",
+                                strategy_instance_id=binding.instance_id,
+                                timeframe=bar.timeframe,
+                                ts=bar.ts.isoformat(),
+                            )
+                        elif bar.warmup and health.get(bar.timeframe) == bar.ts.isoformat():
+                            # Only replay of the exact missing candle repairs the
+                            # chain. Later complete candles cannot clear this.
+                            health.pop(bar.timeframe)
+                    if bar.evidence_gap and not bar.warmup:
+                        for tf in binding.subscribed_timeframes:
+                            end = _next_boundary(bar.ts, tf)
+                            health.setdefault(tf, end.isoformat())
+                    skip_strategy_bar = bar.timeframe in health and not already_committed
+                    # Range receives incomplete observations to expose its own
+                    # model health, but never constructs levels from them.
+                    if not bar.complete and hasattr(strategy, "range_machine"):
+                        skip_strategy_bar = False
+                    if health and hasattr(strategy, "range_machine"):
+                        strategy.mark_evidence_incomplete(bar.ts)
+                    if (
+                        health
+                        and machine is not None
+                        and campaign is not None
+                        and campaign.origin == "historical"
+                    ):
+                        machine.historical_model_complete = False
                     if (
                         machine is not None
                         and campaign is not None
@@ -544,14 +641,19 @@ async def run_portfolio_live(
                                 and machine.historical_model_complete
                                 and machine.historical_funding_available
                             ):
-                                skip_strategy_bar = False
+                                skip_strategy_bar = (
+                                    bar.timeframe in health and not already_committed
+                                )
                         else:
                             historical_waits.pop(binding.instance_id, None)
                     intents = (
                         [] if skip_strategy_bar else intents_to_list(strategy.on_bar(bar, state))
                     )
+                    if bar.warmup:
+                        intents = [i for i in intents if i.kind.value == "noop"]
                     snapshot_due = not bar.warmup and (
                         bar.timeframe in binding.subscribed_timeframes
+                        or bool(health)
                         or bool(intents)
                         or not strategy_snapshot_saved[binding.instance_id]
                         or historical_health_before
@@ -566,6 +668,7 @@ async def run_portfolio_live(
                     if snapshot_due:
                         persistent = strategy.persistent_state()
                         if persistent is not None:
+                            persistent["engine_data_health"] = dict(health)
                             recorder.save_strategy_state(
                                 run_id,
                                 mode="live",
@@ -648,6 +751,7 @@ async def run_portfolio_live(
                     if snapshot_due:
                         persistent = strategy.persistent_state()
                         if persistent is not None:
+                            persistent["engine_data_health"] = dict(health)
                             recorder.save_strategy_state(
                                 run_id,
                                 mode="live",

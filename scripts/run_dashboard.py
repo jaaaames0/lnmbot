@@ -41,10 +41,12 @@ LNM_DAILY_SEED_CACHE = (
     / "config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
 )
 BREAKOUT_CAMPAIGN_SEED = (
-    Path(__file__).resolve().parents[1] / "config/seeds/btc-close-range-lnm-live-seed-2026-09-13.json"
+    Path(__file__).resolve().parents[1]
+    / "config/seeds/btc-close-range-lnm-live-seed-2026-09-13.json"
 )
 BREAKOUT_PAPER_REFERENCE = (
-    Path(__file__).resolve().parents[1] / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json"
+    Path(__file__).resolve().parents[1]
+    / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json"
 )
 SAT_TOKEN = "__SAT_SYMBOL__"
 SAT_ICON = '<i class="fak fa-satoshisymbol-solidtilt sat-symbol" aria-label="sats"></i>'
@@ -149,6 +151,7 @@ class ExchangeSnapshot:
     funding_rate_ts: datetime | None = None
     deposits_sats: int = 0
     withdrawals_sats: int = 0
+    pending_trade_ids: frozenset[str] = frozenset()
 
 
 class ExchangeSnapshotCache:
@@ -198,6 +201,7 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
         (
             account,
             running,
+            pending_trades,
             funding_response,
             deposits_lightning,
             deposits_onchain,
@@ -206,6 +210,7 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
         ) = await asyncio.gather(
             AccountApi(client).get_balance(),
             IsolatedTradesApi(client).get_running_trades(),
+            IsolatedTradesApi(client).get_open_trades(),
             client.get("/futures/funding-settlements", params={"symbol": "BTCUSD", "limit": 1}),
             all_cashflows("/account/deposits/lightning"),
             all_cashflows("/account/deposits/on-chain"),
@@ -249,6 +254,7 @@ async def _fetch_exchange_snapshot() -> ExchangeSnapshot:
         running_pl_sats=running_pl,
         trades=trades,
         fetched_at=datetime.now(UTC),
+        pending_trade_ids=frozenset(t.id for t in pending_trades if t.id),
         funding_rate=funding_rate,
         funding_rate_ts=_parse_ts(latest_funding.get("time"))
         if isinstance(latest_funding, dict)
@@ -1389,7 +1395,7 @@ def _persisted_range_state(db_path: Path) -> dict[str, object] | None:
     try:
         rows = _query(
             db_path,
-            "SELECT ts, state_json FROM strategy_state_snapshots "
+            "SELECT ts, run_id, state_json FROM strategy_state_snapshots "
             "WHERE mode = 'live' AND strategy_name = ? ORDER BY ts DESC LIMIT 1",
             (RANGE_INSTANCE_ID,),
         )
@@ -1399,6 +1405,7 @@ def _persisted_range_state(db_path: Path) -> dict[str, object] | None:
         return None
     state = _metadata(rows[0]["state_json"])
     state["snapshot_ts"] = rows[0]["ts"]
+    state["snapshot_run_id"] = rows[0]["run_id"]
     return state
 
 
@@ -1412,7 +1419,7 @@ def _range_context(
     owned = [p for p in positions if p.get("strategy") == RANGE_INSTANCE_ID]
     state = state or {}
     # Before the first snapshot, show the configured mode rather than guessing.
-    mode = str(state.get("mode") or configured_mode or "shadow")
+    mode = str(configured_mode or state.get("mode") or "shadow")
     machine = _metadata(state.get("machine"))
     params = _metadata(machine.get("params"))
     channel = machine.get("channel")
@@ -1430,10 +1437,16 @@ def _range_context(
         confirmed = _parse_ts(channel.get("confirmed_ts"))
         age = (bar_ts - confirmed).total_seconds() / 86400 if bar_ts and confirmed else 0.0
         levels = {
-            "lo": lo, "hi": hi, "mid": (lo + hi) / 2, "width_pct": (hi / lo - 1) * 100,
-            "buy": lo + zone * width, "sell": hi - zone * width,
-            "stop_lo": lo - tol * width, "stop_hi": hi + tol * width,
-            "age_days": max(0.0, age), "max_age_days": max_age,
+            "lo": lo,
+            "hi": hi,
+            "mid": (lo + hi) / 2,
+            "width_pct": (hi / lo - 1) * 100,
+            "buy": lo + zone * width,
+            "sell": hi - zone * width,
+            "stop_lo": lo - tol * width,
+            "stop_hi": hi + tol * width,
+            "age_days": max(0.0, age),
+            "max_age_days": max_age,
             "size_multiplier": max(0.0, 1 - age / max_age) if params.get("taper", True) else 1.0,
         }
     paper = state.get("paper_position")
@@ -1445,7 +1458,7 @@ def _range_context(
     return {
         "available": bool(state),
         "mode": mode,
-        "entries_enabled": mode == "funded",
+        "entries_enabled": mode == "funded" and state.get("entries_enabled", True),
         "model_complete": state.get("model_complete", True),
         "incomplete_reason": state.get("incomplete_reason"),
         "closing": bool(state.get("closing")),
@@ -1470,6 +1483,14 @@ def _range_context(
 
 def _range_status(context: dict[str, object]) -> tuple[str, str]:
     channel, setup = context["channel"], context["setup"]
+    if context["closing"]:
+        return "Close pending", "Owned exit remains due until venue confirms flat"
+    if not context["model_complete"]:
+        return "Model incomplete", str(
+            context["incomplete_reason"] or "Verified reconstruction required"
+        )
+    if context["mode"] == "off":
+        return "Disabled", "Range admissions disabled"
     if not context["available"]:
         return "Awaiting state", "No range strategy snapshot yet"
     if context["state"] == "seek" and isinstance(setup, dict):
@@ -1481,8 +1502,10 @@ def _range_status(context: dict[str, object]) -> tuple[str, str]:
                 f"Forming after {side} impulse",
                 f"Swing {_format_price(swing)} · confirms on a 4h close past {_format_price(confirm)}",
             )
-        pullback = float(setup["extreme"]) * (1 - float(context["params"].get("pullback", 0.08))
-                                              * (1 if setup.get("side") == 1 else -1))
+        pullback = float(setup["extreme"]) * (
+            1
+            - float(context["params"].get("pullback", 0.08)) * (1 if setup.get("side") == 1 else -1)
+        )
         return (
             f"Impulse {side}",
             f"Extreme {_format_price(setup['extreme'])} · waiting for pullback to {_format_price(pullback)}",
@@ -1530,7 +1553,8 @@ def _range_card(context: dict[str, object], denomination: str, btc_price: float 
         )
     if not context["model_complete"]:
         lines.append(
-            "Model incomplete: " + str(context.get("incomplete_reason") or "evidence gap")
+            "Model incomplete: "
+            + str(context.get("incomplete_reason") or "evidence gap")
             + " · new entries blocked"
         )
     owned = context["owned"]
@@ -1544,8 +1568,11 @@ def _range_card(context: dict[str, object], denomination: str, btc_price: float 
         position = (
             f"<small>Funded {html.escape(str(pos['side']))} ${int(pos['contracts']):,}"
             f" from {_format_price(pos.get('entry_price'))}"
-            + (f" · open P&amp;L {_signed_amount_html(pnl, denomination, btc_price)}"
-               if isinstance(pnl, int) else "")
+            + (
+                f" · open P&amp;L {_signed_amount_html(pnl, denomination, btc_price)}"
+                if isinstance(pnl, int)
+                else ""
+            )
             + "</small>"
         )
     elif isinstance(context["paper"], dict):
@@ -1570,7 +1597,7 @@ def _range_card(context: dict[str, object], denomination: str, btc_price: float 
             + " summed per trade · no funding · excluded from account totals</small>"
         )
     label = {"shadow": "Shadow · no orders", "funded": "Funded"}.get(mode, mode)
-    if mode == "funded" and not context["entries_enabled"]:
+    if owned and not context["entries_enabled"]:
         label = "Exits only"
     return (
         f'<article class="card position-card range-card {card_class}">'
@@ -1817,7 +1844,10 @@ def _signal_detail(reason: object, metadata: dict[str, object] | None = None) ->
         if verdict:
             remaining.append(_verdict_label(verdict))
         return "Pending entry · " + " · ".join(remaining) if remaining else "Pending entry"
-    if reason in {"shadow_entry", "shadow_exit", "range_edge"} and metadata.get("range_id") is not None:
+    if (
+        reason in {"shadow_entry", "shadow_exit", "range_edge"}
+        and metadata.get("range_id") is not None
+    ):
         parts = [f"range #{metadata['range_id']}"]
         if reason == "range_edge" and metadata.get("level") is not None:
             parts.append(f"edge {_format_price(metadata['level'])}")
@@ -2927,11 +2957,7 @@ def _overview(
     range_context = _range_context(
         range_state, positions, price, None if range_mode == "off" else range_mode
     )
-    range_enabled = (
-        range_mode != "off"
-        or range_state is not None
-        or bool(range_context["owned"])
-    )
+    range_enabled = range_mode != "off" or range_state is not None or bool(range_context["owned"])
     pnl = _pnl_summary(db_path, positions)
     by_timeframe = {
         str(position["timeframe"]): position
@@ -3051,10 +3077,21 @@ def _overview(
                 + _table(
                     "Range shadow book",
                     _range_trade_rows(range_context),
-                    ("entry_ts", "exit_ts", "range", "side", "entry_price", "exit_price",
-                     "reason", "net", "source"),
+                    (
+                        "entry_ts",
+                        "exit_ts",
+                        "range",
+                        "side",
+                        "entry_price",
+                        "exit_price",
+                        "reason",
+                        "net",
+                        "source",
+                    ),
                 )
-                + _table("Range events", _range_event_rows(range_context), ("ts", "event", "detail"))
+                + _table(
+                    "Range events", _range_event_rows(range_context), ("ts", "event", "detail")
+                )
                 + "</div>"
                 if range_enabled
                 else ""
@@ -3170,13 +3207,39 @@ def _execution_alignment(
             issues.append("Funded breakout units lack a live campaign")
 
     range_state = _persisted_range_state(db_path)
+    try:
+        run = _active_run(db_path) or {}
+    except sqlite3.Error:
+        run = {}
+    range_configured = _metadata(run.get("config_json")).get("strategy_range_mode", "off") != "off"
+    if range_configured and range_state is None:
+        issues.append("Configured range owner has no saved strategy state")
+    active_bindings = _metadata(run.get("strategy_params_json"))
+    if range_configured and active_bindings and RANGE_INSTANCE_ID not in active_bindings:
+        issues.append("Configured range owner is absent from active bindings")
+    if (
+        range_configured
+        and range_state is not None
+        and range_state.get("snapshot_run_id") != run.get("id")
+    ):
+        issues.append("Range snapshot is from an earlier run")
+    if ma_state.get("engine_data_health"):
+        issues.append("MA market evidence incomplete; new entries blocked")
+    if breakout_state and breakout_state.get("engine_data_health"):
+        issues.append("Breakout market evidence incomplete; new entries blocked")
     range_owned = [p for p in positions if p.get("strategy") == RANGE_INSTANCE_ID]
     if range_state is None and range_owned:
         issues.append("Funded range position lacks a saved strategy state")
-    elif range_state is not None:
+    elif range_state is not None and (
+        range_configured or range_owned or RANGE_INSTANCE_ID in active_bindings
+    ):
         machine = _metadata(range_state.get("machine"))
         if range_state.get("closing"):
-            pending.append("Range closing r0")
+            since = _parse_ts(range_state.get("closing_since"))
+            if since and datetime.now(UTC) - since > timedelta(minutes=5):
+                issues.append("Range close overdue (>5 minutes)")
+            else:
+                pending.append("Range closing r0")
         elif range_owned and not machine.get("position"):
             issues.append("Funded range position is not in the saved range state")
         if not range_state.get("model_complete", True):
@@ -4005,7 +4068,21 @@ def main() -> None:
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             page = parsed.path.strip("/") or "overview"
-            if page == "healthz":
+            status_code = 200
+            if page == "readyz":
+                from lnmarkets_bot.operations.readiness import inspect_readiness
+
+                exchange = _EXCHANGE_CACHE.get()
+                readiness = inspect_readiness(
+                    args.db,
+                    venue_ids=set(exchange.trades) if exchange else None,
+                    venue_ts=exchange.fetched_at if exchange else None,
+                    pending_ids=exchange.pending_trade_ids if exchange else (),
+                )
+                payload = json.dumps(readiness).encode()
+                content_type = "application/json"
+                status_code = 200 if readiness["ready"] else 503
+            elif page == "healthz":
                 payload = b"ok\n"
                 content_type = "text/plain"
             elif page == "api/live-price":
@@ -4027,7 +4104,8 @@ def main() -> None:
                 query = parse_qs(parsed.query)
                 tf = (
                     requested_tf
-                    if page in {"signals", "trades"} and requested_tf in (*TIMEFRAMES, "breakout")
+                    if page in {"signals", "trades"}
+                    and requested_tf in (*TIMEFRAMES, "breakout", "range")
                     else None
                 )
                 denomination = query.get("denom", ["sats"])[0]
@@ -4060,7 +4138,7 @@ def main() -> None:
             else:
                 self.send_error(404)
                 return
-            self.send_response(200)
+            self.send_response(status_code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

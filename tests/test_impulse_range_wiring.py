@@ -101,7 +101,7 @@ def test_strict_data_check_includes_range_snapshot():
         ("shadow", False, True, ("shadow", False)),
         ("funded", False, True, ("funded", True)),
         ("off", True, True, ("funded", False)),
-        ("funded", False, False, None),
+        ("funded", False, False, ("funded", True)),
         ("funded", True, False, ("funded", True)),
     ],
 )

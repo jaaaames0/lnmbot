@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-09-30 — Funded range audit remediation
+
+- Persist and recover owned close obligations and submitted close commands;
+  block admissions for any owned slot or external callback without a binding.
+- Carry minute coverage into aggregate candles, perform bounded gap backfill,
+  preserve reconciliation/owed closes during gaps and persist owner admission
+  health until verified reconstruction. Warmup cannot submit funded orders.
+- Range rule version 2 enforces initial width as well as expanding width;
+  migrate legacy snapshots without losing owned exits. Recompute cached chop
+  eligibility when policy changes.
+- Correct the HTTP range filter and effective exits-only display; add `/readyz`
+  with current-run owner/model/feed/command/venue checks and a monitoring probe.
+- Add immutable candidate and compatible recovery deployment tooling, asserted
+  acceptance after backup, role-based seed repointing and dry-run reconstruction
+  / seed refresh. `LIVE_ENTRIES_ENABLED=false` blocks all new entries while
+  retaining owned managers and the current database.
+- Cached 2020–2026 4h research replay rejects three initial oversized setups.
+  Filtered trades change 132 → 134; summed per-trade return 160.64% → 139.99%.
+  Unfiltered trades change 188 → 186; return 98.23% → 76.68%. These are local
+  research execution results, not live account returns or a new parity claim.
+
 Dates are UTC. Dated entries record operational releases; `Unreleased` records
 source changes that have not been installed as a production release.
 

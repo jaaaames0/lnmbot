@@ -43,6 +43,9 @@ class Bar:
     # Historical bars used only to initialize a live strategy's indicators.
     # They update strategy state but must never create live orders.
     warmup: bool = False
+    # False means missing candle inputs; OHLC is observational, not verified.
+    complete: bool = True
+    evidence_gap: bool = False
 
 
 @dataclass
@@ -59,6 +62,7 @@ class TfPosition:
     entry_price_usd: float | None = None
     entry_ts: datetime | None = None
     leverage: float = 1.0
+    trade_id: str | None = None
 
 
 @dataclass

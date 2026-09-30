@@ -555,3 +555,67 @@ use the whole-engine halt for this purpose. Reverting to pre-remediation code
 or restoring an old database after new writes requires a separate review; the
 independent cutover recovery timer uses compatible code with this zero-entry
 cap and retains the current database.
+
+## 11. Range remediation release and recovery
+
+Use `scripts/deploy_range_remediation.py` for the September 30 remediation and
+compatible follow-up releases. Run the focused regressions, default pytest
+suite, scoped Ruff and import-linter; commit reviewed source before building.
+The helper refuses tracked worktree changes and a tag that lacks the source
+commit suffix. Preserve local ignored research and unrelated untracked scripts.
+
+```bash
+sudo python3 scripts/deploy_range_remediation.py build --tag prod-YYYYMMDD.N-g<12-character-commit>
+sudo python3 scripts/deploy_range_remediation.py cutover
+curl -fsS http://127.0.0.1:8082/readyz
+sudo python3 scripts/deploy_range_remediation.py accept
+```
+
+Build creates root-owned immutable trader, dashboard and compatible recovery
+runtimes, preserving an archive, Git bundle and manifests in a protected
+checkpoint. Cutover takes a consistent SQLite copy, validates seed hashes by
+input role, preserves the existing funded range/risk settings, checks candidate
+units and runs an encrypted backup. It arms and verifies a 30-minute compatible
+recovery timer **before** changing live files. Acceptance asserts both services,
+current bindings/snapshot provenance, fresh feed and venue inventory, resolved
+commands, model health and the range HTTP route; it checks again after backup
+and disarms recovery last. Failed acceptance leaves the timer armed.
+
+The checkpoint's `recover.sh` uses corrected, range-capable code with
+`LIVE_ENTRIES_ENABLED=false`, retaining the current database and all owned exit
+managers. It is available for attended recovery after acceptance. Never use the
+old `deploy_impulse_range_rollout.sh` rollback to return to pre-range code.
+Returning to code without a range binding requires stopping the trader first,
+resolving every submitted/received entry command, and independently verifying
+both running and pending venue inventory are flat for range. Local order count
+alone is insufficient. Never roll the ledger back to an earlier database.
+
+Install `config/systemd/lnmbot-readiness.service` after replacing
+`@DASHBOARD_RELEASE@` with the immutable dashboard path, and its timer. The
+read-only probe fails on unhealthy `/readyz`, so the existing infrastructure
+monitor's failed-unit check detects trader/model failures even when dashboard
+liveness succeeds. Readiness failures require diagnosis, not clearing state.
+
+The fixed September 13 daily seed supports a first 100-day bootstrap only
+through December 22, 2026 UTC. A normal saved-state restart does not need a new
+range seed. Before a future cold rebuild, refresh from authoritative **closed**
+local daily candles using the dry-run tool; it refuses gaps and duplicates:
+
+```bash
+uv run python scripts/rebuild_impulse_range.py --daily <verified-daily.parquet> --refresh-seed --output <new-seed.parquet>
+uv run python scripts/rebuild_impulse_range.py --daily <new-seed.parquet> --minutes <contiguous-UTC-whole-day-minutes.parquet> --copied-db <consistent-copy.sqlite> --output <candidate-range.json>
+```
+
+Reconstruction makes no exchange requests and never changes the live database.
+The output records input hashes and a flat range snapshot. It refuses outstanding
+commands and locally open range trades; independently verify fresh venue running
+and pending inventory too. Start minute replay after the daily seed seam and
+include the full construction interval, which may be longer than 100 days.
+Review channel, ER, rule version, MA/breakout continuity and P&L against the
+existing state before any stopped-trader snapshot replacement. Snapshot repair
+is a separate attended transaction with backup and compatible recovery; never
+hand-clear `model_complete`, delete snapshots or alter accounting to manufacture
+readiness. Track the refreshed range seed in `config/seeds/`, publish it through
+an immutable release, and repoint only the range input role. Keep breakout
+historical seed/reference hashes unchanged. Scan protected input references
+before retiring any older runtime.

@@ -23,7 +23,7 @@ to the bucket 08:00-12:00 (4h) -- that bar's close IS the close we'd see at
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, cast
@@ -52,7 +52,11 @@ _TF_SPECS: dict[str, _TfSpec] = {
 
 
 class MultiTimeframeDataSource(DataSource):
-    """Emit higher-TF bars; funded streams reject missing minute inputs."""
+    """Emit candle coverage; consumers verify their uncommitted evidence.
+
+    Legacy strict arguments remain accepted, but never terminate management
+    on a gap. All incremental candles carry coverage in both old and new history.
+    """
 
     def __init__(
         self,
@@ -201,26 +205,18 @@ class MultiTimeframeDataSource(DataSource):
             if bar.timeframe != "1m":
                 yield bar
                 continue
-            if (
-                self.require_complete_buckets
-                and last_base_ts is not None
-                and (self.strict_from_ts is None or last_base_ts >= self.strict_from_ts)
-                and bar.ts != last_base_ts + timedelta(minutes=1)
-            ):
-                raise ValueError(f"missing or repeated 1m candle after {last_base_ts}")
+            if last_base_ts is not None and bar.ts <= last_base_ts:
+                continue  # API page overlap never counts twice toward coverage.
+            if last_base_ts is not None and bar.ts != last_base_ts + timedelta(minutes=1):
+                bar = replace(bar, evidence_gap=True)
             last_base_ts = bar.ts
             completed: list[Bar] = []
             for tf in self._tfs_desc:
                 start = self._bucket_start(bar.ts, tf)
                 previous = bucket_start.get(tf)
                 if previous is not None and start != previous and bucket_bars[tf]:
-                    strict = self._strict_bucket(tf, previous)
-                    if not strict or self._bucket_is_complete(tf, bucket_bars[tf], previous):
+                    if tf not in first_bucket or bucket_bars[tf][0].ts == previous:
                         completed.append(self._aggregate_bucket(tf, bucket_bars[tf], previous))
-                    elif tf not in first_bucket:
-                        raise ValueError(
-                            f"incomplete {tf} candle ending {self._bucket_end(previous, tf)}"
-                        )
                     first_bucket.discard(tf)
                     bucket_bars[tf] = []
                 bucket_start[tf] = start
@@ -231,13 +227,8 @@ class MultiTimeframeDataSource(DataSource):
                 # that fact. Waiting caused every higher-TF signal to lag by
                 # roughly one minute.
                 if self._bar_closes_bucket(bar, start, tf):
-                    strict = self._strict_bucket(tf, start)
-                    if not strict or self._bucket_is_complete(tf, bucket_bars[tf], start):
+                    if tf not in first_bucket or bucket_bars[tf][0].ts == start:
                         completed.append(self._aggregate_bucket(tf, bucket_bars[tf], start))
-                    elif tf not in first_bucket:
-                        raise ValueError(
-                            f"incomplete {tf} candle ending {self._bucket_end(start, tf)}"
-                        )
                     first_bucket.discard(tf)
                     bucket_bars[tf] = []
             yield bar
@@ -284,6 +275,7 @@ class MultiTimeframeDataSource(DataSource):
             volume=sum(bar.volume for bar in bars),
             timeframe=timeframe,
             warmup=all(bar.warmup for bar in bars),
+            complete=MultiTimeframeDataSource._bucket_is_complete(timeframe, bars, start),
         )
 
     @staticmethod
@@ -296,11 +288,6 @@ class MultiTimeframeDataSource(DataSource):
             and bars[0].ts == start
             and bars[-1].ts == start + timedelta(minutes=expected - 1)
             and all(right.ts - left.ts == timedelta(minutes=1) for left, right in pairwise(bars))
-        )
-
-    def _strict_bucket(self, timeframe: str, start: datetime) -> bool:
-        return self.require_complete_buckets and (
-            self.strict_from_ts is None or self._bucket_end(start, timeframe) > self.strict_from_ts
         )
 
 

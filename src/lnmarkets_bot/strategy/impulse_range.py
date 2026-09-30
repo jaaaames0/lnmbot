@@ -264,7 +264,7 @@ class Event:
 class ImpulseRangeMachine:
     """Causal range state; the caller owns execution and reports fills."""
 
-    VERSION: ClassVar[int] = 1
+    VERSION: ClassVar[int] = 2
 
     def __init__(self, params: ImpulseRangeParams | None = None) -> None:
         self.p = params or ImpulseRangeParams()
@@ -409,6 +409,14 @@ class ImpulseRangeMachine:
             s.swing = min(s.swing, bar.low) if s.side == 1 else max(s.swing, bar.high)
             if s.side * (bar.close - s.swing) >= abs(s.extreme - s.swing) / 3:
                 lo, hi = sorted((s.extreme, s.swing))
+                if lo <= 0 or hi / lo - 1 > p.max_width + 1e-12:
+                    self.state, self.setup = "idle", None
+                    return [
+                        *ev,
+                        Event(
+                            bar.ts, "setup_cancel", {"reason": "initial_width", "lo": lo, "hi": hi}
+                        ),
+                    ]
                 self.channel = Channel(
                     id=self.ended_ranges,
                     side=s.side,
@@ -432,7 +440,7 @@ class ImpulseRangeMachine:
                 min(ch.new_extreme, bar.low) if d == -1 else max(ch.new_extreme, bar.high)
             )
             lo, hi = (ch.new_extreme, ch.hi) if d == -1 else (ch.lo, ch.new_extreme)
-            if hi / lo - 1 > p.max_width:
+            if hi / lo - 1 > p.max_width + 1e-12:
                 return self._end_range(bar.ts, "trend")
             other = ch.hi if d == -1 else ch.lo
             if d * (ch.new_extreme - bar.close) >= abs(other - ch.new_extreme) / 3:
@@ -561,7 +569,7 @@ class ImpulseRangeMachine:
     def restore(
         cls, data: dict[str, Any], params: ImpulseRangeParams | None = None
     ) -> ImpulseRangeMachine:
-        if data.get("version") != cls.VERSION:
+        if data.get("version") not in (1, cls.VERSION):
             raise ValueError("unsupported impulse-range state version")
         saved = ImpulseRangeParams(**data["params"])
         if params is not None and params != saved:
@@ -587,6 +595,11 @@ class ImpulseRangeMachine:
             or (m.state == "active") != (m.channel is not None)
         ):
             raise ValueError("inconsistent impulse-range state")
+        if m.channel is not None and m.channel.hi / m.channel.lo - 1 > saved.max_width + 1e-12:
+            # Existing owned exits retain their levels; no oversized new entry.
+            m.channel.tradeable = False
+            if m.position is None:
+                m._end_range(m.bar_ts or m.channel.confirmed_ts, "restored_width")
         return m
 
 

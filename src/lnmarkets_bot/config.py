@@ -75,6 +75,9 @@ class BotConfig(BaseSettings):
     strategy: str = "lnmarkets_bot.strategy.do_nothing:DoNothing"
     initial_balance_usd: float = 10_000.0  # backtest/paper starting collateral, USD
 
+    # Admission-only recovery switch. Owned exits and reconciliation continue.
+    live_entries_enabled: bool = True
+
     # --- Live sizing policy ---
     sizing_mode: Literal["fixed_notional", "equity_fraction"] = "fixed_notional"
     sizing_fixed_notional_usd: float = 1.0

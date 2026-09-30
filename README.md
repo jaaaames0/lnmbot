@@ -68,3 +68,19 @@ APIs. Historical strategy investigations under the local, Git-ignored `docs/`,
 `scripts/research/`, and `tests/research/` archives are outside normal test
 collection. See [CHANGELOG.md](CHANGELOG.md) for production and dashboard
 history.
+
+Funded range recovery retains an owned close obligation until venue flatness,
+including restart during submission. Range construction rule version 2 enforces
+the 40% width cap at initial confirmation as well as expansion; legacy oversized
+holdings keep their exit levels, while oversized flat channels are retired.
+Changing the chop filter recomputes eligibility from the saved confirmation ER.
+
+Missing minute evidence is carried on aggregated candles. Each affected owner
+blocks admission durably and freezes unverified timeframe decisions; available
+minutes still drive inventory reconciliation, funding and owed close retries.
+The range retains its last verified owned target and time-based expiry. A
+restored owner ignores gaps wholly before its committed state. Recovery requires
+verified replay or reconstruction; later complete candles alone do not repair a
+missing indicator chain. `/healthz` is dashboard liveness; `/readyz` checks the
+active trader, fresh feed, current owner snapshots, commands and venue inventory.
+`LIVE_ENTRIES_ENABLED=false` is an admission-only compatible recovery setting.

@@ -119,7 +119,7 @@ def _strict_data_from(
 def _range_strategy(
     cfg: BotConfig, recorder: Recorder, *, owned: bool, warmup_days: int, log
 ) -> ImpulseRangeLive | None:
-    """Build the impulse-range binding, or None when a cold start is impossible.
+    """Build a range binding; failed cold reconstruction stays visibly incomplete.
 
     With the mode off, an owned position is still managed to its exit with
     new entries disabled. A saved snapshot replaces the machine on startup;
@@ -129,7 +129,7 @@ def _range_strategy(
     strategy = ImpulseRangeLive(
         {
             "mode": "funded" if mode == "off" else mode,
-            "entries_enabled": mode == "funded",
+            "entries_enabled": mode == "funded" and cfg.live_entries_enabled,
             "unit_notional_usd": cfg.strategy_range_unit_notional_usd,
             "leverage": cfg.strategy_range_leverage,
             "direction_mode": cfg.strategy_range_direction_mode,
@@ -148,8 +148,6 @@ def _range_strategy(
         )
     except (OSError, ValueError) as exc:
         log.error("live.range_cold_start_unavailable", error=str(exc))
-        if not owned:
-            return None
         strategy.model_complete = False
         strategy.incomplete_reason = "cold start without daily seed"
     return strategy
@@ -375,7 +373,8 @@ async def main() -> int:
                         "unit_notional_usd": cfg.strategy_breakout_unit_notional_usd,
                         "leverage": cfg.strategy_breakout_leverage,
                         "activation_ts": datetime.now(UTC).isoformat(),
-                        "entries_enabled": cfg.strategy_breakout_enabled,
+                        "entries_enabled": cfg.strategy_breakout_enabled
+                        and cfg.live_entries_enabled,
                         "direction_mode": cfg.strategy_breakout_direction_mode,
                     },
                     machine=load_seed_machine(
@@ -394,7 +393,9 @@ async def main() -> int:
             async def historical_hydrator(machine):
                 root = Path(__file__).resolve().parents[1]
                 ref = json.loads(
-                    (root / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json").read_text()
+                    (
+                        root / "config/seeds/btc-close-range-lnm-paper-reference-2026-09-13.json"
+                    ).read_text()
                 )
                 if (
                     hashlib.sha256(

@@ -62,3 +62,49 @@ async def test_live_catchup_sorts_descending_api_rows_before_advancing_cursor():
     assert warmup.ts == base - timedelta(minutes=5)
     assert first_catchup.ts == base - timedelta(minutes=3)
     assert second_catchup.ts == base - timedelta(minutes=2)
+
+
+@pytest.mark.asyncio
+async def test_live_gap_backfill_recovers_evidence_before_aggregation():
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+
+    def candle(i):
+        return {
+            "time": (start + timedelta(minutes=i)).isoformat(),
+            "open": 100,
+            "high": 100,
+            "low": 100,
+            "close": 100,
+        }
+
+    class Market:
+        async def iter_candles(self, *_args, **_kwargs):
+            yield candle(1)
+
+    stream = LnmLiveStream(None)
+    repaired = await stream._backfill(
+        Market(), [candle(0), candle(2)], start + timedelta(minutes=3)
+    )
+    assert len(repaired) == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_backfill_retains_observations_without_raising():
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+
+    class Market:
+        async def iter_candles(self, *_args, **_kwargs):
+            raise OSError("history unavailable")
+            yield
+
+    rows = [
+        {
+            "time": (start + timedelta(minutes=i)).isoformat(),
+            "open": 100,
+            "high": 100,
+            "low": 100,
+            "close": 100,
+        }
+        for i in (0, 2)
+    ]
+    assert await LnmLiveStream(None)._backfill(Market(), rows, start + timedelta(minutes=3)) == rows

@@ -61,7 +61,7 @@ _CONSTRUCTION = ("pullback", "tolerance", "max_age_days", "zone", "max_width", "
 class ImpulseRangeLive(Strategy):
     tfs = ("1d", "4h")
     position_slots = (SLOT,)
-    VERSION: ClassVar[int] = 1
+    VERSION: ClassVar[int] = 2
     MODES: ClassVar[frozenset[str]] = frozenset({"shadow", "funded"})
     MAX_EVENTS: ClassVar[int] = 200
     MAX_PAPER_TRADES: ClassVar[int] = 500
@@ -99,6 +99,8 @@ class ImpulseRangeLive(Strategy):
         self._inflight_entry: dict[str, Any] | None = None
         self._closing = False
         self._urgent_exit: str | None = None
+        self._close_trade_id: str | None = None
+        self._closing_since: datetime | None = None
         # Shadow paper book.
         self._paper_pending: dict[str, Any] | None = None
         self.paper_position: dict[str, Any] | None = None
@@ -120,9 +122,12 @@ class ImpulseRangeLive(Strategy):
             self._paper_pending = None
             self.range_machine.position = None
             self._log(None, "paper_position_dropped", {"reason": "mode_funded"})
-        if owned and self.range_machine.position is None and not self._closing:
+        if owned and (self._closing or self.range_machine.position is None):
             self._closing = True
-            self._urgent_exit = "unmodelled_owned_position"
+            self._urgent_exit = self._urgent_exit or (
+                "resume_owned_close" if self._closing_since else "unmodelled_owned_position"
+            )
+            self._close_trade_id = state.position(SLOT).trade_id
         elif not owned and self.range_machine.position is not None:
             self.range_machine.position = None
             self._log(None, "machine_position_cleared", {"reason": "venue_flat_at_startup"})
@@ -130,10 +135,13 @@ class ImpulseRangeLive(Strategy):
     def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
         ts = bar.ts.astimezone(UTC)
         intents: list[OrderIntent] = []
-        if not bar.warmup and self._urgent_exit is not None:
-            if state.position(SLOT).qty_sats:
-                intents.append(self._exit_intent(self._urgent_exit, bar.timeframe))
-            self._urgent_exit = None
+        if (
+            not bar.warmup
+            and bar.timeframe == "1m"
+            and self._urgent_exit is not None
+            and state.position(SLOT).qty_sats
+        ):
+            intents.append(self._exit_intent(self._urgent_exit, bar.timeframe))
         if bar.timeframe == "1d":
             self._on_daily(ts, bar)
         elif bar.timeframe == "4h":
@@ -149,6 +157,9 @@ class ImpulseRangeLive(Strategy):
         last = self.range_machine.detector.last_ts
         if last is not None and day <= last:
             return
+        if not bar.complete:
+            self._incomplete(ts, "incomplete daily candle")
+            return
         try:
             events = self.range_machine.observe_daily(_candle(day, bar))
         except ValueError as exc:
@@ -161,6 +172,9 @@ class ImpulseRangeLive(Strategy):
         start = ts - H4
         if m.bar_ts is not None and ts <= m.bar_ts:
             return []  # already processed before a restart
+        if not bar.complete:
+            self._incomplete(ts, "incomplete 4h candle")
+            return []
         had_position = m.position is not None
         events: list[Event] = []
         if m.bar_ts is not None:
@@ -199,6 +213,28 @@ class ImpulseRangeLive(Strategy):
             # evaluated for a new signal.
             intents += self._paper_fill(minute, replayed=bar.warmup)
             return intents
+        # Frozen reconstruction must not suppress an already-owned target or
+        # clock-based expiry. These use the last verified channel, never partial
+        # candles or reconstructed entry eligibility.
+        lv = m.levels()
+        if (
+            not self.model_complete
+            and self.mode == "funded"
+            and m.position is not None
+            and state.position(SLOT).qty_sats
+            and lv is not None
+        ):
+            ch = m.channel
+            reason = None
+            if ch and ts >= ch.confirmed_ts + DAY * m.p.max_age_days:
+                reason = "expired"
+            elif ts != m.position.fill_minute and (
+                bar.close >= lv.mid if m.position.side == 1 else bar.close <= lv.mid
+            ):
+                reason = "target"
+            if reason:
+                m.record_target_exit(fill_minute=ts + MINUTE)
+                return intents + self._funded_exit(reason, bar, state, signal_ts=ts)
         if m.bar_ts is None or not m.bar_ts <= ts < m.bar_ts + H4:
             return intents
         signal = m.minute_signal(minute)
@@ -288,8 +324,10 @@ class ImpulseRangeLive(Strategy):
         self, reason: str, bar: Bar, state: StrategyState, *, signal_ts: datetime | None = None
     ) -> list[OrderIntent]:
         self._closing = True
+        self._urgent_exit = reason
+        self._close_trade_id = state.position(SLOT).trade_id
+        self._closing_since = self._closing_since or bar.ts
         if bar.warmup:
-            self._urgent_exit = reason
             return []
         if not state.position(SLOT).qty_sats:
             return []
@@ -299,6 +337,7 @@ class ImpulseRangeLive(Strategy):
         self, reason: str, trigger_tf: str, signal_ts: datetime | None = None
     ) -> OrderIntent:
         metadata = self._range_metadata()
+        metadata["close_trade_id"] = self._close_trade_id
         if signal_ts is not None:
             metadata["signal_ts"] = signal_ts.isoformat()
         return OrderIntent(
@@ -422,6 +461,9 @@ class ImpulseRangeLive(Strategy):
         owned = state.position(SLOT).qty_sats != 0
         if self._closing and not owned:
             self._closing = False
+            self._urgent_exit = None
+            self._close_trade_id = None
+            self._closing_since = None
         if (
             self.mode == "funded"
             and self.range_machine.position is not None
@@ -436,6 +478,7 @@ class ImpulseRangeLive(Strategy):
         return {
             "version": self.VERSION,
             "mode": self.mode,
+            "entries_enabled": self.entries_enabled,
             "machine": self.range_machine.persistent_state(),
             "model_complete": self.model_complete,
             "incomplete_reason": self.incomplete_reason,
@@ -444,6 +487,8 @@ class ImpulseRangeLive(Strategy):
             "entry_blocked_bar": _iso(self._entry_blocked_bar),
             "closing": self._closing,
             "urgent_exit": self._urgent_exit,
+            "close_trade_id": self._close_trade_id,
+            "closing_since": _iso(self._closing_since),
             "paper_pending": self._paper_pending,
             "paper_position": self.paper_position,
             "paper_trades": list(self.paper_trades),
@@ -452,10 +497,9 @@ class ImpulseRangeLive(Strategy):
         }
 
     def restore_persistent_state(self, snapshot: dict[str, Any]) -> bool:
-        if snapshot.get("version") != self.VERSION:
+        if snapshot.get("version") not in (1, self.VERSION):
             return False
         machine = ImpulseRangeMachine.restore(snapshot["machine"])
-        self._adopt_policy(machine)
         self.range_machine = machine
         self.model_complete = bool(snapshot["model_complete"])
         self.incomplete_reason = snapshot["incomplete_reason"]
@@ -465,11 +509,16 @@ class ImpulseRangeLive(Strategy):
         self._entry_blocked_bar = _ts(snapshot["entry_blocked_bar"])
         self._closing = bool(snapshot["closing"])
         self._urgent_exit = snapshot["urgent_exit"]
+        self._close_trade_id = snapshot.get("close_trade_id")
+        self._closing_since = _ts(snapshot.get("closing_since"))
         self._paper_pending = snapshot["paper_pending"]
         self.paper_position = snapshot["paper_position"]
         self.paper_trades = deque(snapshot["paper_trades"], maxlen=self.MAX_PAPER_TRADES)
         self.paper_totals = dict(snapshot["paper_totals"])
         self.events = deque(snapshot["events"], maxlen=self.MAX_EVENTS)
+        self._adopt_policy(machine)
+        if snapshot.get("version") == 1:
+            self._log(None, "state_migrated", {"from": 1, "to": self.VERSION, "width_rule": 2})
         if snapshot["mode"] != self.mode:
             self._log(None, "mode_changed", {"from": snapshot["mode"], "to": self.mode})
         return True
@@ -481,12 +530,37 @@ class ImpulseRangeLive(Strategy):
         if any(getattr(saved, k) != getattr(wanted, k) for k in _CONSTRUCTION):
             raise ValueError("impulse-range construction parameters differ from saved state")
         if saved != wanted:
+            channel = machine.channel
+            old_eligibility = channel.tradeable if channel else None
             machine.p = replace(
                 saved,
                 direction_mode=wanted.direction_mode,
                 chop_filter=wanted.chop_filter,
                 chop_threshold=wanted.chop_threshold,
             )
+            if channel is not None and channel.er_checked:
+                channel.tradeable = (
+                    not wanted.chop_filter
+                    or (
+                        channel.er_at_confirm is not None
+                        and channel.er_at_confirm >= wanted.chop_threshold
+                    )
+                ) and channel.hi / channel.lo - 1 <= wanted.max_width + 1e-12
+            # __init__ adopts policy before its event buffer exists.
+            if hasattr(self, "events"):
+                self._log(
+                    None,
+                    "policy_changed",
+                    {
+                        "old": asdict(saved),
+                        "new": asdict(machine.p),
+                        "old_tradeable": old_eligibility,
+                        "tradeable": channel.tradeable if channel else None,
+                    },
+                )
+
+    def mark_evidence_incomplete(self, ts: datetime) -> None:
+        self._incomplete(ts, "market evidence incomplete; verified reconstruction required")
 
     def _incomplete(self, ts: datetime, reason: str) -> None:
         if self.model_complete:

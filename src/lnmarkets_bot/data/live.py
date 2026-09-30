@@ -92,9 +92,12 @@ class LnmLiveStream(DataSource):
             _log.error("live.warmup_failed", error=str(exc))
             raise RuntimeError("unable to load live strategy warmup candles") from exc
 
+        history = await self._backfill(market, history, end_dt)
         for candle in sorted(history, key=lambda row: _parse_ts(_candle_time(row)) or end_dt):
             bar = _to_bar(candle, warmup=True)
             if bar is None or bar.ts + timedelta(minutes=1) > end_dt:
+                continue
+            if self._last_yielded_ts is not None and bar.ts <= self._last_yielded_ts:
                 continue
             self._last_yielded_ts = bar.ts
             yield bar
@@ -140,6 +143,7 @@ class LnmLiveStream(DataSource):
                 _log.info("live.poll_recovered", consecutive_failures=consecutive_failures)
                 consecutive_failures = 0
 
+            candles = await self._backfill(market, candles, end_dt)
             # Do not rely on endpoint page order. If a catch-up response is
             # newest-first, advancing ``_last_yielded_ts`` on its first row
             # would otherwise make every older missing candle look stale and
@@ -162,6 +166,43 @@ class LnmLiveStream(DataSource):
             # Sleep until next poll. Random jitter would be nice in production.
             await asyncio.sleep(self.poll_seconds)
             end_dt = datetime.now(tz=UTC)
+
+    async def _backfill(self, market, candles, end_dt):
+        """One bounded attempt per observed gap; never fabricate missing prices.
+
+        Ten requests and a 2s deadline each bound outage impact. An enduring
+        gap is carried as coverage evidence by the aggregator and engine.
+        """
+        bars = sorted(
+            (bar for c in candles if (bar := _to_bar(c, warmup=True)) is not None),
+            key=lambda bar: bar.ts,
+        )
+        last = self._last_yielded_ts
+        gaps = []
+        for bar in bars:
+            if last is not None and bar.ts > last + timedelta(minutes=1):
+                gaps.append((last + timedelta(minutes=1), bar.ts))
+            last = max(last, bar.ts) if last else bar.ts
+        extra = []
+        for start, stop in gaps[:10]:
+            try:
+
+                async def fetch(start=start, stop=stop):
+                    return [
+                        c
+                        async for c in market.iter_candles(
+                            self.symbol, interval="1m", from_ts=start, to_ts=min(stop, end_dt)
+                        )
+                    ]
+
+                extra.extend(await asyncio.wait_for(fetch(), timeout=2.0))
+            except Exception as exc:
+                _log.warning(
+                    "live.candle_backfill_failed",
+                    start=start.isoformat(),
+                    error_type=type(exc).__name__,
+                )
+        return [*candles, *extra]
 
 
 def _parse_ts(s) -> datetime | None:

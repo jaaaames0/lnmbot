@@ -1,6 +1,8 @@
 """Deterministic replays of the impulse-range machine with the research cost model.
 
-Two execution models, both matching the 2026-09-29 research exactly:
+Two execution models follow the 2026-09-29 research timing and cost model.
+Rule version 2 enforces the initial width cap, changing historical trade
+membership; the dated original research parity applies to version 1 only.
 
 - `replay_4h`: limit-style fills at the level on 4h bars, no same-bar round trip
   (the research reference).

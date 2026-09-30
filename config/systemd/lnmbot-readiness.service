@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only LNMarkets trader readiness probe
+After=lnmbot.service lnmbot-dashboard.service
+
+[Service]
+Type=oneshot
+User=lnmbot-dashboard
+Group=lnmbot-dashboard
+ExecStart=@DASHBOARD_RELEASE@/.venv/bin/python @DASHBOARD_RELEASE@/scripts/check_live_readiness.py
+TimeoutStartSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
