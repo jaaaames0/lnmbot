@@ -200,3 +200,65 @@ def test_timer_failure_precedes_every_live_install(tmp_path, monkeypatch, failur
         deploy.cutover(checkpoint)
     assert not installed
     assert env.read_text() == "CONFIG=unchanged\n"
+
+
+def test_deployment_acceptance_requires_selected_range_scope(monkeypatch):
+    from scripts import deploy_range_remediation as deploy
+
+    calls = []
+    candidate = {"trader": "/candidate/trader", "dashboard": "/candidate/dashboard"}
+    monkeypatch.setattr(
+        deploy,
+        "current",
+        lambda unit: candidate["trader" if unit == deploy.TRADER_UNIT else "dashboard"],
+    )
+    monkeypatch.setattr(deploy, "run", lambda *_a, **_kw: "0")
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self, *_args):
+            return self.payload
+
+    def request(url, **_kwargs):
+        calls.append(url)
+        if url.endswith("readyz"):
+            return Response(
+                json.dumps(
+                    {"ready": True, "entries_enabled": True, "owners": [MA, BREAKOUT, RANGE]}
+                ).encode()
+            )
+        return Response(b'<a class="scope-link" href="/signals?tf=range">Range</a>')
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", request)
+    with pytest.raises(RuntimeError, match="range route"):
+        deploy.require_readiness(candidate)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_verified_reconstruction_preserves_daily_seed_seam(tmp_path):
+    start = pd.Timestamp("2026-09-01", tz="UTC")
+    daily = tmp_path / "daily.parquet"
+    minutes = tmp_path / "minutes.parquet"
+
+    def frame(stamps):
+        return pd.DataFrame(
+            {"ts": stamps, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0}
+        )
+
+    frame(pd.date_range(start - pd.Timedelta(days=150), periods=150, freq="D")).to_parquet(daily)
+    frame(pd.date_range(start, periods=1440, freq="min")).to_parquet(minutes)
+    report = await reconstruct(daily, minutes, {})
+    assert report["dry_run"] and report["state"]["model_complete"]
+    assert report["state"]["machine"]["detector"]["count"] == 151
+    assert report["state"]["machine"]["detector"]["last_ts"] == start.isoformat()
+    assert report["state"]["machine"]["position"] is None
+    assert set(report["inputs"]) == {str(daily), str(minutes)}

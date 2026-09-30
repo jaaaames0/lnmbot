@@ -2,6 +2,18 @@
 
 ## 2026-09-30 — Funded range audit remediation
 
+Accepted trader and dashboard runtime: `prod-20260930.3-g9aac08e365ce`,
+source `9aac08e365ce`, run 69. Protected checkpoint:
+`/data/security-backups/lnmbot-remediation-20260930T150127Z`.
+Release validation: **396 tests passed**, scoped Ruff clean, 3 import contracts
+kept. Readiness 200, all owners restored, zero restarts/unresolved commands,
+40 orders and unchanged P&L, zero running/pending venue inventory; encrypted
+backup succeeded and recovery was disarmed. Funded range admissions and risk
+policy were retained. Readiness monitoring is enabled. Independent fresh minute and native daily/4h
+replays reproduce the migrated current channel/detector exactly, with complete
+coverage of all 143,460 expected minute candles. Post-acceptance source checks
+passed 397 default tests, plus the verified dry-run reconstruction regression.
+
 - Persist and recover owned close obligations and submitted close commands;
   block admissions for any owned slot or external callback without a binding.
 - Carry minute coverage into aggregate candles, perform bounded gap backfill,

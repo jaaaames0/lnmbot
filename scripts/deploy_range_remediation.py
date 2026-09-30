@@ -145,7 +145,7 @@ def require_readiness(checkpoint):
         raise RuntimeError("trader readiness assertions failed")
     with urllib.request.urlopen("http://127.0.0.1:8082/signals?tf=range", timeout=45) as response:
         page = response.read().decode()
-    if "tf=range" not in page or "Range" not in page:
+    if '<a class="scope-link active" href="/signals?tf=range">Range</a>' not in page:
         raise RuntimeError("dashboard range route assertion failed")
     return report
 

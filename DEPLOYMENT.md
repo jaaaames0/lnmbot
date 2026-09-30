@@ -571,6 +571,9 @@ curl -fsS http://127.0.0.1:8082/readyz
 sudo python3 scripts/deploy_range_remediation.py accept
 ```
 
+Run root Python validation with `PYTHONDONTWRITEBYTECODE=1` so root does not
+generate writable caches inside immutable runtimes.
+
 Build creates root-owned immutable trader, dashboard and compatible recovery
 runtimes, preserving an archive, Git bundle and manifests in a protected
 checkpoint. Cutover takes a consistent SQLite copy, validates seed hashes by
