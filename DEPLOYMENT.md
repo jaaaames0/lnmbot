@@ -145,6 +145,42 @@ breakout exits continue throughout. In that case, verify the missing funding
 and candle evidence, then restart only the trader to rebuild from its saved
 checkpoint; do not clear the model flags by hand.
 
+### Optional impulse-range strategy
+
+`STRATEGY_RANGE_MODE` accepts `off` (default), `shadow`, or `funded`. Any mode
+other than `off` requires an order-enabled run. The strategy waits for a
+structure-passing daily breakout (the same candidate rule as the breakout
+strategy), confirms a swing channel after an 8% pullback, and trades from the
+channel edges to its midpoint with market orders on a 1m close. A 4h close
+beyond an edge exits, and the channel is redrawn; the range is abandoned beyond
+40% width, and its entry size tapers to zero over 120 days.
+
+- `shadow` records paper fills at the next minute's open, with fees and
+  slippage but no funding, and places no orders. Paper fills appear as
+  `shadow_entry` and `shadow_exit` signals in the audit trail.
+- `funded` owns one isolated trade (`btc_impulse_range_v1:r0`) sized at
+  `STRATEGY_RANGE_UNIT_NOTIONAL_USD` times the age taper, at
+  `STRATEGY_RANGE_LEVERAGE`, under the shared risk guard.
+- With `STRATEGY_RANGE_CHOP_FILTER=true`, a range whose 20-day efficiency ratio
+  at confirmation is below `STRATEGY_RANGE_CHOP_THRESHOLD` is tracked but not
+  traded. `STRATEGY_RANGE_DIRECTION_MODE` limits new entries.
+- Mode, size, leverage, direction, and filter settings may change across a
+  restart. The range-construction rules are fixed; a saved state built with
+  different construction rules is refused.
+
+On the first start, the daily detector is warmed from
+`STRATEGY_RANGE_SEED_DAILY_PATH` up to the start of the live feed's 100-day
+warmup, and the warmup rebuilds recent range state. A range that began before
+that window is not recognised; the strategy stays idle until the next impulse.
+If the seed does not reach the warmup start, the strategy is not started and
+`live.range_cold_start_unavailable` is logged; supply a newer daily seed.
+Later restarts restore the saved state instead.
+
+Entries are never taken on replayed bars; an exit that fell due while the
+trader was stopped is sent on the first live bar. A missing daily or 4h bar
+marks the model incomplete: new entries stop and owned exits continue. There is
+no automated rebuild yet; `incomplete_reason` in the saved state records the cause.
+
 ## 4. First-time installation
 
 For local checks, install dependencies in the checkout:

@@ -5,6 +5,20 @@ source changes that have not been installed as a production release.
 
 ## Unreleased
 
+### Impulse-range strategy (source only; not deployed)
+
+- Add a third strategy for post-impulse consolidations. It uses the breakout
+  impulse rule, then a swing channel and edge-to-midpoint trades, with a
+  close-based stop, channel redraws, a 40% width cap, and a tapered 120-day
+  expiry. A choppiness filter (20-day efficiency ratio below 0.22 at
+  confirmation) is on by default.
+- The pure machine reproduces the 2026-09-29 research simulator trade for trade.
+  The live adapter's shadow book and funded orders match the validated
+  one-minute replay trade for trade on feed-ordered synthetic data.
+- `STRATEGY_RANGE_MODE` (`off`, `shadow`, `funded`) wires it into the funded
+  live process with its own owned slot and fixed-notional sizing. It is `off` by
+  default.
+
 ### Historical funding admission
 
 - Keep the historical breakout model at its last verified point when funding is

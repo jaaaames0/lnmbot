@@ -38,6 +38,7 @@ from lnmarkets_bot.persistence.recorder import Recorder
 from lnmarkets_bot.risk.guard import SizingPolicy
 from lnmarkets_bot.strategy.close_range_live import CloseRangeLive, load_seed_machine
 from lnmarkets_bot.strategy.historical import hydrate_historical
+from lnmarkets_bot.strategy.impulse_range_live import ImpulseRangeLive, load_cold_machine
 from lnmarkets_bot.strategy.ma_cross import MaCross
 
 
@@ -58,7 +59,12 @@ async def _historical_funding(client, from_ts: datetime, to_ts: datetime):
     return [row for row in result if row[0] <= to_ts]
 
 
-def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime | None:
+RANGE_INSTANCE_ID = "btc_impulse_range_v1"
+
+
+def _strict_data_from(
+    recorder: Recorder, *, include_breakout: bool, include_range: bool = False
+) -> datetime | None:
     """Validate uncommitted days while ignoring old replay gaps."""
     names = ["lnmarkets_bot.strategy.ma_cross.MaCross"]
     if include_breakout:
@@ -73,6 +79,17 @@ def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime
         )
         utc = stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)
         return utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if include_range:
+        snapshot = recorder.latest_strategy_state(mode="live", strategy_name=RANGE_INSTANCE_ID)
+        if snapshot is None:
+            return None
+        machine = snapshot["state"].get("machine", {})
+        bar_ts = machine.get("bar_ts")
+        last_day = machine.get("detector", {}).get("last_ts")
+        if not bar_ts or not last_day:
+            return None
+        starts.extend([day_start(bar_ts), day_start(last_day) + timedelta(days=1)])
 
     for name in names:
         snapshot = recorder.latest_strategy_state(
@@ -97,6 +114,45 @@ def _strict_data_from(recorder: Recorder, *, include_breakout: bool) -> datetime
                 return None
             starts.append(day_start(last_day) + timedelta(days=1))
     return min(starts)
+
+
+def _range_strategy(
+    cfg: BotConfig, recorder: Recorder, *, owned: bool, warmup_days: int, log
+) -> ImpulseRangeLive | None:
+    """Build the impulse-range binding, or None when a cold start is impossible.
+
+    With the mode off, an owned position is still managed to its exit with
+    new entries disabled. A saved snapshot replaces the machine on startup;
+    only a first start warms the daily detector from the seed file.
+    """
+    mode = cfg.strategy_range_mode
+    strategy = ImpulseRangeLive(
+        {
+            "mode": "funded" if mode == "off" else mode,
+            "entries_enabled": mode == "funded",
+            "unit_notional_usd": cfg.strategy_range_unit_notional_usd,
+            "leverage": cfg.strategy_range_leverage,
+            "direction_mode": cfg.strategy_range_direction_mode,
+            "chop_filter": cfg.strategy_range_chop_filter,
+            "chop_threshold": cfg.strategy_range_chop_threshold,
+        }
+    )
+    if recorder.latest_strategy_state(mode="live", strategy_name=RANGE_INSTANCE_ID) is not None:
+        return strategy
+    through_day = (datetime.now(UTC) - timedelta(days=warmup_days)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    try:
+        strategy.range_machine = load_cold_machine(
+            cfg.strategy_range_seed_daily_path, strategy.range_machine.p, through_day=through_day
+        )
+    except (OSError, ValueError) as exc:
+        log.error("live.range_cold_start_unavailable", error=str(exc))
+        if not owned:
+            return None
+        strategy.model_complete = False
+        strategy.incomplete_reason = "cold start without daily seed"
+    return strategy
 
 
 async def main() -> int:
@@ -148,6 +204,10 @@ async def main() -> int:
         parser.error("--test-5m cannot run while STRATEGY_BREAKOUT_ENABLED=true")
     if cfg.strategy_breakout_enabled and not args.allow_orders:
         parser.error("integrated breakout currently requires funded live execution")
+    if args.test_5m and cfg.strategy_range_mode != "off":
+        parser.error("--test-5m cannot run while STRATEGY_RANGE_MODE is enabled")
+    if cfg.strategy_range_mode != "off" and not args.allow_orders:
+        parser.error("the impulse-range strategy runs inside the funded live process")
     configure_logging(cfg.storage_log_level, cfg.storage_log_path)
     log = get_logger("live")
     log.info(
@@ -270,19 +330,27 @@ async def main() -> int:
     # Run
     try:
         owned_breakout = False
+        owned_range = False
         if executor is not None:
             await executor.reconcile()
             owned_breakout = any(
                 key.startswith("btc_close_range_v1:") and position.qty_sats
                 for key, position in executor.positions.items()
             )
+            owned_range = any(
+                key.startswith(f"{RANGE_INSTANCE_ID}:") and position.qty_sats
+                for key, position in executor.positions.items()
+            )
+        include_range = cfg.strategy_range_mode != "off" or owned_range
         ds = MultiTimeframeDataSource(
             base_stream,
             higher_timeframes=higher_timeframes,
             require_complete_buckets=args.allow_orders,
             strict_from_ts=(
                 _strict_data_from(
-                    recorder, include_breakout=cfg.strategy_breakout_enabled or owned_breakout
+                    recorder,
+                    include_breakout=cfg.strategy_breakout_enabled or owned_breakout,
+                    include_range=include_range,
                 )
                 if executor is not None
                 else None
@@ -293,7 +361,7 @@ async def main() -> int:
             total_margin_fraction=cfg.sizing_total_margin_fraction,
             timeframe_weights=cfg.sizing_timeframe_weights,
             equity_haircut=cfg.sizing_equity_haircut,
-            fixed_notional_strategy_ids=frozenset({"btc_close_range_v1"}),
+            fixed_notional_strategy_ids=frozenset({"btc_close_range_v1", RANGE_INSTANCE_ID}),
         )
         if executor is not None:
             assert account_balance_provider is not None
@@ -316,6 +384,12 @@ async def main() -> int:
                     ),
                 )
                 bindings.append(StrategyBinding("btc_close_range_v1", breakout))
+            if include_range:
+                range_strategy = _range_strategy(
+                    cfg, recorder, owned=owned_range, warmup_days=base_stream.warmup_days, log=log
+                )
+                if range_strategy is not None:
+                    bindings.append(StrategyBinding(RANGE_INSTANCE_ID, range_strategy))
 
             async def historical_hydrator(machine):
                 root = Path(__file__).resolve().parents[1]

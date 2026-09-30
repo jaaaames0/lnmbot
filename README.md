@@ -3,7 +3,9 @@
 An isolated-margin BTC/USD futures bot with a read-only operations dashboard.
 The live runner always operates the MA-cross strategy independently on `4h`
 and `1d`. It can also operate a daily close-range breakout campaign with
-separately owned units in the same funded account. The breakout strategy is
+separately owned units in the same funded account, and an impulse-range
+strategy that trades post-breakout consolidations, either as an
+order-incapable shadow book or with one funded slot. The breakout strategy is
 disabled in the example configuration; enabling it requires an order-enabled
 run. Historical breakout and shadow results remain separate from funded P&L.
 

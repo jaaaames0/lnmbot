@@ -105,6 +105,18 @@ class BotConfig(BaseSettings):
         "./config/seeds/btc-close-range-lnm-live-seed-2026-09-13.json"
     )
 
+    # --- Optional impulse-range strategy in the shared live process ---
+    # "shadow" runs an order-incapable paper book; "funded" places orders.
+    strategy_range_mode: Literal["off", "shadow", "funded"] = "off"
+    strategy_range_unit_notional_usd: float = Field(default=100.0, gt=0)
+    strategy_range_leverage: float = Field(default=2.0, gt=0)
+    strategy_range_direction_mode: Literal["both", "long_only", "short_only"] = "both"
+    strategy_range_chop_filter: bool = True
+    strategy_range_chop_threshold: float = Field(default=0.22, ge=0, le=1)
+    strategy_range_seed_daily_path: Path = Path(
+        "./config/seeds/lnmarkets_btc_1d_2019-09-09_2026-09-13.parquet"
+    )
+
     # --- Kill switch ---
     halted: str = ""  # "1" to halt
     halt_file: Path | None = None

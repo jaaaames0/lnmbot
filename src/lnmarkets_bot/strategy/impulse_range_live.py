@@ -32,7 +32,9 @@ import math
 from collections import deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import pandas as pd  # type: ignore[import-untyped]
 
 from .base import Bar, Strategy, StrategyState
 from .impulse_range import (
@@ -45,6 +47,9 @@ from .impulse_range import (
     ImpulseRangeParams,
 )
 from .intents import OrderIntent, Side, SignalKind
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 SLOT = "r0"
 FEE = 0.001
@@ -71,6 +76,8 @@ class ImpulseRangeLive(Strategy):
         self.mode = str(self.params.get("mode", "shadow"))
         if self.mode not in self.MODES:
             raise ValueError(f"unsupported impulse-range mode: {self.mode!r}")
+        # False keeps managing an owned position without admitting new entries.
+        self.entries_enabled = bool(self.params.get("entries_enabled", True))
         self.unit_notional_usd = float(self.params.get("unit_notional_usd", 100.0))
         self.leverage = float(self.params.get("leverage", 2.0))
         if not all(math.isfinite(v) and v > 0 for v in (self.unit_notional_usd, self.leverage)):
@@ -80,8 +87,8 @@ class ImpulseRangeLive(Strategy):
             chop_filter=bool(self.params.get("chop_filter", True)),
             chop_threshold=float(self.params.get("chop_threshold", 0.22)),
         )
-        self.machine = machine or ImpulseRangeMachine(self.machine_params)
-        self._adopt_policy(self.machine)
+        self.range_machine = machine or ImpulseRangeMachine(self.machine_params)
+        self._adopt_policy(self.range_machine)
         self.model_complete = True
         self.incomplete_reason: str | None = None
         self.last_minute_ts: datetime | None = None
@@ -111,13 +118,13 @@ class ImpulseRangeLive(Strategy):
             # Switching from shadow to funded: paper exposure is not owned.
             self.paper_position = None
             self._paper_pending = None
-            self.machine.position = None
+            self.range_machine.position = None
             self._log(None, "paper_position_dropped", {"reason": "mode_funded"})
-        if owned and self.machine.position is None and not self._closing:
+        if owned and self.range_machine.position is None and not self._closing:
             self._closing = True
             self._urgent_exit = "unmodelled_owned_position"
-        elif not owned and self.machine.position is not None:
-            self.machine.position = None
+        elif not owned and self.range_machine.position is not None:
+            self.range_machine.position = None
             self._log(None, "machine_position_cleared", {"reason": "venue_flat_at_startup"})
 
     def on_bar(self, bar: Bar, state: StrategyState) -> list[OrderIntent]:
@@ -139,18 +146,18 @@ class ImpulseRangeLive(Strategy):
     # ------------------------------------------------------------------ bars
     def _on_daily(self, ts: datetime, bar: Bar) -> None:
         day = ts - DAY
-        last = self.machine.detector.last_ts
+        last = self.range_machine.detector.last_ts
         if last is not None and day <= last:
             return
         try:
-            events = self.machine.observe_daily(Candle(day, bar.open, bar.high, bar.low, bar.close))
+            events = self.range_machine.observe_daily(_candle(day, bar))
         except ValueError as exc:
             self._incomplete(ts, f"daily evidence gap: {exc}")
             return
         self._record(events)
 
     def _on_4h(self, ts: datetime, bar: Bar, state: StrategyState) -> list[OrderIntent]:
-        m = self.machine
+        m = self.range_machine
         start = ts - H4
         if m.bar_ts is not None and ts <= m.bar_ts:
             return []  # already processed before a restart
@@ -160,7 +167,7 @@ class ImpulseRangeLive(Strategy):
             if start != m.bar_ts:
                 self._incomplete(ts, f"4h evidence gap after {m.bar_ts.isoformat()}")
             else:
-                events += m.close_bar(Candle(start, bar.open, bar.high, bar.low, bar.close))
+                events += m.close_bar(_candle(start, bar))
         events += m.open_bar(ts, bar.close)
         self._record(events)
         intents: list[OrderIntent] = []
@@ -181,11 +188,11 @@ class ImpulseRangeLive(Strategy):
         return intents
 
     def _on_minute(self, ts: datetime, bar: Bar, state: StrategyState) -> list[OrderIntent]:
-        m = self.machine
+        m = self.range_machine
         if self.last_minute_ts is not None and ts <= self.last_minute_ts:
             return []
         self.last_minute_ts = ts
-        minute = Candle(ts, bar.open, bar.high, bar.low, bar.close)
+        minute = _candle(ts, bar)
         intents: list[OrderIntent] = []
         if self.mode == "shadow" and self._paper_pending is not None:
             # As in the replay, the minute in which an order was due is not
@@ -215,7 +222,7 @@ class ImpulseRangeLive(Strategy):
         bar: Bar,
         state: StrategyState,
     ) -> list[OrderIntent]:
-        m = self.machine
+        m = self.range_machine
         lv = m.levels()
         if lv is None:
             return []
@@ -242,7 +249,7 @@ class ImpulseRangeLive(Strategy):
                 "fill_minute": fill_minute.isoformat(),
             }
             return []
-        if bar.warmup or not self.model_complete or self._closing:
+        if bar.warmup or not self.entries_enabled or not self.model_complete or self._closing:
             return []
         if self._entry_blocked_bar == m.bar_ts or state.position(SLOT).qty_sats:
             return []
@@ -306,7 +313,7 @@ class ImpulseRangeLive(Strategy):
     def _paper_fill(self, minute: Candle, *, replayed: bool) -> list[OrderIntent]:
         pending, self._paper_pending = self._paper_pending, None
         assert pending is not None
-        m = self.machine
+        m = self.range_machine
         fill_minute = pending.get("fill_minute")
         if fill_minute is not None and datetime.fromisoformat(fill_minute) != minute.ts:
             return []  # the minute it was due in is missing; the replay drops it
@@ -380,14 +387,14 @@ class ImpulseRangeLive(Strategy):
             return
         inflight, self._inflight_entry = self._inflight_entry, None
         if not decision.order_id or decision.order_id <= 0:
-            self._entry_blocked_bar = self.machine.bar_ts
+            self._entry_blocked_bar = self.range_machine.bar_ts
             self._log(None, "entry_not_filled", {"reason": decision.detail.get("reason")})
             return
         price = decision.detail.get("price_usd")
         if price is None or inflight is None:
             raise RuntimeError("confirmed impulse-range entry has no fill record")
         try:
-            self.machine.record_entry(
+            self.range_machine.record_entry(
                 inflight["side"],
                 float(price),
                 inflight["fill_minute"],
@@ -400,10 +407,10 @@ class ImpulseRangeLive(Strategy):
 
     def on_intent_rejected(self, intent: OrderIntent) -> None:
         if intent.kind == SignalKind.ENTRY:
-            self._entry_blocked_bar = self.machine.bar_ts
+            self._entry_blocked_bar = self.range_machine.bar_ts
 
     def on_external_position_closed(self, event: Any, state: StrategyState) -> None:
-        self.machine.position_closed_externally()
+        self.range_machine.position_closed_externally()
         self._closing = False
         self._log(
             getattr(event, "observed_at", None),
@@ -417,11 +424,11 @@ class ImpulseRangeLive(Strategy):
             self._closing = False
         if (
             self.mode == "funded"
-            and self.machine.position is not None
+            and self.range_machine.position is not None
             and not owned
             and self._inflight_entry is None
         ):
-            self.machine.position = None
+            self.range_machine.position = None
             self._log(None, "machine_position_cleared", {"reason": "venue_flat"})
 
     # ------------------------------------------------------------------ persistence
@@ -429,7 +436,7 @@ class ImpulseRangeLive(Strategy):
         return {
             "version": self.VERSION,
             "mode": self.mode,
-            "machine": self.machine.persistent_state(),
+            "machine": self.range_machine.persistent_state(),
             "model_complete": self.model_complete,
             "incomplete_reason": self.incomplete_reason,
             "last_minute_ts": _iso(self.last_minute_ts),
@@ -449,7 +456,7 @@ class ImpulseRangeLive(Strategy):
             return False
         machine = ImpulseRangeMachine.restore(snapshot["machine"])
         self._adopt_policy(machine)
-        self.machine = machine
+        self.range_machine = machine
         self.model_complete = bool(snapshot["model_complete"])
         self.incomplete_reason = snapshot["incomplete_reason"]
         self.last_minute_ts = _ts(snapshot["last_minute_ts"])
@@ -495,7 +502,7 @@ class ImpulseRangeLive(Strategy):
         self.events.append({"ts": _iso(ts), "kind": kind, "detail": detail})
 
     def _range_metadata(self) -> dict[str, Any]:
-        ch = self.machine.channel
+        ch = self.range_machine.channel
         if ch is None:
             return {"range_id": None}
         return {
@@ -508,11 +515,12 @@ class ImpulseRangeLive(Strategy):
 
     def status(self) -> dict[str, Any]:
         """Read-only summary for dashboards and logs."""
-        m = self.machine
+        m = self.range_machine
         lv = m.levels()
         ch = m.channel
         return {
             "mode": self.mode,
+            "entries_enabled": self.entries_enabled,
             "state": m.state,
             "model_complete": self.model_complete,
             "incomplete_reason": self.incomplete_reason,
@@ -523,6 +531,40 @@ class ImpulseRangeLive(Strategy):
         }
 
 
+def load_cold_machine(
+    daily_path: Path, params: ImpulseRangeParams, *, through_day: datetime
+) -> ImpulseRangeMachine:
+    """Warm the impulse detector from a daily seed file up to `through_day` inclusive.
+
+    The live feed's own warmup then continues from the next day, so its 4h
+    history rebuilds recent range state. The seed must reach `through_day`.
+    """
+    frame = pd.read_parquet(daily_path).sort_values("ts")
+    frame["ts"] = pd.to_datetime(frame["ts"], utc=True)
+    frame = frame[frame.ts <= pd.Timestamp(through_day)]
+    if frame.empty or frame.ts.iloc[-1].to_pydatetime() != through_day:
+        raise ValueError(
+            f"daily seed {daily_path} does not reach {through_day.date()}; "
+            "a newer seed is required for a cold start"
+        )
+    if not frame.ts.diff().dropna().eq(pd.Timedelta(days=1)).all():
+        raise ValueError(f"daily seed {daily_path} is not contiguous")
+    machine = ImpulseRangeMachine(params)
+    for row in frame.itertuples(index=False):
+        machine.observe_daily(_candle(row.ts.to_pydatetime(), row))
+    # Seed history only warms indicators; never act on its last signal.
+    machine.pending_impulse = None
+    return machine
+
+
+def _candle(ts: datetime, bar: Any) -> Candle:
+    """Venue candles occasionally quote an open just outside their high/low
+    (six LN Markets daily rows miss by $0.5-8). Keep open and close and widen
+    the range minimally, as the breakout seed loader does."""
+    o, c = float(bar.open), float(bar.close)
+    return Candle(ts, o, max(o, float(bar.high), c), min(o, float(bar.low), c), c)
+
+
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
@@ -531,4 +573,4 @@ def _ts(value: str | None) -> datetime | None:
     return None if value is None else datetime.fromisoformat(value).astimezone(UTC)
 
 
-__all__ = ["SLOT", "ImpulseRangeLive"]
+__all__ = ["SLOT", "ImpulseRangeLive", "load_cold_machine"]

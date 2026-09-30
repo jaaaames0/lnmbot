@@ -50,7 +50,7 @@ def strategy(mode, **kw):
 
 
 def primed(s, bars):
-    s.machine.open_bar(T0, bars[0].open)
+    s.range_machine.open_bar(T0, bars[0].open)
     return s
 
 
@@ -247,7 +247,7 @@ def test_exit_due_during_downtime_is_sent_on_first_live_bar(market):
 
 def test_rejected_entry_blocks_rest_of_bar_only():
     s = strategy("funded")
-    s.machine.bar_ts = T0
+    s.range_machine.bar_ts = T0
     s.on_intent_rejected(SimpleNamespace(kind=SignalKind.ENTRY))
     assert s._entry_blocked_bar == T0
 
@@ -283,7 +283,9 @@ def test_construction_change_is_refused_but_policy_change_is_adopted():
         {"mode": "funded", "direction_mode": "short_only", "chop_filter": True}
     )
     assert other.restore_persistent_state(snap)
-    assert other.machine.p.direction_mode == "short_only" and other.machine.p.chop_filter
+    assert (
+        other.range_machine.p.direction_mode == "short_only" and other.range_machine.p.chop_filter
+    )
     assert other.events[-1]["kind"] == "mode_changed"
 
 
