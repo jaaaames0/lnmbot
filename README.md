@@ -70,9 +70,10 @@ collection. See [CHANGELOG.md](CHANGELOG.md) for production and dashboard
 history.
 
 Funded range recovery retains an owned close obligation until venue flatness,
-including restart during submission. Range construction rule version 2 enforces
-the 40% width cap at initial confirmation as well as expansion; legacy oversized
-holdings keep their exit levels, while oversized flat channels are retired.
+including restart during submission. Range construction rule version 3 is the
+tested research rule: the 40% width cap ends an expanding channel, while a
+channel may confirm wider. In such a channel the isolated margin, not the
+close-based stop, can bound a loss; a liquidation blocks re-entry for that 4h bar.
 Changing the chop filter recomputes eligibility from the saved confirmation ER.
 
 Missing minute evidence is carried on aggregated candles. Each affected owner

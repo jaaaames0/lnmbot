@@ -152,8 +152,11 @@ other than `off` requires an order-enabled run. The strategy waits for a
 structure-passing daily breakout (the same candidate rule as the breakout
 strategy), confirms a swing channel after an 8% pullback, and trades from the
 channel edges to its midpoint with market orders on a 1m close. A 4h close
-beyond an edge exits, and the channel is redrawn; the range is abandoned beyond
-40% width, and its entry size tapers to zero over 120 days.
+beyond an edge exits, and the channel is redrawn; a range expanding beyond 40%
+width is abandoned, and its entry size tapers to zero over 120 days. A range may
+confirm wider than 40% (as tested); at 5x its stop can then lie beyond isolated
+liquidation, which bounds the loss at the margin. After any venue-side close
+the strategy does not re-enter within the same 4h bar.
 
 - `shadow` records paper fills at the next minute's open, with fees and
   slippage but no funding, and places no orders. Paper fills appear as
@@ -587,7 +590,8 @@ and disarms recovery last. Failed acceptance leaves the timer armed.
 The checkpoint's `recover.sh` uses corrected, range-capable code with
 `LIVE_ENTRIES_ENABLED=false`, retaining the current database and all owned exit
 managers. It is available for attended recovery after acceptance. Never use the
-old `deploy_impulse_range_rollout.sh` rollback to return to pre-range code.
+`rollback.sh` in the first 30 September checkpoint
+(`lnmbot-impulse-range-20260930T132213Z`) to return to pre-range code.
 Returning to code without a range binding requires stopping the trader first,
 resolving every submitted/received entry command, and independently verifying
 both running and pending venue inventory are flat for range. Local order count

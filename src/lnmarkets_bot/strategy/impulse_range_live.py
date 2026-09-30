@@ -451,6 +451,10 @@ class ImpulseRangeLive(Strategy):
     def on_external_position_closed(self, event: Any, state: StrategyState) -> None:
         self.range_machine.position_closed_externally()
         self._closing = False
+        # A liquidation can precede the 4h-close stop, leaving price beyond the
+        # buy/sell level. The tested strategy would still hold until that close,
+        # so do not re-enter within the current 4h bar.
+        self._entry_blocked_bar = self.range_machine.bar_ts
         self._log(
             getattr(event, "observed_at", None),
             "external_close",
@@ -517,8 +521,11 @@ class ImpulseRangeLive(Strategy):
         self.paper_totals = dict(snapshot["paper_totals"])
         self.events = deque(snapshot["events"], maxlen=self.MAX_EVENTS)
         self._adopt_policy(machine)
-        if snapshot.get("version") == 1:
-            self._log(None, "state_migrated", {"from": 1, "to": self.VERSION, "width_rule": 2})
+        saved_rule = snapshot["machine"].get("version")
+        if saved_rule != ImpulseRangeMachine.VERSION:
+            self._log(
+                None, "state_migrated", {"from": saved_rule, "to": ImpulseRangeMachine.VERSION}
+            )
         if snapshot["mode"] != self.mode:
             self._log(None, "mode_changed", {"from": snapshot["mode"], "to": self.mode})
         return True
@@ -539,13 +546,10 @@ class ImpulseRangeLive(Strategy):
                 chop_threshold=wanted.chop_threshold,
             )
             if channel is not None and channel.er_checked:
-                channel.tradeable = (
-                    not wanted.chop_filter
-                    or (
-                        channel.er_at_confirm is not None
-                        and channel.er_at_confirm >= wanted.chop_threshold
-                    )
-                ) and channel.hi / channel.lo - 1 <= wanted.max_width + 1e-12
+                channel.tradeable = not wanted.chop_filter or (
+                    channel.er_at_confirm is not None
+                    and channel.er_at_confirm >= wanted.chop_threshold
+                )
             # __init__ adopts policy before its event buffer exists.
             if hasattr(self, "events"):
                 self._log(

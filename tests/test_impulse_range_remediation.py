@@ -170,13 +170,15 @@ async def test_missing_minute_in_nonstrict_cold_history_blocks_range():
     assert not s.model_complete, "Missing minute produced a seemingly complete 4h candle"
 
 
-def test_initial_confirmation_enforces_width_cap():
+def test_initial_confirmation_keeps_tested_width_rule():
+    """Rule 3 (as tested): a crash may confirm a channel wider than the cap."""
     m = active().range_machine
     m.state, m.channel = "seek", None
     m.setup = Setup(side=1, impulse_ts=T0 - H4, extreme=100, pulled=True, swing=50)
     m.close_bar(Candle(T0, 65, 75, 50, 70))
     m.open_bar(T0 + H4, 70)
-    assert m.levels() is None, "100% wide initial channel admitted despite 40% cap"
+    assert (m.channel.lo, m.channel.hi) == (50, 100)
+    assert m.levels() is not None and m.levels().allowed == frozenset({1, -1})
 
 
 def test_range_filter_is_passed_through_http_handler(monkeypatch):
@@ -296,8 +298,8 @@ async def test_strict_feed_gap_does_not_stop_all_funded_management():
 
 
 @pytest.mark.parametrize("side", [1, -1])
-@pytest.mark.parametrize("width,allowed", [(0.399, True), (0.4, True), (0.401, False)])
-def test_width_confirmation_boundary_for_both_impulses(side, width, allowed):
+@pytest.mark.parametrize("width", [0.399, 0.4, 0.401, 0.65])
+def test_width_confirmation_for_both_impulses(side, width):
     m = active().range_machine
     m.state, m.channel = "seek", None
     lo, hi = 100, 100 * (1 + width)
@@ -310,23 +312,55 @@ def test_width_confirmation_boundary_for_both_impulses(side, width, allowed):
     )
     m.close_bar(Candle(T0, 120, hi, lo, (lo + hi) / 2))
     m.open_bar(T0 + H4, (lo + hi) / 2)
-    assert (m.levels() is not None) is allowed
+    assert m.levels() is not None
 
 
-def test_legacy_oversized_snapshot_preserves_holding_exit_levels():
+def test_expansion_beyond_width_cap_still_ends_range():
+    m = active().range_machine
+    m.channel.expanding, m.channel.new_extreme = 1, 110
+    m.close_bar(Candle(T0, 110, 127, 109, 126))
+    assert m.state == "idle" and m.channel is None
+    assert m.ended_ranges == 1
+
+
+@pytest.mark.parametrize("rule", [1, 2])
+@pytest.mark.parametrize("holding", [False, True])
+def test_earlier_rule_snapshots_restore_unchanged(rule, holding):
     s = active()
-    s.range_machine.record_entry(1, 92, T0, 1)
+    if holding:
+        s.range_machine.record_entry(1, 92, T0, 1)
     snapshot = s.persistent_state()
-    snapshot["version"] = snapshot["machine"]["version"] = 1
-    snapshot["machine"]["channel"]["lo"] = 50
+    snapshot["version"] = min(rule, s.VERSION)
+    snapshot["machine"]["version"] = rule
+    snapshot["machine"]["channel"]["lo"] = 50  # wider than the cap, as tested
     restored = ImpulseRangeLive(s.params)
     assert restored.restore_persistent_state(snapshot)
-    assert restored.range_machine.position is not None
-    assert not restored.range_machine.levels().allowed
-    assert (
-        restored.range_machine.minute_signal(Candle(T0 + timedelta(minutes=1), 100, 100, 100, 100))
-        == "exit"
-    )
+    m = restored.range_machine
+    assert m.state == "active" and m.channel.lo == 50
+    assert m.levels().allowed == frozenset({1, -1})
+    assert (m.position is not None) is holding
+    assert restored.persistent_state()["machine"]["version"] == 3
+    assert restored.events[-1]["detail"] == {"from": rule, "to": 3}
+
+
+def test_liquidation_in_wide_range_blocks_reentry_for_the_bar():
+    """Isolated liquidation can precede the 4h-close stop; do not buy straight back."""
+    s = active()
+    m = s.range_machine
+    m.channel.lo, m.channel.first_lo = 50, 50
+    state = StrategyState()
+    state.positions[SLOT] = TfPosition(side=Side.LONG, qty_sats=100)
+    m.record_entry(1, 60, T0, 1)
+    state.positions[SLOT] = TfPosition()
+    s.on_external_position_closed(SimpleNamespace(reason="liquidation"), state)
+    assert m.position is None and m.state == "active"
+    # Price is below the buy level (57.5) but inside the stop band (45).
+    assert s.on_bar(minute(5, 48), state) == []
+    assert s.on_bar(minute(6, 49), state) == []
+    # Next 4h bar with a close inside the band: entries resume.
+    s.on_bar(Bar(T0 + H4, 48, 55, 47, 50, 0, "4h"), state)
+    intents = s.on_bar(minute(241, 50), state)
+    assert [i.kind for i in intents] == [SignalKind.ENTRY]
 
 
 @pytest.mark.asyncio

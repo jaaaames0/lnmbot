@@ -28,6 +28,7 @@ passed 397 default tests, plus the verified dry-run reconstruction regression.
   acceptance after backup, role-based seed repointing and dry-run reconstruction
   / seed refresh. `LIVE_ENTRIES_ENABLED=false` blocks all new entries while
   retaining owned managers and the current database.
+- Dashboard: show the configured range mode before the first range snapshot.
 - Cached 2020–2026 4h research replay rejects three initial oversized setups.
   Filtered trades change 132 → 134; summed per-trade return 160.64% → 139.99%.
   Unfiltered trades change 188 → 186; return 98.23% → 76.68%. These are local
@@ -38,8 +39,12 @@ source changes that have not been installed as a production release.
 
 ## Unreleased
 
-- Dashboard: show the configured range mode before the first range snapshot
-  (it briefly read "Shadow · no orders" during the funded cutover).
+- Range rule version 3 restores the tested width rule: the 40% cap ends a
+  channel that expands beyond it, but a channel may confirm wider (as in the
+  research, after crash impulses). Version 1 and 2 snapshots restore unchanged.
+  The research parity suite again matches trade for trade (filtered 132 trades,
+  160.64%; unfiltered 188, 98.23%). An isolated liquidation that precedes the
+  4h-close stop blocks range re-entry for the rest of that 4h bar.
 
 ## 2026-09-30 — Impulse-range strategy funded
 

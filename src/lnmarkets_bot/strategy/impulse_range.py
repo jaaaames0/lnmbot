@@ -5,7 +5,8 @@ close-range breakout strategy), the machine waits for a pullback, confirms a
 swing channel between the impulse extreme and the pullback swing, and trades
 from the channel edges back to its midpoint. A 4h close beyond an edge stops
 the position out and the channel is redrawn to the new extreme once price
-retraces; the range is abandoned as a trend once its width exceeds a cap.
+retraces; the range is abandoned as a trend once an expansion exceeds a width
+cap.
 
 Rules are frozen from the 2026-09-29 research (v2 central) and verified
 trade-for-trade against it. Optionally, a range whose lead-in was choppy
@@ -264,7 +265,7 @@ class Event:
 class ImpulseRangeMachine:
     """Causal range state; the caller owns execution and reports fills."""
 
-    VERSION: ClassVar[int] = 2
+    VERSION: ClassVar[int] = 3
 
     def __init__(self, params: ImpulseRangeParams | None = None) -> None:
         self.p = params or ImpulseRangeParams()
@@ -408,15 +409,10 @@ class ImpulseRangeMachine:
                 return [Event(bar.ts, "setup_cancel", {})]
             s.swing = min(s.swing, bar.low) if s.side == 1 else max(s.swing, bar.high)
             if s.side * (bar.close - s.swing) >= abs(s.extreme - s.swing) / 3:
+                # The width cap applies only while a channel expands (rule 3,
+                # as tested): a crash can confirm a wider first channel. Its
+                # isolated margin, not the cap, bounds a loss beyond the stop.
                 lo, hi = sorted((s.extreme, s.swing))
-                if lo <= 0 or hi / lo - 1 > p.max_width + 1e-12:
-                    self.state, self.setup = "idle", None
-                    return [
-                        *ev,
-                        Event(
-                            bar.ts, "setup_cancel", {"reason": "initial_width", "lo": lo, "hi": hi}
-                        ),
-                    ]
                 self.channel = Channel(
                     id=self.ended_ranges,
                     side=s.side,
@@ -569,7 +565,9 @@ class ImpulseRangeMachine:
     def restore(
         cls, data: dict[str, Any], params: ImpulseRangeParams | None = None
     ) -> ImpulseRangeMachine:
-        if data.get("version") not in (1, cls.VERSION):
+        # Version 2 cancelled setups wider than the cap at confirmation;
+        # its surviving states are valid under the tested rule 3 unchanged.
+        if data.get("version") not in (1, 2, cls.VERSION):
             raise ValueError("unsupported impulse-range state version")
         saved = ImpulseRangeParams(**data["params"])
         if params is not None and params != saved:
@@ -595,11 +593,6 @@ class ImpulseRangeMachine:
             or (m.state == "active") != (m.channel is not None)
         ):
             raise ValueError("inconsistent impulse-range state")
-        if m.channel is not None and m.channel.hi / m.channel.lo - 1 > saved.max_width + 1e-12:
-            # Existing owned exits retain their levels; no oversized new entry.
-            m.channel.tradeable = False
-            if m.position is None:
-                m._end_range(m.bar_ts or m.channel.confirmed_ts, "restored_width")
         return m
 
 

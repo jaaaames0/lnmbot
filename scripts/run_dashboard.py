@@ -3509,7 +3509,7 @@ def _strategy_explainer(run: dict[str, object]) -> str:
             "pullback, a 4h close retracing a third of the move confirms a channel between the "
             "impulse extreme and the swing. A 1m close within 15% of an edge enters toward the "
             "channel; the midpoint is the target. A 4h close beyond an edge by 10% of the width "
-            "exits and the channel is redrawn; beyond 40% width the range is abandoned, and size "
+            "exits and the channel is redrawn; expanding beyond 40% width abandons the range, and size "
             f"tapers to zero over 120 days.{chop} "
             + (
                 "Shadow mode: paper fills only, no orders, excluded from account totals."
