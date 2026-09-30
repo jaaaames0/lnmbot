@@ -174,7 +174,9 @@ warmup, and the warmup rebuilds recent range state. A range that began before
 that window is not recognised; the strategy stays idle until the next impulse.
 If the seed does not reach the warmup start, the strategy is not started and
 `live.range_cold_start_unavailable` is logged; supply a newer daily seed.
-Later restarts restore the saved state instead.
+Later restarts restore the saved state instead. A cold range strategy does not
+make the feed's whole warmup strict: gaps before its first saved state only
+affect the rebuilt range, and a later missing daily or 4h bar blocks its entries.
 
 Entries are never taken on replayed bars; an exit that fell due while the
 trader was stopped is sent on the first live bar. A missing daily or 4h bar

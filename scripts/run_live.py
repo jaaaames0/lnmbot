@@ -81,15 +81,15 @@ def _strict_data_from(
         return utc.replace(hour=0, minute=0, second=0, microsecond=0)
 
     if include_range:
+        # A cold range strategy does not need a gap-free warmup: it rebuilds
+        # from whatever the feed supplies and blocks its own entries when a
+        # daily or 4h bar is missing. Only its committed state bounds checking.
         snapshot = recorder.latest_strategy_state(mode="live", strategy_name=RANGE_INSTANCE_ID)
-        if snapshot is None:
-            return None
-        machine = snapshot["state"].get("machine", {})
+        machine = snapshot["state"].get("machine", {}) if snapshot else {}
         bar_ts = machine.get("bar_ts")
         last_day = machine.get("detector", {}).get("last_ts")
-        if not bar_ts or not last_day:
-            return None
-        starts.extend([day_start(bar_ts), day_start(last_day) + timedelta(days=1)])
+        if bar_ts and last_day:
+            starts.extend([day_start(bar_ts), day_start(last_day) + timedelta(days=1)])
 
     for name in names:
         snapshot = recorder.latest_strategy_state(

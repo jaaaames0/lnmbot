@@ -86,8 +86,11 @@ def test_strict_data_check_includes_range_snapshot():
     assert run_live._strict_data_from(rec, include_breakout=False, include_range=True) == datetime(
         2026, 9, 23, tzinfo=UTC
     )
+    # A cold range strategy does not force strict checking of the whole warmup.
     del snapshots[run_live.RANGE_INSTANCE_ID]
-    assert run_live._strict_data_from(rec, include_breakout=False, include_range=True) is None
+    assert run_live._strict_data_from(rec, include_breakout=False, include_range=True) == datetime(
+        2026, 9, 24, tzinfo=UTC
+    )
 
 
 @pytest.mark.asyncio
