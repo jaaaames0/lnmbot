@@ -262,3 +262,28 @@ async def test_verified_reconstruction_preserves_daily_seed_seam(tmp_path):
     assert report["state"]["machine"]["detector"]["last_ts"] == start.isoformat()
     assert report["state"]["machine"]["position"] is None
     assert set(report["inputs"]) == {str(daily), str(minutes)}
+
+
+@pytest.mark.parametrize(
+    ("minutes", "last_hours", "ready"),
+    [(3, 8, True), (14, 8, True), (15, 8, False), (3, 16, False)],
+    ids=["routine-delay", "within-grace", "past-grace", "older-settlement-missing"],
+)
+def test_readiness_tolerates_unpublished_latest_settlement(ready_db, minutes, last_hours, ready):
+    path, _, _ = ready_db
+    boundary = datetime(2026, 10, 1, 16, tzinfo=UTC)
+    now = boundary + timedelta(minutes=minutes)
+    machine = {
+        "historical_model_complete": True,
+        "historical_funding_available": False,
+        "last_historical_funding_ts": (boundary - timedelta(hours=last_hours)).isoformat(),
+    }
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE bars SET ts=?", (now.isoformat(),))
+        db.execute(
+            "UPDATE strategy_state_snapshots SET state_json=? WHERE strategy_name=?",
+            (json.dumps({"machine": machine}), BREAKOUT),
+        )
+    report = inspect_readiness(path, venue_ids=set(), venue_ts=now, now=now)
+    assert report["ready"] is ready
+    assert bool(report["pending"]) is ready

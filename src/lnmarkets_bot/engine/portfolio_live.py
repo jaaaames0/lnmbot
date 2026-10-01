@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from ..config import BotConfig
     from ..data.source import DataSource
     from ..persistence.recorder import Recorder
-    from ..strategy import Strategy
+    from ..strategy import OrderIntent, Strategy
 
 
 _HISTORICAL_FUNDING_RETRY_SECONDS = 30.0
@@ -35,6 +35,11 @@ _HISTORICAL_FUNDING_BACKGROUND_TIMEOUT_SECONDS = 10.0
 _HISTORICAL_FUNDING_DAILY_GRACE_SECONDS = 3.0
 _HISTORICAL_FUNDING_DAILY_RETRY_SECONDS = 1.0
 _MAX_HISTORICAL_CATCHUP_BARS = 4500  # About three days of minute and aggregate bars.
+# LN Markets publishes each 8h settlement a few minutes after its boundary.
+# A shorter wait is routine; a held daily decision recovered within the late
+# window still acts, at the then-current price.
+_HISTORICAL_FUNDING_GRACE = timedelta(minutes=15)
+_HISTORICAL_DECISION_LATE_WINDOW = timedelta(minutes=10)
 _HISTORICAL_FUNDING_FAILURE_REASONS = frozenset(
     {
         "historical funding provider unavailable",
@@ -124,11 +129,15 @@ def _replay_historical_bars(
     state: StrategyState,
     bars: list[Bar],
     rows: list[tuple[datetime, float, float]],
-) -> None:
+    *,
+    live_since: datetime | None = None,
+) -> list[OrderIntent]:
+    """Replay buffered bars; only a live daily decision at or after `live_since` acts."""
     machine = strategy.machine
     last_minute = machine.last_historical_price_ts
     row_index = 0
     machine.historical_funding_available = True
+    late: list[OrderIntent] = []
     for bar in bars:
         boundary = _funding_boundary(bar.ts)
         while row_index < len(rows) and rows[row_index][0] <= boundary:
@@ -138,9 +147,18 @@ def _replay_historical_bars(
             if last_minute is not None and bar.ts > last_minute + timedelta(minutes=1):
                 raise RuntimeError("historical price gap during funding catch-up")
             last_minute = bar.ts
+        if (
+            live_since is not None
+            and bar.timeframe == "1d"
+            and not bar.warmup
+            and bar.ts >= live_since
+        ):
+            late += intents_to_list(strategy.on_bar(bar, state))
+            continue
         # A missed decision is evidence for model state, never a late order.
         if intents_to_list(strategy.on_bar(replace(bar, warmup=True), state)):
             raise RuntimeError("historical catch-up emitted an order intent")
+    return late
 
 
 @dataclass
@@ -467,6 +485,7 @@ async def run_portfolio_live(
                         getattr(machine, "historical_funding_available", True),
                     )
                     health = data_health[binding.instance_id]
+                    replayed_intents: list[OrderIntent] = []
                     committed = _committed_bar(strategy, bar.timeframe)
                     already_committed = committed is not None and bar.ts <= committed
                     if bar.timeframe in binding.subscribed_timeframes and not already_committed:
@@ -531,7 +550,11 @@ async def run_portfolio_live(
                                     else:
                                         wait = _HistoricalFundingWait([])
                                         historical_waits[binding.instance_id] = wait
-                                    log.warning(
+                                    routine = (
+                                        wait is not None
+                                        and bar.ts - boundary < _HISTORICAL_FUNDING_GRACE
+                                    )
+                                    (log.info if routine else log.warning)(
                                         "live.historical_funding_unavailable",
                                         error_type=type(exc).__name__,
                                         reason=(
@@ -572,7 +595,12 @@ async def run_portfolio_live(
                                             wait.retry_at = (
                                                 loop.time() + _HISTORICAL_FUNDING_RETRY_SECONDS
                                             )
-                                            log.warning(
+                                            requested = wait.requested_boundary or boundary
+                                            (
+                                                log.info
+                                                if bar.ts - requested < _HISTORICAL_FUNDING_GRACE
+                                                else log.warning
+                                            )(
                                                 "live.historical_funding_retry_failed",
                                                 error_type=type(exc).__name__,
                                                 reason=(
@@ -592,8 +620,13 @@ async def run_portfolio_live(
                                             ):
                                                 checkpoint = strategy.persistent_state()
                                                 try:
-                                                    _replay_historical_bars(
-                                                        strategy, state, wait.bars, rows
+                                                    replayed_intents = _replay_historical_bars(
+                                                        strategy,
+                                                        state,
+                                                        wait.bars,
+                                                        rows,
+                                                        live_since=bar.ts
+                                                        - _HISTORICAL_DECISION_LATE_WINDOW,
                                                     )
                                                 except Exception as exc:
                                                     if (
@@ -646,7 +679,7 @@ async def run_portfolio_live(
                                 )
                         else:
                             historical_waits.pop(binding.instance_id, None)
-                    intents = (
+                    intents = replayed_intents + (
                         [] if skip_strategy_bar else intents_to_list(strategy.on_bar(bar, state))
                     )
                     if bar.warmup:

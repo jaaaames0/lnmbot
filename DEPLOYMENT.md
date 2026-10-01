@@ -136,8 +136,12 @@ At each eight-hour boundary, the trader verifies historical funding before
 advancing the seeded campaign. At the daily decision it waits up to three
 seconds for a newly published settlement. If funding remains late, the breakout
 model pauses and retries while the trader buffers its price bars. Once funding is
-complete, it replays those bars in order and resumes at the next live decision;
-missed entry signals are never placed late. The paused state survives a trader
+complete, it replays those bars in order. LN Markets normally publishes a
+settlement two to three minutes after its boundary, so a daily decision held for
+up to ten minutes still acts, at the then-current price; a later recovery
+resumes at the next live decision and never places missed entries late. Waits
+under 15 minutes are logged as info and `/readyz` reports them under `pending`
+rather than as errors; longer waits are warnings and readiness failures. The paused state survives a trader
 restart through its saved checkpoint and the live feed's candle backfill. If
 price evidence is missing or the buffer exceeds roughly three days, it needs
 verified reconstruction before new breakout entries. MA trading and owned

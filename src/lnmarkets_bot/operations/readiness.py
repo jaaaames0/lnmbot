@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 MA = "ma_cross_primary"
 BREAKOUT = "btc_close_range_v1"
 RANGE = "btc_impulse_range_v1"
+# Same grace as the engine: settlements publish minutes after each 8h boundary.
+FUNDING_GRACE = timedelta(minutes=15)
 
 
 def _stamp(value):
@@ -20,12 +22,30 @@ def _stamp(value):
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
+def _settlement_pending(machine: dict, now: datetime) -> bool:
+    """Only the newest 8h settlement is missing, and it is still within grace."""
+    last = machine.get("last_historical_funding_ts")
+    boundary = now.replace(hour=now.hour // 8 * 8, minute=0, second=0, microsecond=0)
+    return (
+        last is not None
+        and _stamp(last) >= boundary - timedelta(hours=8)
+        and now - boundary < FUNDING_GRACE
+    )
+
+
 def inspect_readiness(
     path: Path, *, venue_ids=None, venue_ts=None, pending_ids=(), now=None
 ) -> dict:
     now = now or datetime.now(UTC)
     errors = []
-    report = {"ready": False, "errors": errors, "run_id": None, "owners": [], "open_trade_ids": []}
+    report = {
+        "ready": False,
+        "errors": errors,
+        "pending": [],
+        "run_id": None,
+        "owners": [],
+        "open_trade_ids": [],
+    }
     try:
         with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
             db.row_factory = sqlite3.Row
@@ -99,7 +119,10 @@ def inspect_readiness(
                 if owner == BREAKOUT and not machine.get("historical_model_complete", False):
                     errors.append("breakout reconstruction incomplete")
                 if owner == BREAKOUT and not machine.get("historical_funding_available", True):
-                    errors.append("breakout funding evidence incomplete")
+                    if _settlement_pending(machine, now.astimezone(UTC)):
+                        report["pending"].append("breakout funding settlement not yet published")
+                    else:
+                        errors.append("breakout funding evidence incomplete")
             if (
                 venue_ids is None
                 or venue_ts is None

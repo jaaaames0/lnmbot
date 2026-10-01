@@ -527,3 +527,91 @@ def test_parent_threshold_precedes_children_and_forces_survivors_at_that_price(s
     assert [e.reason for e in events[:-1]] == ["parent_forced_exit"] * 3
     assert all(e.price == pytest.approx(threshold) for e in events)
     assert events[-1].metadata["surviving_units"] == [1, 2, 3]
+
+
+def _reversal_at(stamp):
+    """Historical campaign exits and a new structure parent opens on the same daily open."""
+    from lnmarkets_bot.strategy.close_range_live import CloseRangeLive
+
+    machine = seeded()
+    machine.last_bar_ts = stamp - timedelta(days=2)
+    machine.last_historical_funding_ts = stamp - timedelta(hours=8)
+    machine.last_historical_price_ts = stamp - timedelta(minutes=2)
+    machine.pending_exit = "range_close"
+    machine._candidate = lambda candle: BreakoutCandidate(
+        signal_ts=candle.ts,
+        side=1,
+        boundary=90,
+        signal_close=100,
+        ema20=100,
+        atr14=2,
+        average_overlap10=0.4,
+        distance_ema_atr=3,
+        structure_pass=True,
+    )
+    return CloseRangeLive(
+        {"activation_ts": (stamp - timedelta(days=5)).isoformat()}, machine=machine
+    )
+
+
+async def _run_daily_publication_delay(cfg, recorder, monkeypatch, *, failed_calls, minutes):
+    import lnmarkets_bot.engine.portfolio_live as portfolio_live
+    from lnmarkets_bot.engine.portfolio_live import StrategyBinding, run_portfolio_live
+    from lnmarkets_bot.risk.guard import SizingPolicy
+    from lnmarkets_bot.strategy import Bar
+    from tests.test_portfolio_live import _Executor
+
+    monkeypatch.setattr(portfolio_live, "_HISTORICAL_FUNDING_RETRY_SECONDS", 0)
+    monkeypatch.setattr(portfolio_live, "_HISTORICAL_FUNDING_DAILY_GRACE_SECONDS", 0.01)
+    stamp = datetime(2026, 1, 11, tzinfo=UTC)
+    strategy = _reversal_at(stamp)
+    calls = []
+
+    async def publishing(start, end):
+        calls.append(end)
+        return [] if len(calls) <= failed_calls else [(stamp, 0.001, 100)]
+
+    bars = [
+        Bar(stamp - timedelta(minutes=1), 100, 101, 99, 100, 1),
+        Bar(stamp, 100, 101, 99, 100, 1, timeframe="1d"),
+        *(Bar(stamp + timedelta(minutes=i), 100, 101, 99, 100, 1) for i in range(minutes)),
+    ]
+    executor = _Executor()
+    await run_portfolio_live(
+        cfg=cfg,
+        data_source=_YieldingBars(bars),
+        bindings=(StrategyBinding("breakout", strategy),),
+        executor=executor,
+        recorder=recorder,
+        sizing_policy=SizingPolicy(fixed_notional_strategy_ids=frozenset({"breakout"})),
+        account_balance_provider=None,
+        install_signal_handlers=False,
+        historical_funding_provider=publishing,
+    )
+    return strategy, executor
+
+
+@pytest.mark.asyncio
+async def test_daily_decision_acts_when_settlement_publishes_minutes_late(
+    cfg, recorder, monkeypatch
+):
+    """The routine 2-3 minute publication delay no longer drops a daily entry."""
+    strategy, executor = await _run_daily_publication_delay(
+        cfg, recorder, monkeypatch, failed_calls=2, minutes=6
+    )
+    assert strategy.machine.historical_funding_available
+    assert executor.keys == ["breakout:k0"]
+    assert strategy.machine.campaign is not None
+    assert strategy.machine.campaign.origin == "live"
+
+
+@pytest.mark.asyncio
+async def test_daily_decision_expires_when_settlement_is_later_than_window(
+    cfg, recorder, monkeypatch
+):
+    strategy, executor = await _run_daily_publication_delay(
+        cfg, recorder, monkeypatch, failed_calls=14, minutes=20
+    )
+    assert strategy.machine.historical_funding_available
+    assert executor.keys == []
+    assert strategy.machine.campaign is None

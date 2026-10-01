@@ -56,6 +56,13 @@ source changes that have not been installed as a production release.
 
 ## Unreleased
 
+- Breakout historical funding: LN Markets publishes each 8h settlement two to
+  three minutes late. Waits under 15 minutes now log as info, and `/readyz`
+  lists them under `pending` instead of failing (previously three false
+  readiness failures a day). A daily decision held by that wait now acts if
+  funding arrives within ten minutes of the daily close, instead of being
+  dropped as a missed entry; longer outages keep the never-late rule.
+
 ## 2026-09-30 — Impulse-range strategy funded
 
 Release `prod-20260930.1-g61c98f3592fd` for trader and dashboard, from commit
