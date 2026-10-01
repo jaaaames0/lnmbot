@@ -414,3 +414,26 @@ def test_overview_includes_range_model_activity_at_knowledge_time(db_path):
     redraw = next(row for row in rows if row["event"] == "Channel redrawn")
     assert charts.stamp(redraw["action_ts"]) == charts.stamp("2026-09-22T08:00:00Z")
     assert redraw["qualifiers"] == "Model observation · not a fill"
+
+
+def test_chart_builds_are_serialized_to_bound_memory(db_path, monkeypatch):
+    active, peak, real = [0], [0], charts._chart_data
+
+    def counted(*args, **kwargs):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        try:
+            return real(*args, **kwargs)
+        finally:
+            active[0] -= 1
+
+    monkeypatch.setattr(charts, "_chart_data", counted)
+    workers = [
+        threading.Thread(target=charts.chart_data, args=(db_path,), kwargs={"days": days})
+        for days in (1, 7, 30, 90)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+    assert peak[0] == 1

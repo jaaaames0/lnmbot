@@ -34,6 +34,7 @@ MA_WARMUP = 80  # candles before the window for SMA20/EMA21 display convergence
 CACHE_SECONDS = 120
 _CACHE: OrderedDict = OrderedDict()
 _LOCK = threading.Lock()
+_BUILD = threading.Lock()
 
 
 def stamp(value: object) -> int | None:
@@ -1000,7 +1001,17 @@ def _execution_markers(view, db, owner, start, end, ma_tf):
 
 
 def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=None) -> dict:
-    """Build a bounded versioned view. Opening a missing DB fails without creation."""
+    """Build a bounded versioned view. Opening a missing DB fails without creation.
+
+    Builds run one at a time: concurrent long-window aggregations would each
+    hold SQLite sort memory inside the dashboard's 160 MiB cap, while a queued
+    request costs ~150 ms or is answered by the cache the previous build filled.
+    """
+    with _BUILD:
+        return _chart_data(path, strategy=strategy, tf=tf, days=days, ma_tf=ma_tf, end=end)
+
+
+def _chart_data(path, *, strategy, tf, days, ma_tf, end):
     opts = options(
         {
             "strategy": [strategy],
@@ -1014,8 +1025,7 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
     days = opts["days"]
     with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3) as db:
         db.execute("PRAGMA query_only=ON")
-        # Concurrent long-window aggregations each hold a page cache; a small one
-        # keeps the dashboard inside its 160 MiB cap at no measured speed cost.
+        # A small page cache bounds aggregation memory at no measured speed cost.
         db.execute("PRAGMA cache_size=-512")
         # One transaction: market rows and overlays describe the same SQLite view.
         db.execute("BEGIN")
