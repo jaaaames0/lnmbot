@@ -364,8 +364,8 @@ restarts both services and is unsuitable for this purpose. Verify service paths,
 dashboard readiness and the unchanged trader PID/release before and after the
 change. Avoid the 00/04/08/12/16/20 UTC boundaries, including funding at 00/08/16.
 
-The 1 October dashboard-only release is `prod-20261001.2-g7709dd300b89`; the trader
-remains on `prod-20261001.1-g0b1650b10779`. The readiness oneshot's Python
+The current dashboard-only release is `prod-20261001.3-gf01842182add` (1 October,
+04:43 UTC); the trader remains on `prod-20261001.1-g0b1650b10779`. The readiness oneshot's Python
 and script paths follow the dashboard release and must switch with it. Preserve
 the installed unit's identity, sandbox, credential path and **160 MiB** cap;
 the repository template's memory value is not the current host baseline.
@@ -378,7 +378,9 @@ For the next dashboard-only release:
    runtime files root-owned and non-writable.
 2. Checkpoint the two dashboard/probe units and a consistent read-only SQLite
    backup. Stage an offline candidate on a private copy under the installed
-   sandbox/memory cap; check concurrent long-window chart requests.
+   sandbox/memory cap; check concurrent long-window chart requests. Read the
+   candidate cgroup's `memory.peak` and `memory.events` (not process RSS) and
+   compare with the running release under the identical load.
 3. Prepare unit candidates by changing only dashboard release paths. Arm an
    independent timed rollback that restores those units and restarts only the
    dashboard; never restore the database or touch the trader/configuration.
@@ -388,8 +390,9 @@ For the next dashboard-only release:
    unchanged trader PID/release/config and execution journal, encrypted backup
    and monitoring. Record acceptance, disarm rollback and retain the old release.
 
-The dated transaction and detailed evidence are in the local ignored
-`docs/operations/2026-10-01-dashboard-release.md` archive.
+The dated transactions and detailed evidence are in the local ignored
+`docs/operations/2026-10-01-dashboard-release.md` and
+`docs/operations/2026-10-01-dashboard-fidelity-release.md` archives.
 
 An optional, separately installed `lnmbot-breakout-shadow.service` and timer
 can advance an order-incapable daily breakout book from completed public

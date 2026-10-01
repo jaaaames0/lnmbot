@@ -1,9 +1,22 @@
 # Changelog
 
-## Unreleased — Dashboard chart fidelity, overview top bar and render cost
+## 2026-10-01 — Dashboard chart fidelity, overview top bar and render cost
 
-Source only; not deployed. Trading behavior, risk and the database schema are
-unchanged.
+Dashboard-only release `prod-20261001.3-gf01842182add`, source `f01842182add`,
+accepted at 04:43 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-fidelity-20261001T044200Z`. The trader
+remains on `prod-20261001.1-g0b1650b10779`, PID 1411724, run 71; its unit,
+configuration, 40 orders and 40 fills were unchanged. Readiness, desktop/mobile
+LAN browser checks, the encrypted backup and infrastructure monitor passed
+(**127 passes, zero warnings/failures**). Timed rollback was disarmed; the
+preceding dashboard release remains available. Trading behavior, risk and the
+database schema are unchanged.
+
+Validation: **426 tests passed**, scoped Ruff clean, 3 import contracts kept.
+Under the installed sandbox, three rounds of four concurrent cold 90-day chart
+requests peaked at **121 MiB** of the 160 MiB cap; the previous release peaked
+at 142 MiB in the same test and had reached the cap in service. Two earlier
+candidates without serialized builds reached the cap and were not switched.
 
 - Charts: anchor markers to the candle that caused them instead of the next
   candle boundary; draw price-less events above their candle rather than at the
@@ -20,8 +33,9 @@ unchanged.
   candles with an 80-candle warm-up, so partial candles no longer leave holes.
   On the live copy the final values match the saved indicators within 0.01%.
 - Performance: aggregate chart candles in SQLite (90-day cold build about
-  350 ms to 150 ms); content-addressed chart cache kept 120 s; browser polling
-  15 s with requestAnimationFrame drawing. Bound the per-render market-context
+  350 ms to 150 ms) with a 512 KiB page cache, one build at a time so
+  concurrent requests stay inside the memory cap; content-addressed chart cache
+  kept 120 s; browser polling 15 s with requestAnimationFrame drawing. Bound the per-render market-context
   query to recent bar ids (page renders roughly 3–4× faster).
 - Overview: funded net P&L and its window toggle move to the top bar on every
   page and keep the current page; the runner/feed/entry strip is removed (shown
