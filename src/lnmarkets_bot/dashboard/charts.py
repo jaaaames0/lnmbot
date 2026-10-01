@@ -105,15 +105,10 @@ def _candles(db, start, end, tf):
         "SELECT id,ts,open,high,low,close,volume FROM bars WHERE ts>=? AND ts<? ORDER BY ts,id",
         (sql_start, sql_end),
     )
-    minutes = {}
-    for row in rows:
-        t = stamp(row[1])
-        values = [number(x) for x in row[2:6]]
-        if t is not None and all(x is not None and x > 0 for x in values):
-            minutes[t] = (values, number(row[6]) or 0)
     period = PERIODS[tf]
     grouped = {}
-    for t, (prices, volume) in minutes.items():
+
+    def aggregate(t, prices, volume):
         key = t - t % period
         o, h, low, c = prices
         if key not in grouped:
@@ -137,12 +132,30 @@ def _candles(db, start, end, tf):
                 volume=bar["volume"] + volume,
                 minutes=bar["minutes"] + 1,
             )
+
+    # Rows are ordered by timestamp/id: keep only the last valid restart row
+    # for one minute, then fold it into its candle. Long windows need not retain
+    # a Python object for every source minute, including concurrent requests.
+    pending = None
+    recorded = 0
+    for row in rows:
+        t = stamp(row[1])
+        values = [number(x) for x in row[2:6]]
+        if t is None or not all(x is not None and x > 0 for x in values):
+            continue
+        if pending is not None and t != pending[0]:
+            aggregate(*pending)
+            recorded += 1
+        pending = (t, values, number(row[6]) or 0)
+    if pending is not None:
+        aggregate(*pending)
+        recorded += 1
     for bar in grouped.values():
         bar["missing_minutes"] = period // 60 - bar["minutes"]
         bar["complete"] = bar["missing_minutes"] == 0 and bar["close_time"] <= end
     result = list(grouped.values())[-MAX_CANDLES:]
     expected = max(0, (end - start) // 60)
-    return result, max(0, expected - len(minutes))
+    return result, max(0, expected - recorded)
 
 
 def _segment(
