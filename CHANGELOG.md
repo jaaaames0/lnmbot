@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — Chart page panels
+
+Source only; not deployed.
+
+- Fixed-size Levels panel beside the chart: one row per level, highest price
+  first, with line swatches; hovering no longer reflows the page.
+- Saved state becomes a short strategy-specific strip above the chart (phase,
+  admission and the few fields that matter per strategy).
+- Controls reduced to Strategy plus an MA 1d/4h timeframe; breakout and range
+  always use 4h candles; the window is fixed at 90 days (zoom to narrow). The
+  1m inspection, explanatory subtitle and coverage notes are removed. The JSON
+  interface keeps its bounded parameters; its defaults are now 90 days and 4h
+  for breakout.
+- Events become a fixed-height table that follows the enabled layers.
+
 ## 2026-10-01 — Dashboard chart fidelity, overview top bar and render cost
 
 Dashboard-only release `prod-20261001.3-gf01842182add`, source `f01842182add`,

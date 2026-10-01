@@ -54,8 +54,10 @@ Overview gives each enabled strategy a compact summary and lists funded position
 from historical campaigns and shadow trades. `/strategies/ma`,
 `/strategies/breakout`, and `/strategies/range` hold the detailed state.
 
-`/charts` overlays strategy levels on recorded LN Markets candles, with 1d/4h
-views and a bounded one-day 1m inspection. It uses native Canvas, local assets
+`/charts` overlays strategy levels on recorded LN Markets candles over a 90-day
+window: MA on its 1d or 4h decision candles, breakout and range on 4h. A
+fixed-size levels panel beside the chart and an events table below it follow
+the hovered candle; a compact strip summarizes the saved state. It uses native Canvas, local assets
 and no JavaScript build step or chart price API. All three strategies contribute
 to the same read-only chart interface. Markers sit on the candle that caused
 them: ▲/▼ long/short entries, ● exits, hollow symbols for shadow or historical

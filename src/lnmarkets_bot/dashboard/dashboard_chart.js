@@ -16,23 +16,22 @@
   const date = t => t == null ? '—' : new Date(t*1000).toISOString().replace('T',' ').slice(0,16)+' UTC';
   const text = (tag, value, cls) => {const el=document.createElement(tag);el.textContent=value;if(cls)el.className=cls;return el;};
   const params = new URLSearchParams(location.search);
-  form.strategy.value = params.get('strategy') || 'ma';
-  form.tf.value = params.get('tf') || (form.strategy.value==='range'?'4h':'1d');
-  form.ma_tf.value = params.get('ma_tf') || (form.tf.value==='1m'?'4h':form.tf.value);
-  form.days.value = params.get('days') || (form.tf.value==='1m'?'1':'30');
-  let end = params.get('end');
+  // MA chooses its decision timeframe; breakout and range always use 4h candles.
+  form.strategy.value = ['ma','breakout','range'].includes(params.get('strategy')) ? params.get('strategy') : 'ma';
+  form.tf.value = params.get('tf') === '4h' ? '4h' : '1d';
   for (const [key, name] of [...roleLayers.map(r => [r, r]), ...Object.entries(markerLayers)]) {
     const label=text('label',''), input=document.createElement('input');input.type='checkbox';input.checked=enabled.has(key);label.dataset.layer=key;
-    input.onchange=()=>{input.checked?enabled.add(key):enabled.delete(key);schedule();levels(true);};
+    input.onchange=()=>{input.checked?enabled.add(key):enabled.delete(key);schedule();levels(true);if(data)events();};
     label.append(input,document.createTextNode(name));$('chart-layers').append(label);
   }
   function query() {
-    const q=new URLSearchParams(new FormData(form));if(end)q.set('end',end);return q;
+    const strategy=form.strategy.value, tf=strategy==='ma'?form.tf.value:'4h';
+    return new URLSearchParams({strategy,tf,ma_tf:tf,days:'90'});
   }
   function saveURL() {
     const u=new URL(location.href);
     for(const k of ['strategy','tf','days','ma_tf','end'])u.searchParams.delete(k);
-    for(const [k,v] of query())u.searchParams.set(k,v);
+    u.searchParams.set('strategy',form.strategy.value);if(form.strategy.value==='ma')u.searchParams.set('tf',form.tf.value);
     history.replaceState(null,'',u);
   }
   async function load(reset=false) {
@@ -48,7 +47,7 @@
       const present=new Set([...data.segments,...data.bands,...data.series].map(s=>s.role));
       for(const m of data.markers)present.add(m.layer);
       for(const label of $('chart-layers').children)label.style.display=present.has(label.dataset.layer)?'':'none';
-      form.ma_tf.parentElement.style.display=form.strategy.value==='ma'?'':'none';
+      $('chart-tf').style.display=form.strategy.value==='ma'?'':'none';
       status();events();schedule();levels(true);
     } catch(e) {if(e.name!=='AbortError')$('chart-error').textContent=e.message;}
     finally {if(abort===request)abort=null;}
@@ -72,36 +71,57 @@
     while(lo<=hi){const mid=(lo+hi)>>1,c=candles[mid];if(t<c.time)hi=mid-1;else if(t>=c.close_time)lo=mid+1;else return c;}
     return null;
   }
+  // A short, strategy-specific summary of the saved state; full detail lives on /strategies.
+  const stateFields=[
+    ['phase','Phase'],['admission','Admission'],['channel','Channel',v=>v.split(' to ').map(x=>'$'+fmt(Number(x))).join(' – ')],
+    ['confirmation_er','Confirm ER',v=>Number(v).toFixed(3)],['redraws','Redraws'],['expiry_utc','Expires',v=>String(v).slice(0,10)],
+    ['campaign','Campaign'],['held_days','Day'],['mode','Mode',v=>String(v).replaceAll('_',' ')],
+    ['Recovery condition starts','Recovery from',v=>String(v).slice(0,10)],['Maximum hold','Max hold',v=>String(v).slice(0,10)],
+    ['winner_remaining','Winner cooldown'],['loss_remaining','Loss cooldown'],['manual_hold','Manual hold'],['pending_exit','Exit pending'],
+  ];
   function status() {
     const dl=$('chart-status');dl.replaceChildren();
-    const rows={...data.status,'State as of':date(data.state_as_of),'Latest recorded minute':date(data.candles_as_of),'Owner':data.instance_id,'Run':data.run_id,'Rule version':data.rule_version};
-    for(const [k,v] of Object.entries(rows)){if(v==null||v==='')continue;dl.append(text('dt',k.replaceAll('_',' ')),text('dd',String(v)));}
-    const sparse=data.candles.filter(c=>c.close_time<=data.end&&c.missing_minutes>(c.close_time-c.time)/600).length;
-    $('chart-coverage').textContent=`${data.candles.length} candles · ${data.coverage.missing_minutes.toLocaleString()} missing recorded minutes`+(sparse?` · ${sparse} sparse candle${sparse>1?'s':''} outlined amber`:'')+'. Record gaps do not diagnose live model health.';
-    const ul=$('chart-warnings');ul.replaceChildren();for(const warning of data.coverage.warnings)ul.append(text('li',warning));
+    const st=data.status;
+    for(const [key,label,format] of stateFields){
+      const v=st[key];
+      if(v==null||v===''||v===false)continue;
+      if(key==='mode'&&data.strategy==='range')continue;
+      pair(label,v===true?'yes':format?format(v):String(v));
+    }
+    if(data.state_as_of)pair('Saved',date(data.state_as_of).slice(5,16));
+    function pair(label,value){const item=document.createElement('div');item.append(text('dt',label),text('dd',value));dl.append(item);}
   }
   function levels(force=false) {
     if(!data||!viewport)return;
-    const t=hover??Math.min(viewport[1],data.end)-1, c=candleAt(data.candles,t), key=c?c.time:t;
+    const t=Math.min(hover??viewport[1],data.end)-1, c=candleAt(data.candles,t), key=c?c.time:t;
     if(!force&&key===hoverCandle)return;hoverCandle=key;
-    const el=$('chart-levels');el.replaceChildren();const seen=new Set();
-    for(const s of data.segments){if(!enabled.has(s.role)||s.start>t||s.end<=t||seen.has(s.label))continue;seen.add(s.label);
-      const row=text('div',`${s.label}: $${fmt(s.value)}`,'chart-level');row.append(text('small',s.origin+(s.eligible?'':' · entries skipped/paused')));el.append(row);}
+    $('chart-levels-time').textContent=date(c?c.time:t).slice(5,16);
+    const rows=[],seen=new Set();
+    for(const s of data.segments){if(!enabled.has(s.role)||s.start>t||s.end<=t||seen.has(s.label))continue;seen.add(s.label);rows.push([s.label,s.value,stroke(s),!s.eligible,s.origin]);}
     for(const s of data.series){if(!enabled.has(s.role)||seen.has(s.label))continue;const p=s.points.filter(p=>p.time<=t).at(-1);if(!p||t-p.time>s.period)continue;
-      const row=text('div',`${s.label}: $${fmt(p.value)}`,'chart-level');row.append(text('small',s.origin));el.append(row);}
-    if(!el.childNodes.length)el.append(text('p','No recorded levels at this time.','muted'));
+      seen.add(s.label);rows.push([s.label,p.value,s.label.includes('EMA')?colors.target:colors[s.role]||colors.average,false,s.origin]);}
+    // Highest price first, like the axis; rows are fixed-height so hover never reflows the page.
+    rows.sort((a,b)=>b[1]-a[1]);
+    const el=$('chart-levels');el.replaceChildren();
+    for(const [label,value,col,muted,origin] of rows){
+      const row=text('div','','chart-level'+(muted?' muted-level':''));row.title=label+' · '+origin+(muted?' · entries skipped or paused':'');
+      const swatch=text('i','');swatch.style.borderColor=col;
+      row.append(swatch,text('span',label),text('b','$'+fmt(value)));el.append(row);
+    }
+    if(!rows.length)el.append(text('p','No levels at this time.','muted'));
   }
   function events() {
     const el=$('chart-events');el.replaceChildren();
-    for(const m of [...data.markers].reverse()) {
-      const row=text('div','','chart-event'), jump=text('button',date(m.time));jump.type='button';
-      jump.onclick=()=>{follow=false;const width=viewport[1]-viewport[0];viewport=[m.time-width*.65,m.time+width*.35];hover=m.anchor??m.time;schedule();levels();};
-      const info=text('div',`${m.label}${m.slot?' · '+m.slot:''}${m.price==null?'':' · $'+fmt(m.price)}`,'chart-event-description');
-      info.append(text('small',m.origin+(m.detail?' · '+m.detail:'')));
-      const zoom=text('button','1m inspection');zoom.type='button';zoom.onclick=()=>{end=new Date((m.time+6*3600)*1000).toISOString();form.tf.value='1m';form.days.value='1';saveURL();load(true);};
-      row.append(jump,info,zoom);el.append(row);
+    const shown=[...data.markers].filter(m=>enabled.has(m.layer)&&!m.redundant).reverse();
+    for(const m of shown) {
+      const row=document.createElement('tr');row.tabIndex=0;row.title=m.detail||'';
+      const jump=()=>{follow=false;const width=viewport[1]-viewport[0];viewport=[m.time-width*.65,m.time+width*.35];hover=m.anchor??m.time;schedule();levels();};
+      row.onclick=jump;row.onkeydown=e=>{if(e.key==='Enter')jump();};
+      const name=m.label.replaceAll('_',' ');
+      row.append(text('td',date(m.time).slice(5,16)),text('td',name.charAt(0).toUpperCase()+name.slice(1)),text('td',m.slot||'—'),text('td',m.price==null?'—':'$'+fmt(m.price)),text('td',m.origin));
+      el.append(row);
     }
-    if(!el.childNodes.length)el.append(text('p','No recorded events in this window.','muted'));
+    if(!shown.length){const row=document.createElement('tr'),cell=text('td','No events in this window.','muted');cell.colSpan=5;row.append(cell);el.append(row);}
   }
   function schedule(){if(!frame)frame=requestAnimationFrame(()=>{frame=0;draw();});}
   function dash(s){return !s.eligible?[5,4]:s.role==='stop'||/threshold|close/i.test(s.label)?[5,4]:s.role==='target'?[2,3]:s.role==='trigger'?[2,3]:[];}
@@ -130,7 +150,7 @@
     ctx.font='11px system-ui';ctx.lineWidth=1;
     const step=Math.pow(10,Math.floor(Math.log10((high-low)/5))),tick=[1,2,5,10].map(m=>m*step).find(s=>(high-low)/s<=7);
     const ticks=[];for(let v=Math.ceil(low/tick)*tick;v<high;v+=tick){const yy=y(v);ticks.push([v,yy]);ctx.strokeStyle=ink.grid;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(W-pad.r,yy);ctx.stroke();}
-    for(let i=0;i<=4;i++){const t=a+(b-a)*i/4;ctx.fillStyle=ink.text;ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.fillText(date(t).slice(5,16),x(t),H-10);}ctx.textAlign='left';
+    const n=pw<420?2:4,label=t=>b-a>3*86400?date(t).slice(5,10):date(t).slice(5,16);for(let i=0;i<=n;i++){const t=a+(b-a)*i/n;ctx.fillStyle=ink.text;ctx.textAlign=i===0?'left':i===n?'right':'center';ctx.fillText(label(t),x(t),H-10);}ctx.textAlign='left';
     ctx.save();ctx.beginPath();ctx.rect(pad.l,pad.t,pw,ph);ctx.clip();
     for(const band of data.bands){if(!enabled.has(band.role)||band.end<a||band.start>b)continue;ctx.fillStyle=band.eligible?(colors[band.role]||ink.up):ink.text;ctx.globalAlpha=band.eligible?.1:.06;ctx.fillRect(x(band.start),y(band.upper),x(band.end)-x(band.start),y(band.lower)-y(band.upper));}
     ctx.globalAlpha=1;
@@ -221,9 +241,9 @@
   });
   canvas.addEventListener('pointerleave',()=>{hover=null;$('chart-tooltip').hidden=true;schedule();levels();});
   canvas.addEventListener('keydown',e=>{if(!viewport)return;if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();const shift=(viewport[1]-viewport[0])*.1*(e.key==='ArrowLeft'?-1:1);viewport=viewport.map(v=>v+shift);follow=false;schedule();levels();}});
-  form.addEventListener('change',e=>{if(e.target.name==='strategy'){form.tf.value=form.strategy.value==='range'?'4h':'1d';form.ma_tf.value=form.tf.value;}if(form.tf.value==='1m')form.days.value='1';else if(e.target.name==='tf')form.ma_tf.value=form.tf.value;end=null;saveURL();load(true);});
+  form.addEventListener('change',()=>{saveURL();load(true);});
   form.addEventListener('submit',e=>e.preventDefault());
-  $('chart-latest').onclick=()=>{end=null;saveURL();load(true);};
+  $('chart-latest').onclick=()=>{hover=null;load(true);};
   new ResizeObserver(()=>schedule()).observe(canvas.parentElement);
   // Prices advance once a minute; the server cache answers repeats cheaply.
   setInterval(()=>{if(!document.hidden&&!abort&&!drag)load();},15000);

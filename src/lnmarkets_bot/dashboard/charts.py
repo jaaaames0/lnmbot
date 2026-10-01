@@ -68,8 +68,8 @@ def metadata(value: object) -> dict:
 def options(query: dict) -> dict:
     """Allowlist and bound all public chart parameters before touching SQLite."""
     strategy = query.get("strategy", ["ma"])[0]
-    tf = query.get("tf", ["4h" if strategy == "range" else "1d"])[0]
-    days = query.get("days", ["1" if tf == "1m" else "30"])[0]
+    tf = query.get("tf", ["1d" if strategy == "ma" else "4h"])[0]
+    days = query.get("days", ["1" if tf == "1m" else "90"])[0]
     if strategy not in OWNERS or tf not in PERIODS or days not in {"1", "7", "30", "90"}:
         raise ValueError("Choose a supported strategy, timeframe and window")
     if tf == "1m" and days != "1":
@@ -1173,23 +1173,22 @@ def _chart_data(path, *, strategy, tf, days, ma_tf, end):
     return view
 
 
-def page(strategy="ma", tf="1d", days=30, ma_tf="1d", end=None) -> str:
+def page(strategy="ma", tf="1d", days=90, ma_tf="1d", end=None) -> str:
     """Fixed HTML shell; URL parameters and DB prose are only handled as data."""
     options({"strategy": [strategy], "tf": [tf], "days": [str(days)], "ma_tf": [ma_tf]})
     return """<link rel="stylesheet" href="/assets/dashboard_chart.css">
 <section id="strategy-chart" data-preserve-chart>
-<h1>Strategy chart</h1><p class="muted">Recorded LN Markets price · UTC · levels explain decisions; they are not venue stop orders.</p>
+<div class="chart-head"><h1>Strategy chart</h1>
 <form id="chart-controls" class="chart-controls">
 <label>Strategy <select name="strategy"><option value="ma">MA cross</option><option value="breakout">Close-range breakout</option><option value="range">Impulse range</option></select></label>
-<label>Candles <select name="tf"><option>1d</option><option>4h</option><option>1m</option></select></label>
-<label>MA decision timeframe <select name="ma_tf"><option>1d</option><option>4h</option></select></label>
-<label>Window <select name="days"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></label>
-<button type="button" id="chart-latest">Latest / reset zoom</button><span class="muted">Wheel to zoom · drag to pan</span>
-</form><div id="chart-layers" class="chart-controls" aria-label="Chart layers"></div>
-<p class="chart-key muted"><b class="up">▲</b> long entry · <b class="down">▼</b> short entry · <b>●</b> exit (ring = side) · <b class="model">△ ○</b> shadow/historical model, not funded · <b class="model">◆</b> model event · <b class="intent">○</b> intent · <b class="schedule">┊</b> schedule · grey dashed levels = entries skipped or paused · hover for source</p>
+<label id="chart-tf">Timeframe <select name="tf"><option>1d</option><option>4h</option></select></label>
+<button type="button" id="chart-latest">Reset zoom</button>
+</form></div>
+<dl id="chart-status" class="chart-state" aria-label="Latest saved state"></dl>
+<div id="chart-layers" class="chart-controls chart-layers" aria-label="Chart layers"></div>
+<p class="chart-key muted"><b class="up">▲</b> long entry · <b class="down">▼</b> short entry · <b>●</b> exit (ring = side) · <b class="model">△ ○</b> unfunded model · <b class="model">◆</b> model event · <b class="intent">○</b> intent · <b class="schedule">┊</b> schedule · grey dashed = entries skipped/paused</p>
 <p id="chart-error" role="status"></p>
-<div class="chart-layout"><div class="chart-main"><div class="chart-canvas-wrap"><canvas id="chart-canvas" tabindex="0" aria-label="Price candles with strategy levels; use the level and event tables below for text"></canvas><div id="chart-tooltip" hidden></div></div><p id="chart-coverage" class="muted"></p></div>
-<aside class="chart-inspector"><h2>Latest saved state</h2><dl id="chart-status"></dl><h2>Visible levels</h2><div id="chart-levels"></div></aside></div>
-<details data-preserve-open><summary>Coverage and history limitations</summary><ul id="chart-warnings"></ul></details>
-<details data-preserve-open><summary>Recorded events · select to inspect</summary><div id="chart-events"></div></details>
+<div class="chart-layout"><div class="chart-canvas-wrap"><canvas id="chart-canvas" tabindex="0" aria-label="Price candles with strategy levels; the levels panel and events table give the values as text"></canvas><div id="chart-tooltip" hidden></div></div>
+<aside class="chart-inspector"><h2>Levels <span id="chart-levels-time"></span></h2><div id="chart-levels"></div></aside></div>
+<section class="chart-events-panel"><h2>Events</h2><div class="chart-events-wrap"><table><thead><tr><th>Time (UTC)</th><th>Event</th><th>Slot</th><th>Price</th><th>Source</th></tr></thead><tbody id="chart-events"></tbody></table></div></section>
 <script src="/assets/dashboard_chart.js" defer></script></section>"""
