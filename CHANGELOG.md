@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased — Dashboard Overview and strategy charts
+## 2026-10-01 — Dashboard Overview and strategy charts
+
+Dashboard-only release `prod-20261001.2-g7709dd300b89`, source `7709dd300b89`,
+accepted at 02:24 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-charts-20261001T021734Z`. The trader
+remains on `prod-20261001.1-g0b1650b10779`, PID 1411724, run 71; its unit,
+configuration, 40 orders and 40 fills were unchanged. Readiness, desktop/mobile
+LAN browser checks, the encrypted backup and infrastructure monitor passed
+(**127 passes, zero warnings/failures**). Timed rollback was disarmed; the
+preceding dashboard release remains available.
+
+Validation: **424 tests passed**, scoped Ruff clean. Streaming candle
+aggregation kept four simultaneous cold chart requests below the unchanged
+160 MiB cap (about 140 MiB peak) and preserved chart values.
 
 - Compact Overview with funded P&L, execution/feed/entry context, consistent
   strategy summaries, funded inventory and six recent activity rows. Collapse
@@ -10,8 +23,8 @@
   breakout and range levels on 1d/4h candles or one-day 1m inspection. Preserve
   zoom and layer choices during refresh; label timing, provenance and incomplete
   history, including chop-skipped channels and model-only campaign units.
-- Add offline database-copy previews. No trader, strategy, risk, schema or live
-  deployment change is included.
+- Add offline database-copy previews. Trading behavior, risk and the database
+  schema are unchanged; only the dashboard and its readiness-probe paths moved.
 
 ## 2026-10-01 — Routine funding publication delay
 
