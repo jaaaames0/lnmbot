@@ -3,3 +3,4 @@
 @media(max-width:700px){.chart-canvas-wrap{height:380px}.chart-controls{gap:8px}.chart-controls label{flex-wrap:wrap}.chart-inspector dl{grid-template-columns:110px 1fr}}
 
 .chart-key{font-size:.75rem;margin:.5rem 0 1rem}
+.chart-key b{font-weight:600;color:#e5e7eb}.chart-key b.up{color:#34d399}.chart-key b.down{color:#f87171}.chart-key b.model{color:#fbbf24}.chart-key b.intent{color:#93c5fd}.chart-key b.schedule{color:#c084fc}

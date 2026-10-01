@@ -881,7 +881,9 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
 
     assert overview.count('class="strategy-summary"') == 2
     assert "winner cooldown 11" in overview
-    assert "Historical campaign" in overview and "20260822L" in overview
+    # Model incomplete outranks the historical-campaign label in the card status.
+    assert "Model incomplete · entries blocked" in overview and "20260822L" in overview
+    assert "execution-strip" not in overview and "pnl-card" not in overview
     assert "no funded units" in overview
     assert "Funded positions · Flat" in overview
     assert "Recent activity" in overview
@@ -890,6 +892,11 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "/strategies/ma" in overview and "/charts?strategy=breakout" in overview
     page = dashboard._render(db_path, "overview", None)
     assert "<span>Execution</span>" in page
+    assert page.count('class="topbar-pnl"') == 1 and "<span>Net P&amp;L</span>" in page
+    trades = dashboard._render(db_path, "trades", "1d", pnl_window="30days")
+    # The top-bar window toggles keep the current page and its filters.
+    assert 'href="/trades?pnl_window=1day&amp;tf=1d"' in trades
+    assert 'href="/trades?tf=1d"' in trades and "/signals?pnl_window=30days" in trades
     assert "Action needed" in page and "new breakout entries blocked" in page
     detail = dashboard._strategy_page(db_path, run, "breakout", "sats", None)
     assert "range close $72,968.00" in detail

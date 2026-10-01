@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
+from itertools import pairwise
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -108,12 +109,22 @@ def test_range_geometry_uses_knowledge_time_and_keeps_skipped_channel_muted(db_p
     redraw = next(m for m in view["markers"] if m["kind"] == "redraw")
     assert confirm["time"] == confirm["observed_at"] + 4 * 3600
     assert redraw["time"] == redraw["observed_at"] + 4 * 3600
+    assert confirm["anchor"] == confirm["time"] - 1  # inside the candle that closed
     old = [s for s in view["segments"] if s["label"] == "Channel high" and s["value"] == 110]
     assert old[0]["start"] == confirm["time"]
-    assert old[-1]["end"] == charts.stamp("2026-09-21T04:00:00Z")
+    # Edges stay drawn while the broken channel expands; trading levels stop at the break.
+    assert old[-1]["end"] == redraw["time"]
+    buy = [s for s in view["segments"] if s["label"] == "Buy ≤" and s["value"] == 84.5]
+    assert buy[-1]["end"] == charts.stamp("2026-09-21T04:00:00Z")
+    extreme = sorted(
+        (s for s in view["segments"] if s["label"] == "Expansion extreme"), key=lambda s: s["start"]
+    )
+    assert extreme[0]["start"] == charts.stamp("2026-09-21T04:00:00Z")
+    assert extreme[-1]["end"] == redraw["time"] and extreme[-1]["value"] == 102
     new = [s for s in view["segments"] if s["label"] == "Channel high" and s["value"] == 120]
     assert min(s["start"] for s in new) == redraw["time"]
-    assert all(not s["eligible"] for s in view["segments"])
+    expansion = ("Expansion", "4h redraw")
+    assert all(not s["eligible"] for s in view["segments"] if not s["label"].startswith(expansion))
     assert not any(s["start"] < redraw["time"] < s["end"] for s in new)
     levels = {s["label"]: s["value"] for s in view["segments"] if s["start"] == view["state_as_of"]}
     assert levels["Buy ≤"] == 86 and levels["Sell ≥"] == 114
@@ -121,6 +132,27 @@ def test_range_geometry_uses_knowledge_time_and_keeps_skipped_channel_muted(db_p
     assert view["status"]["admission"] == "Chop skipped"
     assert any(b["role"] == "stop" and b["upper"] == 80 and b["lower"] == 76 for b in view["bands"])
     assert not any(m["origin"] == "Recorded execution" for m in view["markers"])
+
+
+def test_range_formation_is_replayed_from_events_and_recorded_candles(db_path):
+    state = range_state()
+    state["machine"].update(channel=None, state="seek", setup={"side": 1, "extreme": 102})
+    state["events"] = [
+        {"ts": "2026-09-20T08:00:00Z", "kind": "impulse", "detail": {"side": 1, "extreme": 101}}
+    ]
+    save_state(db_path, "range", state)
+    view = charts.chart_data(db_path, strategy="range", tf="4h", days=7)
+    extreme = sorted(
+        (s for s in view["segments"] if s["label"] == "Impulse extreme"), key=lambda s: s["start"]
+    )
+    # The extreme follows recorded 4h highs from the impulse bar onward, without gaps.
+    assert extreme[0]["start"] == charts.stamp("2026-09-20T08:00:00Z")
+    assert extreme[0]["value"] == 102 and extreme[-1]["end"] == view["end"]
+    assert all(a["end"] == b["start"] for a, b in pairwise(extreme))
+    threshold = next(s for s in view["segments"] if s["label"] == "Pullback threshold")
+    assert threshold["value"] == pytest.approx(102 * 0.92)
+    impulse = next(m for m in view["markers"] if m["kind"] == "impulse")
+    assert impulse["layer"] == "model" and impulse["direction"] == 1 and impulse["price"] == 101
 
 
 def test_current_range_formation_is_not_projected_backwards(db_path):
@@ -220,7 +252,8 @@ def test_ma_history_matches_complete_local_candles_and_preserves_cooldown(db_pat
     assert view["status"]["winner_remaining"] == 11
     ema = next(s for s in view["series"] if s["label"] == "EMA21")
     sma = next(s for s in view["series"] if s["label"] == "SMA20")
-    assert len(ema["points"]) == 24 and len(sma["points"]) == 5
+    # SMA20 and EMA21 (seeded with SMA21) from recorded candles: 24 closes give 4 points.
+    assert len(ema["points"]) == 4 and len(sma["points"]) == 4
     assert all(p["value"] == pytest.approx(100) for p in ema["points"])
     assert all(p["time"] <= charts.stamp(completed) for s in view["series"] for p in s["points"])
     # Last completed instant equals price history end; no future/current band is fabricated.
@@ -229,6 +262,11 @@ def test_ma_history_matches_complete_local_candles_and_preserves_cooldown(db_pat
     assert view["bands"][-1]["lower"] == pytest.approx(99.5)
     assert view["bands"][-1]["upper"] == pytest.approx(100.5)
     assert any("not an authoritative" in w for w in view["coverage"]["warnings"])
+    with sqlite3.connect(db_path) as db:
+        db.execute("DELETE FROM bars WHERE ts='2026-09-20 12:00:00'")
+    partial = charts.chart_data(db_path, strategy="ma", tf="1d", days=30)
+    # A candle missing a recorded minute still contributes its close.
+    assert len(next(s for s in partial["series"] if s["label"] == "EMA21")["points"]) == 4
 
 
 def test_execution_markers_distinguish_rejection_intent_shadow_and_fills(db_path):
@@ -259,6 +297,11 @@ def test_execution_markers_distinguish_rejection_intent_shadow_and_fills(db_path
         )
     view = charts.chart_data(db_path, strategy="range", tf="4h", days=7)
     assert len([m for m in view["markers"] if m["kind"] == "entry"]) == 1
+    entry = next(m for m in view["markers"] if m["kind"] == "entry")
+    assert entry["layer"] == "execution" and entry["direction"] == 1
+    assert entry["anchor"] == entry["time"] and "long" in entry["label"]
+    assert next(m for m in view["markers"] if m["kind"] == "order_status")["layer"] == "diagnostic"
+    assert next(m for m in view["markers"] if m["kind"] == "signal")["layer"] == "intent"
     assert next(m["price"] for m in view["markers"] if m["kind"] == "entry") == 91
     assert any(m["kind"] == "order_status" and "rejected" in m["label"] for m in view["markers"])
     assert any(m["kind"] == "signal" and "not a fill" in m["origin"] for m in view["markers"])

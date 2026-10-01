@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import pandas as pd
@@ -28,6 +29,9 @@ from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTradesApi
 from lnmarkets_bot.dashboard import charts
 from lnmarkets_bot.portfolio.store import read_overview
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 TIMEFRAMES = ("1d", "4h")
 MA_STRATEGY_NAME = "lnmarkets_bot.strategy.ma_cross.MaCross"
@@ -541,12 +545,17 @@ def _position_card(
 
 
 def _pnl_card(
-    pnl: list[dict[str, object]], denomination: str, window: str, btc_price: float | None
+    pnl: list[dict[str, object]],
+    denomination: str,
+    window: str,
+    btc_price: float | None,
+    href: Callable[[str], str] | None = None,
 ) -> str:
     chosen = next((row for row in pnl if row["key"] == window), pnl[0])
+    link = href or (lambda key: f"/?denom={denomination}&pnl_window={key}")
     controls = "".join(
         f'<a class="pnl-toggle{" active" if key == window else ""}" '
-        f'href="/?denom={denomination}&pnl_window={key}">{label}</a>'
+        f'href="{html.escape(link(key))}">{label}</a>'
         for key, label in (
             ("1day", "1d"),
             ("7days", "7d"),
@@ -554,6 +563,14 @@ def _pnl_card(
             ("alltime", "All"),
         )
     )
+    if href is not None:
+        # Topbar form: funded ledger + open mark, fees and funding on every page.
+        return (
+            '<div class="topbar-pnl"><a href="/pnl" title="Funded ledger + open mark, trading fees and funding; historical and shadow trades excluded">'
+            "<span>Net P&amp;L</span><strong>"
+            f"{_signed_amount_html(chosen['net'], denomination, btc_price)}</strong></a>"
+            f"<small>{controls}</small></div>"
+        )
     return (
         '<article class="card pnl-card"><p>Net P&amp;L</p>'
         f"<strong>{_signed_amount_html(chosen['net'], denomination, btc_price)}</strong>"
@@ -836,7 +853,10 @@ def _trade_history_rows(
 def _market_context(db_path: Path) -> tuple[float | None, list[dict[str, object]], datetime | None]:
     rows = _query(
         db_path,
-        "SELECT ts, close FROM bars WHERE id IN (SELECT MAX(id) FROM bars GROUP BY ts) "
+        # bars.ts is unindexed: deduplicate restart rows among recent ids only,
+        # rather than grouping the whole retained history on every render.
+        "SELECT ts, close FROM bars WHERE id IN (SELECT MAX(id) FROM "
+        "(SELECT id, ts FROM bars ORDER BY id DESC LIMIT 12000) GROUP BY ts) "
         "ORDER BY ts DESC LIMIT 10100",
     )
     if not rows:
@@ -3174,13 +3194,8 @@ def _overview(
     pnl_window: str,
     exchange: ExchangeSnapshot | None,
 ) -> str:
-    price, _, last_bar = _market_context(db_path)
+    price, _, _ = _market_context(db_path)
     positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
-    cfg = _metadata(run.get("config_json"))
-    entry_policy = (
-        "Enabled" if cfg.get("live_entries_enabled", True) else "Disabled · owned exits continue"
-    )
-    pnl = _pnl_summary(db_path, positions)
     funded_rows = [
         {
             "strategy": _strategy_label(str(p["strategy"])),
@@ -3209,18 +3224,8 @@ def _overview(
         recent.append(signal)
         if len(recent) == 6:
             break
-    fresh = bool(last_bar and (datetime.now(UTC) - last_bar).total_seconds() <= 180)
-    health = (
-        f'<section class="execution-strip"><div><span>Runner</span><strong>{html.escape(str(run["status"]))} · run {run["id"]}</strong></div>'
-        f"<div><span>Recorded feed</span><strong>{'Fresh' if fresh else 'Stale / unavailable'}</strong><small>{html.escape(str(last_bar or '—'))}</small></div>"
-        f"<div><span>Entry policy</span><strong>{entry_policy}</strong><small>Execution admission shown above</small></div>"
-        '<a href="/health">Health details →</a></section>'
-    )
     return (
-        '<h1>Operational overview</h1><div class="overview-account">'
-        + _pnl_card(pnl, denomination, pnl_window, price)
-        + '<p class="muted">Funded ledger + open mark, trading fees and funding. Historical campaigns and shadow trades stay separate. <a href="/pnl">P&amp;L details →</a></p></div>'
-        + health
+        "<h1>Operational overview</h1>"
         + _strategy_summaries(db_path, run, positions, price)
         + (
             _table(
@@ -3418,7 +3423,12 @@ def _execution_alignment(
 
 
 def _topbar(
-    db_path: Path, run: dict[str, object], denomination: str, exchange: ExchangeSnapshot | None
+    db_path: Path,
+    run: dict[str, object],
+    denomination: str,
+    exchange: ExchangeSnapshot | None,
+    pnl_window: str = "7days",
+    pnl_href: Callable[[str], str] | None = None,
 ) -> str:
     price, changes, _ = _market_context(db_path)
     snapshots = _query(
@@ -3470,7 +3480,14 @@ def _topbar(
         f"{_signed_amount_html(running_pl, denomination, price)}</strong></div>"
         f"<small>available {_amount_html(available, denomination, price)} · margin {_amount_html(margin_used, denomination, price)}"
         f"<br>{html.escape(account_source)} · {html.escape(account_as_of)}</small></div>"
-        f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
+        + _pnl_card(
+            _pnl_summary(db_path, positions),
+            denomination,
+            pnl_window,
+            price,
+            pnl_href or (lambda key: f"/?denom={denomination}&pnl_window={key}"),
+        )
+        + f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
         f"<strong>{html.escape(alignment)}</strong>"
         f"<small>{html.escape(alignment_detail)}</small></div>"
     )
@@ -4042,7 +4059,7 @@ def _render(
         query: dict[str, str] = {}
         if denomination != "sats":
             query["denom"] = denomination
-        if target == "overview" and pnl_window != "7days":
+        if pnl_window != "7days":
             query["pnl_window"] = pnl_window
         if target == "pnl":
             if pnl_granularity != "daily":
@@ -4125,15 +4142,14 @@ def _render(
 .strategy-summary{display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:1rem;min-width:0}
 .strategy-summary header{display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;margin-bottom:.7rem}.strategy-summary h2{margin:0;color:var(--text);font-size:.85rem}
 .strategy-summary header span{color:var(--accent);font-size:.75rem}.strategy-summary p{margin:.3rem 0;color:var(--muted);font-size:.78rem;overflow-wrap:anywhere}
-.strategy-summary footer{display:flex;gap:1rem;margin-top:auto;padding-top:.8rem}.strategy-summary a,.execution-strip a,.overview-account a{color:var(--accent);text-decoration:none}
-.execution-strip{display:flex;flex-wrap:wrap;align-items:center;gap:1rem 2rem;background:var(--surface);padding:1rem;border:1px solid var(--border);border-radius:7px}
-.execution-strip span,.execution-strip small{display:block;color:var(--muted);font-size:.72rem}.execution-strip strong{font-size:.8rem}
-.overview-account{display:flex;gap:1.2rem;align-items:center;margin:0 0 1rem}.overview-account .pnl-card{min-width:220px;flex-shrink:0}.overview-account p{max-width:44rem}
+.strategy-summary footer{display:flex;gap:1rem;margin-top:auto;padding-top:.8rem}.strategy-summary a{color:var(--accent);text-decoration:none}
+.topbar-pnl{display:flex;flex-direction:column;gap:.3rem;border-left:1px solid var(--border);padding-left:1rem}.topbar-pnl a{display:flex;align-items:baseline;gap:.45rem;color:inherit;text-decoration:none}.topbar-pnl a:hover strong{text-decoration:underline}.topbar-pnl strong{font-size:1.05rem}.topbar-pnl small{display:flex;gap:.25rem}.topbar-pnl .pnl-toggle{font-size:.66rem;padding:.08rem .32rem}
+
 .flat-inventory{display:flex;gap:1.5rem;margin-top:1.5rem;border:1px solid var(--border);border-radius:7px;padding:1rem}.flat-inventory span{color:var(--muted)}
 .topbar{flex-wrap:wrap}.topbar-metric{flex-wrap:wrap}.table-section{min-width:0}.table-wrap{max-width:100%}
-.overview-account~.table-section:last-of-type td:last-child{min-width:22rem}
+.content>.table-section:last-of-type td:last-child{min-width:22rem}
 @media(max-width:1100px){.strategy-summaries{grid-template-columns:1fr}.strategy-summary footer{margin-top:.3rem}}
-@media(max-width:700px){.layout{flex-direction:column}.content{width:100%;padding:1rem}.overview-account,.flat-inventory{flex-direction:column;align-items:stretch}.topbar-market,.topbar-metric,.topbar-alignment{min-width:0;width:100%}.config-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:700px){.layout{flex-direction:column}.content{width:100%;padding:1rem}.flat-inventory{flex-direction:column;align-items:stretch}.topbar-market,.topbar-metric,.topbar-alignment,.topbar-pnl{min-width:0;width:100%}.topbar-pnl{border-left:0;padding-left:0}.config-grid{grid-template-columns:1fr 1fr}}
 </style>""",
     )
     refresh_script = """<script>
@@ -4202,7 +4218,43 @@ def _render(
   refreshPrice()
 })()
 </script>"""
-    topbar = _topbar(db_path, run, denomination, exchange) if run is not None else ""
+
+    def here(**changes: str) -> str:
+        """The current page with display preferences changed and its filters kept."""
+        query: dict[str, str] = {}
+        if denomination != "sats":
+            query["denom"] = denomination
+        if pnl_window != "7days":
+            query["pnl_window"] = pnl_window
+        if page == "pnl":
+            if pnl_granularity != "daily":
+                query["pnl_granularity"] = pnl_granularity
+            if pnl_page != 1:
+                query["pnl_page"] = str(pnl_page)
+            if pnl_basis == "constant":
+                query["pnl_basis"] = "constant"
+        if page in filterable_pages and tf:
+            query["tf"] = tf
+        if page == "charts":
+            query.update(chart_query or {})
+        query.update(changes)
+        if query.get("pnl_window") == "7days":
+            del query["pnl_window"]
+        path = "/" if page == "overview" else f"/{page}"
+        return f"{path}?{urlencode(query)}" if query else path
+
+    topbar = (
+        _topbar(
+            db_path,
+            run,
+            denomination,
+            exchange,
+            pnl_window,
+            lambda key: here(pnl_window=key),
+        )
+        if run is not None
+        else ""
+    )
     last_bar = _market_context(db_path)[2] if run is not None else None
     sidebar_status = _sidebar_status(run, last_bar) if run is not None else ""
     replacements = {
@@ -4221,27 +4273,11 @@ def _render(
     }
     for source, replacement in replacements.items():
         template = template.replace(source, replacement)
-    denomination_links = []
-    for value, label in (("sats", SAT_ICON), ("usd", "USD")):
-        query: dict[str, str] = {"denom": value}
-        if page == "overview" and pnl_window != "7days":
-            query["pnl_window"] = pnl_window
-        if page == "pnl":
-            if pnl_granularity != "daily":
-                query["pnl_granularity"] = pnl_granularity
-            if pnl_page != 1:
-                query["pnl_page"] = str(pnl_page)
-            if pnl_basis == "constant":
-                query["pnl_basis"] = "constant"
-        if page in filterable_pages and tf:
-            query["tf"] = tf
-        if page == "charts":
-            query.update(chart_query or {})
-        path = "/" if page == "overview" else f"/{page}"
-        denomination_links.append(
-            f'<a class="denom-toggle{" active" if denomination == value else ""}" '
-            f'href="{path}?{urlencode(query)}">{label}</a>'
-        )
+    denomination_links = [
+        f'<a class="denom-toggle{" active" if denomination == value else ""}" '
+        f'href="{html.escape(here(denom=value))}">{label}</a>'
+        for value, label in (("sats", SAT_ICON), ("usd", "USD"))
+    ]
     template = template.replace("{denomination_links}", "".join(denomination_links))
     scope_note = ""
     return template.replace(

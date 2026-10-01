@@ -48,19 +48,23 @@ The example dashboard unit binds port `8082` on all interfaces. Restrict it
 with the host firewall or change the unit to loopback. For a loopback listener,
 use `ssh -L 8082:127.0.0.1:8082 <bot-host>` and open
 `http://127.0.0.1:8082` locally. The dashboard shows account context, strategy
-positions, signals, funding, P&L, run configuration, and health. Overview gives
-each enabled strategy a compact summary and lists funded positions separately
+positions, signals, funding, P&L, run configuration, and health. The top bar
+on every page carries price, equity and funded net P&L with its window toggle.
+Overview gives each enabled strategy a compact summary and lists funded positions separately
 from historical campaigns and shadow trades. `/strategies/ma`,
 `/strategies/breakout`, and `/strategies/range` hold the detailed state.
 
 `/charts` overlays strategy levels on recorded LN Markets candles, with 1d/4h
 views and a bounded one-day 1m inspection. It uses native Canvas, local assets
 and no JavaScript build step or chart price API. All three strategies contribute
-to the same read-only chart interface. Sources distinguish confirmed executions,
-intents, model events and shadow trades; partial candles and unavailable history
-are explicit. MA history is a bounded display reconstruction. Snapshots overwrite
-current state, so continuous range formation and historical recovery peaks are
-not available as complete series. This viewer makes no trader-side changes.
+to the same read-only chart interface. Markers sit on the candle that caused
+them: ▲/▼ long/short entries, ● exits, hollow symbols for shadow or historical
+model trades, ◆ model events, ○ intents; routine diagnostics are off by default.
+MA averages are recomputed from recorded candles for display. Range formation,
+channel and expansion levels are replayed from the retained machine events over
+recorded 4h candles; the saved snapshot defines current levels. Historical
+breakout recovery peaks are not a recorded series. The chart is a visual aid,
+not an audit, and makes no trader-side changes.
 
 Changing sizing or direction settings requires editing the trader env file
 and restarting its service. Existing venue positions are reconciled, not

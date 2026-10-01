@@ -27,8 +27,11 @@ OWNERS = {
 }
 LEGACY_MA = "lnmarkets_bot.strategy.ma_cross.MaCross"
 PERIODS = {"1m": 60, "4h": 14400, "1d": 86400}
+H4 = PERIODS["4h"]
 MAX_CANDLES = 1500
 MAX_MARKERS = 2000
+MA_WARMUP = 80  # candles before the window for SMA20/EMA21 display convergence
+CACHE_SECONDS = 120
 _CACHE: OrderedDict = OrderedDict()
 _LOCK = threading.Lock()
 
@@ -101,61 +104,48 @@ def _candles(db, start, end, tf):
     """Deduplicate restart rows, aggregate on UTC starts, and count real minutes."""
     sql_start = datetime.fromtimestamp(start, UTC).replace(tzinfo=None).isoformat(" ")
     sql_end = datetime.fromtimestamp(end, UTC).replace(tzinfo=None).isoformat(" ")
-    rows = db.execute(
-        "SELECT id,ts,open,high,low,close,volume FROM bars WHERE ts>=? AND ts<? ORDER BY ts,id",
-        (sql_start, sql_end),
-    )
     period = PERIODS[tf]
-    grouped = {}
-
-    def aggregate(t, prices, volume):
-        key = t - t % period
-        o, h, low, c = prices
-        if key not in grouped:
-            grouped[key] = {
+    # SQLite aggregates in C: the last valid restart row wins for each minute,
+    # then minutes fold into UTC candles. Python only sees the bounded result.
+    rows = db.execute(
+        """
+        WITH m AS MATERIALIZED (
+            SELECT ts AS minute, MAX(id) AS id FROM bars
+            WHERE ts >= ? AND ts < ? AND open > 0 AND high > 0 AND low > 0 AND close > 0
+            GROUP BY 1
+        ), g AS (
+            SELECT unixepoch(m.minute) / ? AS k, MIN(m.minute) AS first, MAX(m.minute) AS last,
+                MAX(b.high) AS high, MIN(b.low) AS low, SUM(b.volume) AS volume, COUNT(*) AS n
+            FROM m JOIN bars b ON b.id = m.id GROUP BY 1 HAVING k IS NOT NULL
+        )
+        SELECT g.k, o.open, g.high, g.low, c.close, g.volume, g.n FROM g
+        JOIN m mo ON mo.minute = g.first JOIN bars o ON o.id = mo.id
+        JOIN m mc ON mc.minute = g.last JOIN bars c ON c.id = mc.id
+        ORDER BY g.k
+        """,
+        (sql_start, sql_end, period),
+    ).fetchall()
+    result, recorded = [], 0
+    for k, o, h, low, c, volume, minutes in rows:
+        key = k * period
+        recorded += minutes
+        result.append(
+            {
                 "time": key,
                 "close_time": key + period,
                 "open": o,
                 "high": h,
                 "low": low,
                 "close": c,
-                "volume": volume,
-                "minutes": 1,
+                "volume": number(volume) or 0,
+                "minutes": minutes,
                 "source": "Recorded LN Markets minutes",
+                "missing_minutes": period // 60 - minutes,
+                "complete": minutes == period // 60 and key + period <= end,
             }
-        else:
-            bar = grouped[key]
-            bar.update(
-                high=max(bar["high"], h),
-                low=min(bar["low"], low),
-                close=c,
-                volume=bar["volume"] + volume,
-                minutes=bar["minutes"] + 1,
-            )
-
-    # Rows are ordered by timestamp/id: keep only the last valid restart row
-    # for one minute, then fold it into its candle. Long windows need not retain
-    # a Python object for every source minute, including concurrent requests.
-    pending = None
-    recorded = 0
-    for row in rows:
-        t = stamp(row[1])
-        values = [number(x) for x in row[2:6]]
-        if t is None or not all(x is not None and x > 0 for x in values):
-            continue
-        if pending is not None and t != pending[0]:
-            aggregate(*pending)
-            recorded += 1
-        pending = (t, values, number(row[6]) or 0)
-    if pending is not None:
-        aggregate(*pending)
-        recorded += 1
-    for bar in grouped.values():
-        bar["missing_minutes"] = period // 60 - bar["minutes"]
-        bar["complete"] = bar["missing_minutes"] == 0 and bar["close_time"] <= end
-    result = list(grouped.values())[-MAX_CANDLES:]
+        )
     expected = max(0, (end - start) // 60)
-    return result, max(0, expected - recorded)
+    return result[-MAX_CANDLES:], max(0, expected - recorded)
 
 
 def _segment(
@@ -189,7 +179,15 @@ def _marker(
     origin="Recorded model event",
     slot="",
     detail="",
+    layer="model",
+    direction=None,
+    closed=False,
 ):
+    """Record an event; `anchor` is the instant whose candle caused it.
+
+    Close-based events become known at a candle boundary, so they anchor one
+    second earlier, inside the candle that closed, on every display timeframe.
+    """
     if known is None:
         return
     view["markers"].append(
@@ -197,9 +195,12 @@ def _marker(
             "id": f"{kind}-{len(view['markers'])}",
             "label": label,
             "kind": kind,
+            "layer": layer,
+            "direction": direction if direction in (1, -1) else None,
             "observed_at": observed,
             "time": known,
             "known_at": known,
+            "anchor": known - 1 if closed else known,
             "price": number(price),
             "origin": origin,
             "slot": str(slot),
@@ -208,47 +209,240 @@ def _marker(
     )
 
 
-def _range_geometry(view, lo, hi, start, end, params, eligible):
-    lo, hi = number(lo), number(hi)
-    if lo is None or hi is None or hi <= lo:
-        return
+def _steps(view, rows, origin):
+    """Emit per-bar display levels as merged step segments and zone bands.
+
+    `rows` holds (start, end, levels, zones): levels map a label to
+    (role, value, eligible); zones map a label to (role, lower, upper, eligible).
+    """
+    open_levels, open_zones = {}, {}
+
+    def flush_level(label):
+        start, end, role, value, eligible = open_levels.pop(label)
+        _segment(view, label, role, start, end, value, origin=origin, eligible=eligible)
+
+    def flush_zone(label):
+        start, end, role, lower, upper, eligible = open_zones.pop(label)
+        view["bands"].append(
+            {
+                "label": label,
+                "role": role,
+                "start": start,
+                "end": end,
+                "lower": lower,
+                "upper": upper,
+                "eligible": eligible,
+                "origin": origin,
+            }
+        )
+
+    for start, end, levels, zones in rows:
+        for label in [k for k in open_levels if k not in levels]:
+            flush_level(label)
+        for label in [k for k in open_zones if k not in zones]:
+            flush_zone(label)
+        for label, (role, value, eligible) in levels.items():
+            run = open_levels.get(label)
+            if run and run[1] == start and run[3:] == (value, eligible):
+                open_levels[label] = (*run[:1], end, *run[2:])
+                continue
+            if run:
+                flush_level(label)
+            open_levels[label] = (start, end, role, value, eligible)
+        for label, (role, lower, upper, eligible) in zones.items():
+            run = open_zones.get(label)
+            if run and run[1] == start and run[3:] == (lower, upper, eligible):
+                open_zones[label] = (*run[:1], end, *run[2:])
+                continue
+            if run:
+                flush_zone(label)
+            open_zones[label] = (start, end, role, lower, upper, eligible)
+    for label in list(open_levels):
+        flush_level(label)
+    for label in list(open_zones):
+        flush_zone(label)
+
+
+# Range close-candle event timestamps describe the source 4h candle start.
+RANGE_CLOSE_EVENTS = {"pullback", "setup_cancel", "confirm", "redraw"}
+RANGE_MODEL_EVENTS = {
+    "impulse",
+    "pullback",
+    "setup_cancel",
+    "confirm",
+    "chop_skip",
+    "break",
+    "redraw",
+    "range_end",
+}
+
+
+def _channel_levels(lo, hi, params, eligible):
+    """One bar of tradeable channel geometry: (levels, zones)."""
     width = hi - lo
     zone, tol = number(params.get("zone", 0.15)), number(params.get("tolerance", 0.1))
-    if zone is None or tol is None:
-        return
+    if zone is None or tol is None or width <= 0:
+        return {}, {}
     buy, sell = lo + zone * width, hi - zone * width
-    for label, role, value in [
-        ("Channel low", "channel", lo),
-        ("Channel high", "channel", hi),
-        ("Buy ≤", "entry", buy),
-        ("Sell ≥", "entry", sell),
-        ("Midpoint target", "target", (lo + hi) / 2),
-        ("4h close stop below", "stop", lo - tol * width),
-        ("4h close stop above", "stop", hi + tol * width),
-    ]:
-        _segment(view, label, role, start, end, value, eligible=eligible)
-    if start is not None and end > start:
-        for label, role, lower, upper in [
-            ("Buy zone", "entry", lo, buy),
-            ("Sell zone", "entry", sell, hi),
-            ("Lower stop band", "stop", lo - tol * width, lo),
-            ("Upper stop band", "stop", hi, hi + tol * width),
-        ]:
-            view["bands"].append(
-                {
-                    "label": label,
-                    "role": role,
-                    "start": start,
-                    "end": end,
-                    "lower": lower,
-                    "upper": upper,
-                    "eligible": bool(eligible),
-                    "origin": "Derived from recorded edges",
-                }
+    levels = {
+        "Channel low": ("channel", lo, eligible),
+        "Channel high": ("channel", hi, eligible),
+        "Buy ≤": ("entry", buy, eligible),
+        "Sell ≥": ("entry", sell, eligible),
+        "Midpoint target": ("target", (lo + hi) / 2, eligible),
+        "4h close stop below": ("stop", lo - tol * width, eligible),
+        "4h close stop above": ("stop", hi + tol * width, eligible),
+    }
+    zones = {
+        "Buy zone": ("entry", lo, buy, eligible),
+        "Sell zone": ("entry", sell, hi, eligible),
+        "Lower stop band": ("stop", lo - tol * width, lo, eligible),
+        "Upper stop band": ("stop", hi, hi + tol * width, eligible),
+    }
+    return levels, zones
+
+
+def _expansion_levels(lo, hi, direction, extreme, params):
+    """Broken channel: edges stay visible, entries pause, the new extreme is tracked."""
+    levels = {"Channel low": ("channel", lo, False), "Channel high": ("channel", hi, False)}
+    if extreme is None:
+        return levels
+    other = hi if direction == -1 else lo
+    levels["Expansion extreme"] = ("formation", extreme, True)
+    levels["4h redraw close"] = ("formation", extreme + (other - extreme) / 3, True)
+    cap = number(params.get("max_width", 0.4))
+    if cap is not None:
+        levels["Expansion width cap"] = (
+            "stop",
+            other / (1 + cap) if direction == -1 else other * (1 + cap),
+            True,
+        )
+    return levels
+
+
+def _formation_levels(side, extreme, swing, params):
+    if extreme is None:
+        return {}
+    levels = {"Impulse extreme": ("formation", extreme, True)}
+    if swing is not None:
+        levels["Swing"] = ("formation", swing, True)
+        levels["4h confirmation close"] = (
+            "formation",
+            swing + side * abs(extreme - swing) / 3,
+            True,
+        )
+    else:
+        pullback = number(params.get("pullback", 0.08))
+        if pullback is not None:
+            levels["Pullback threshold"] = ("formation", extreme * (1 - side * pullback), True)
+    return levels
+
+
+def _range_geometry(view, lo, hi, start, end, params, eligible):
+    lo, hi = number(lo), number(hi)
+    if lo is None or hi is None or hi <= lo or start is None or end <= start:
+        return
+    _steps(
+        view,
+        [(start, end, *_channel_levels(lo, hi, params, bool(eligible)))],
+        "Derived from recorded state",
+    )
+
+
+def _range_known(kind, t, detail):
+    closed = kind in RANGE_CLOSE_EVENTS or (kind == "range_end" and detail.get("reason") == "trend")
+    return t + H4 if closed else t
+
+
+def _range_history(view, events, params, bars, until):
+    """Replay retained machine events over recorded 4h candles, display only.
+
+    Events fix every level the machine reported (impulse extreme, swing,
+    channel edges). Between events, extremes are extended with recorded candle
+    highs/lows exactly as the machine's close rules do; a bar shows the level
+    after its own candle, like the research replay. Missing candles hold the
+    previous level rather than leaving a gap.
+    """
+    queue = sorted(
+        ((_range_known(kind, t, detail), kind, detail) for kind, t, detail in events),
+        key=lambda e: e[0],
+    )
+    if not queue or until is None:
+        return
+    bar = queue[0][0] - queue[0][0] % H4
+    formation = channel = None
+    rows, i = [], 0
+    while bar < until:
+        while i < len(queue) and queue[i][0] <= bar:
+            _, kind, detail = queue[i]
+            i += 1
+            if kind == "impulse":
+                side = 1 if detail.get("side", 1) == 1 else -1
+                formation = {"side": side, "extreme": number(detail.get("extreme")), "swing": None}
+                channel = None
+            elif kind == "pullback":
+                extreme, swing = number(detail.get("extreme")), number(detail.get("swing"))
+                side = (
+                    formation["side"] if formation else 1 if (extreme or 0) > (swing or 0) else -1
+                )
+                formation = {"side": side, "extreme": extreme, "swing": swing}
+            elif kind == "setup_cancel":
+                formation = None
+            elif kind in {"confirm", "redraw"}:
+                lo, hi = number(detail.get("lo")), number(detail.get("hi"))
+                skipped = bool(channel and channel["skipped"]) if kind == "redraw" else False
+                formation = None
+                channel = (
+                    {"lo": lo, "hi": hi, "dir": 0, "extreme": None, "skipped": skipped}
+                    if lo is not None and hi is not None and hi > lo
+                    else None
+                )
+            elif kind == "chop_skip" and channel:
+                channel["skipped"] = True
+            elif kind == "break" and channel:
+                channel["dir"] = -1 if detail.get("dir") == -1 else 1
+                candle = bars.get(bar)
+                channel["extreme"] = candle["open"] if candle else None
+            elif kind == "range_end":
+                channel = None
+        candle = bars.get(bar)
+        if candle and formation and formation["extreme"] is not None:
+            side, pick = formation["side"], max if formation["side"] == 1 else min
+            if formation["swing"] is None:
+                formation["extreme"] = pick(
+                    formation["extreme"], candle["high" if side == 1 else "low"]
+                )
+            else:
+                other = min if side == 1 else max
+                formation["swing"] = other(
+                    formation["swing"], candle["low" if side == 1 else "high"]
+                )
+        if candle and channel and channel["dir"]:
+            d = channel["dir"]
+            edge = candle["low" if d == -1 else "high"]
+            current = channel["extreme"]
+            channel["extreme"] = (
+                edge if current is None else min(current, edge) if d == -1 else max(current, edge)
             )
+        levels, zones = {}, {}
+        if channel and channel["dir"]:
+            levels = _expansion_levels(
+                channel["lo"], channel["hi"], channel["dir"], channel["extreme"], params
+            )
+        elif channel:
+            levels, zones = _channel_levels(
+                channel["lo"], channel["hi"], params, not channel["skipped"]
+            )
+        elif formation:
+            levels = _formation_levels(
+                formation["side"], formation["extreme"], formation["swing"], params
+            )
+        rows.append((bar, min(bar + H4, until), levels, zones))
+        bar += H4
+    _steps(view, rows, "Replayed from recorded events and 4h candles · display only")
 
 
-def _range(view, state, as_of, end):
+def _range(view, state, as_of, end, load_4h, since):
     machine = metadata(state.get("machine"))
     params = metadata(machine.get("params"))
     channel = metadata(machine.get("channel"))
@@ -258,6 +452,7 @@ def _range(view, state, as_of, end):
         mode=str(state.get("mode", "Unknown")),
         pending_exit=bool(state.get("closing")),
     )
+    current = as_of if as_of is not None and as_of < end else end
     if channel:
         eligible = channel.get("tradeable", True) and not channel.get("expanding")
         er = number(channel.get("er_at_confirm"))
@@ -274,32 +469,31 @@ def _range(view, state, as_of, end):
             else "Eligible channel",
         )
         if channel.get("expanding"):
-            extreme = number(channel.get("new_extreme"))
-            below = channel["expanding"] == -1
-            other = number(channel.get("hi" if below else "lo"))
-            if extreme is not None and other is not None:
-                _segment(view, "Expansion extreme (current)", "formation", as_of, end, extreme)
-                _segment(
+            lo, hi = number(channel.get("lo")), number(channel.get("hi"))
+            if lo is not None and hi is not None:
+                _steps(
                     view,
-                    "4h redraw close (current)",
-                    "formation",
-                    as_of,
-                    end,
-                    extreme + (other - extreme) / 3,
+                    [
+                        (
+                            current,
+                            end,
+                            _expansion_levels(
+                                lo,
+                                hi,
+                                -1 if channel["expanding"] == -1 else 1,
+                                number(channel.get("new_extreme")),
+                                params,
+                            ),
+                            {},
+                        )
+                    ]
+                    if end > current
+                    else [],
+                    "Derived from recorded state",
                 )
-                cap = number(params.get("max_width", 0.4))
-                if cap is not None:
-                    _segment(
-                        view,
-                        "Expansion width cap",
-                        "stop",
-                        as_of,
-                        end,
-                        other / (1 + cap) if below else other * (1 + cap),
-                    )
         else:
             _range_geometry(
-                view, channel.get("lo"), channel.get("hi"), as_of, end, params, eligible
+                view, channel.get("lo"), channel.get("hi"), current, end, params, eligible
             )
         confirmed = stamp(channel.get("confirmed_ts"))
         age_days = number(params.get("max_age_days", 120))
@@ -314,104 +508,77 @@ def _range(view, state, as_of, end):
                 confirmed,
                 confirmed + int(age_days * 86400),
                 origin="Derived schedule · not a fill",
+                layer="schedule",
             )
-    if setup:
-        side, extreme, swing = (
-            setup.get("side", 1),
-            number(setup.get("extreme")),
-            number(setup.get("swing")),
-        )
-        _segment(view, "Impulse extreme (current)", "formation", as_of, end, extreme)
-        if extreme is not None:
-            if setup.get("pulled") and swing is not None:
-                _segment(view, "Swing (current)", "formation", as_of, end, swing)
-                _segment(
-                    view,
-                    "4h confirmation close (current)",
-                    "formation",
-                    as_of,
+    if setup and end > current:
+        side = -1 if setup.get("side", 1) == -1 else 1
+        swing = number(setup.get("swing")) if setup.get("pulled") else None
+        _steps(
+            view,
+            [
+                (
+                    current,
                     end,
-                    swing + side * abs(extreme - swing) / 3,
+                    _formation_levels(side, number(setup.get("extreme")), swing, params),
+                    {},
                 )
-            else:
-                pullback = number(params.get("pullback", 0.08))
-                if pullback is not None:
-                    _segment(
-                        view,
-                        "Pullback threshold (current)",
-                        "formation",
-                        as_of,
-                        end,
-                        extreme * (1 - side * pullback),
-                    )
-    events = state.get("events", [])
-    events = events if isinstance(events, list) else []
-    # close_bar event timestamps describe the source candle start, not knowledge time.
-    close_events = {"pullback", "setup_cancel", "confirm", "redraw"}
-    edges, active_since, active_id, skipped = None, None, None, False
-    for event in events[-200:]:
+            ],
+            "Derived from recorded state",
+        )
+    raw = state.get("events", [])
+    events = []
+    for event in raw[-200:] if isinstance(raw, list) else []:
         if not isinstance(event, dict):
             continue
-        kind, t, detail = (
-            str(event.get("kind", "")),
-            stamp(event.get("ts")),
-            metadata(event.get("detail")),
-        )
-        if t is None:
+        kind, t = str(event.get("kind", "")), stamp(event.get("ts"))
+        if t is not None:
+            events.append((kind, t, metadata(event.get("detail"))))
+    if events:
+        # Every replayed level is reset by an event, so candles are only needed
+        # from the last event before the window (or the first retained event).
+        known = sorted(_range_known(*event) for event in events)
+        load_from = max((k for k in known if k <= since), default=known[0])
+        if current > load_from:
+            bars = {c["time"]: c for c in load_4h(load_from - load_from % H4, current)}
+            _range_history(view, events, params, bars, current)
+    for kind, t, detail in events:
+        if kind in {"impulse_signal", "state_migrated"}:
             continue
-        known = (
-            t + 14400
-            if kind in close_events or (kind == "range_end" and detail.get("reason") == "trend")
-            else t
-        )
-        if (
-            kind in {"confirm", "redraw", "break", "range_end", "chop_skip", "impulse"}
-            and edges
-            and active_since
-        ):
-            _range_geometry(view, *edges, active_since, known, params, not skipped)
-            active_since = known
-        if kind == "confirm":
-            edges = (detail.get("lo"), detail.get("hi"))
-            active_since, active_id, skipped = known, detail.get("id"), False
-        elif kind == "redraw":
-            edges = (detail.get("lo"), detail.get("hi"))
-            active_since = known
-        elif kind in {"break", "range_end", "impulse"}:
-            edges, active_since = None, None
-        elif kind == "chop_skip":
-            skipped = True
-        if kind not in {"impulse_signal", "state_migrated"}:
-            _marker(
-                view,
-                kind.replace("_", " ").title(),
-                kind,
-                t,
-                known,
-                detail.get("price", detail.get("extreme", detail.get("swing"))),
-                detail=" · ".join(
-                    f"{k}: {detail[k]}"
-                    for k in (
-                        "side",
-                        "id",
-                        "lo",
-                        "hi",
-                        "extreme",
-                        "swing",
-                        "er",
-                        "reason",
-                        "dir",
-                        "redraws",
-                    )
-                    if k in detail
-                ),
-            )
+        known = _range_known(kind, t, detail)
+        closed = known != t
         if kind == "pullback":
-            _marker(view, "Pullback swing", "pullback", t, known, detail.get("swing"))
-    if edges and active_since and channel.get("id") == active_id:
-        _range_geometry(view, *edges, active_since, min(as_of or end, end), params, not skipped)
+            price = detail.get("swing")
+        else:
+            price = detail.get("price", detail.get("extreme"))
+        _marker(
+            view,
+            kind.replace("_", " ").title(),
+            f"model_{kind}" if kind in {"entry", "exit"} else kind,
+            t,
+            known,
+            price,
+            detail=" · ".join(
+                f"{k}: {detail[k]}"
+                for k in (
+                    "side",
+                    "id",
+                    "lo",
+                    "hi",
+                    "extreme",
+                    "swing",
+                    "er",
+                    "reason",
+                    "dir",
+                    "redraws",
+                )
+                if k in detail
+            ),
+            layer="model" if kind in RANGE_MODEL_EVENTS else "diagnostic",
+            direction=detail.get("side") if kind == "impulse" else None,
+            closed=closed,
+        )
     view["coverage"]["warnings"].append(
-        "Range events retain at most 200 observations. Continuous swing/expansion extremes are unavailable; current formation levels start at the snapshot."
+        "Range events retain at most 200 observations. Formation and expansion levels between events are replayed from recorded 4h candles for display; the saved snapshot defines current levels."
     )
     if channel.get("tradeable") is False:
         view["coverage"]["warnings"].append(
@@ -441,6 +608,7 @@ def _range(view, state, as_of, end):
                 trade.get(action, trade.get(f"{action}_price")),
                 origin="Shadow · not funded",
                 slot="r0",
+                direction=trade.get("side"),
             )
     paper = metadata(state.get("paper_position"))
     if paper:
@@ -454,12 +622,13 @@ def _range(view, state, as_of, end):
             paper.get("entry"),
             origin="Shadow · not funded",
             slot="r0",
+            direction=paper.get("side"),
         )
         _segment(
             view,
             "Open shadow entry reference",
             "position",
-            as_of,
+            current,
             end,
             paper.get("entry"),
             origin="Current shadow snapshot · not funded",
@@ -470,7 +639,7 @@ def _range(view, state, as_of, end):
             view,
             "Current model entry reference",
             "position",
-            as_of,
+            current,
             end,
             holding.get("entry_price"),
             origin="Current model snapshot · see confirmed execution markers",
@@ -496,24 +665,30 @@ def _breakout(view, state, as_of, end):
         (stamp(c.get("ts")), number(c.get("close"))) for c in daily[-256:] if isinstance(c, dict)
     ]
     valid = [(t, c) for t, c in valid if t is not None and c is not None]
+    rows = []
     for i in range(19, len(valid)):
         window = valid[i - 19 : i + 1]
         if any(b[0] - a[0] != 86400 for a, b in pairwise(window)):
             continue
         start = valid[i][0] + 86400
-        for label, value in [
-            ("Prior 20-close upper boundary", max(x[1] for x in window)),
-            ("Prior 20-close lower boundary", min(x[1] for x in window)),
-        ]:
-            _segment(
-                view,
-                label,
-                "trigger",
-                start,
-                min(start + 86400, end),
-                value,
-                origin="Derived from saved daily candles · structure filters also required",
+        if start < end:
+            closes = [x[1] for x in window]
+            rows.append(
+                (
+                    start,
+                    min(start + 86400, end),
+                    {
+                        "Prior 20-close upper boundary": ("trigger", max(closes), True),
+                        "Prior 20-close lower boundary": ("trigger", min(closes), True),
+                    },
+                    {},
+                )
             )
+    _steps(
+        view,
+        rows,
+        "Derived from saved daily candles · structure filters also required",
+    )
     if campaign:
         origin = (
             "Historical model · not funded"
@@ -561,6 +736,7 @@ def _breakout(view, state, as_of, end):
                     price,
                     origin=unit_origin,
                     slot=slot,
+                    direction=campaign.get("side", 1),
                 )
         parent = units[0] if units and isinstance(units[0], dict) else {}
         entry, peak = number(parent.get("entry_price")), number(campaign.get("peak_favorable"))
@@ -596,6 +772,7 @@ def _breakout(view, state, as_of, end):
                     started,
                     started + days * 86400,
                     origin="Derived schedule · not a fill",
+                    layer="schedule",
                 )
         view["status"].update(
             campaign=str(campaign.get("campaign_id", "")),
@@ -609,14 +786,17 @@ def _breakout(view, state, as_of, end):
         if not isinstance(decision, dict):
             continue
         t, meta = stamp(decision.get("ts")), metadata(decision.get("metadata"))
+        signal = stamp(meta.get("signal_ts"))
         _marker(
             view,
             str(decision.get("reason", "Decision")),
             "decision",
-            stamp(meta.get("signal_ts")),
+            signal,
             t,
             meta.get("signal_close", decision.get("price")),
             origin="Recorded model decision · not a fill",
+            # Decisions follow the daily close of the signal candle.
+            closed=signal is not None and t is not None and signal < t,
         )
     view["coverage"]["warnings"].append(
         "Add-ons need a fresh same-side daily breakout, structure/direction/cap checks and ≤15% parent displacement; there is no fixed K-price ladder. Historical recovery peaks are not a recorded series."
@@ -644,10 +824,10 @@ def _ma(view, state, as_of, end, ma_tf, candles):
     if sma is None or ema is None or tol is None or completed is None:
         return
     for label, role, value in [
-        ("SMA20 (last completed)", "average", sma),
-        ("EMA21 (last completed)", "average", ema),
-        ("Up verdict threshold (last completed)", "trigger", max(sma, ema) * (1 + tol)),
-        ("Down verdict threshold (last completed)", "trigger", min(sma, ema) * (1 - tol)),
+        ("SMA20", "average", sma),
+        ("EMA21", "average", ema),
+        ("Up verdict threshold", "trigger", max(sma, ema) * (1 + tol)),
+        ("Down verdict threshold", "trigger", min(sma, ema) * (1 - tol)),
     ]:
         _segment(
             view,
@@ -671,41 +851,38 @@ def _ma(view, state, as_of, end, ma_tf, candles):
                 "origin": "Derived current decision thresholds",
             }
         )
-    closes = current.get("closes", [])
-    closes = [number(c) for c in closes[-64:]] if isinstance(closes, list) else []
+    # The live rule aggregates the same recorded minutes into right-labelled
+    # candles: SMA20, and EMA21 seeded with SMA21. Partial candles keep their
+    # last recorded close rather than leaving a hole in the averages.
     period = PERIODS[ma_tf]
-    bars_by_end = {c["close_time"]: c for c in candles}
+    closes = [(c["close_time"], c["close"]) for c in candles if c["close_time"] <= completed]
     points = {
         key: [] for key in ("SMA20", "EMA21", "Up verdict threshold", "Down verdict threshold")
     }
-    anchor = ema
-    # Invert the bounded saved close window, anchored at the recorded EMA.
-    # Only publish points whose completed candle is independently present/complete.
-    for i in range(len(closes) - 1, -1, -1):
-        if closes[i] is None:
-            break
-        t = completed - (len(closes) - 1 - i) * period
-        bar = bars_by_end.get(t)
-        recent = closes[max(0, i - 19) : i + 1]
-        if bar and bar["complete"] and abs(bar["close"] - closes[i]) < 1e-6:
-            points["EMA21"].append({"time": t, "value": anchor})
-            if len(recent) == 20 and all(c is not None for c in recent):
-                s = sum(recent) / 20
-                for key, value in [
-                    ("SMA20", s),
-                    ("Up verdict threshold", max(s, anchor) * (1 + tol)),
-                    ("Down verdict threshold", min(s, anchor) * (1 - tol)),
-                ]:
-                    points[key].append({"time": t, "value": value})
-        anchor = (anchor - closes[i] / 11) / (10 / 11)
+    average = None
+    for i in range(20, len(closes)):
+        t, close = closes[i]
+        s = sum(c for _, c in closes[i - 19 : i + 1]) / 20
+        average = (
+            sum(c for _, c in closes[i - 20 : i + 1]) / 21
+            if average is None
+            else close * (2 / 22) + average * (20 / 22)
+        )
+        for key, value in [
+            ("SMA20", s),
+            ("EMA21", average),
+            ("Up verdict threshold", max(s, average) * (1 + tol)),
+            ("Down verdict threshold", min(s, average) * (1 - tol)),
+        ]:
+            points[key].append({"time": t, "value": value})
     for label, values in points.items():
         view["series"].append(
             {
                 "label": label,
                 "role": "average" if label in {"SMA20", "EMA21"} else "trigger",
-                "points": list(reversed(values)),
+                "points": values,
                 "period": period,
-                "origin": "Derived saved-close window · anchored to recorded EMA; matched complete local candles",
+                "origin": "Recomputed from recorded candles · display only",
             }
         )
     down = {p["time"]: p["value"] for p in points["Down verdict threshold"]}
@@ -721,14 +898,19 @@ def _ma(view, state, as_of, end, ma_tf, candles):
                     "lower": down[t],
                     "upper": point["value"],
                     "eligible": True,
-                    "origin": "Derived saved-close decision thresholds",
+                    "origin": "Recomputed decision thresholds",
                 }
             )
+    last = points["EMA21"][-1] if points["EMA21"] else None
+    if last and last["time"] == completed and abs(last["value"] / ema - 1) > 0.0025:
+        view["coverage"]["warnings"].append(
+            f"Recomputed EMA21 differs from the saved indicator by {abs(last['value'] / ema - 1):.2%}; recorded minute gaps or seeded history differ from the live warm-up."
+        )
     view["coverage"]["warnings"].append(
         "MA uses a completed close above/below both averages by the tolerance, not an SMA/EMA crossover. Only directional verdict transitions act; FLAT alone is not an exit. Cooldown blocks replacement entries, not owned exits."
     )
     view["coverage"]["warnings"].append(
-        "MA history is a bounded display reconstruction, not an authoritative per-bar audit. Current thresholds describe the last decision; averages move at the next close."
+        "MA history is recomputed from recorded candles for display, not an authoritative per-bar audit. Levels after the last completed close are the saved indicator; averages move at the next close."
     )
 
 
@@ -754,15 +936,20 @@ def _execution_markers(view, db, owner, start, end, ma_tf):
             confirmed = row[1] == "filled" and action in {"open", "close", "external_close"}
             if confirmed:
                 kind = "entry" if action == "open" else "exit"
+                # Entries buy long / sell short; exits sell to close long / buy to close short.
+                buy = str(row[2]).lower() == "buy"
+                direction = (1 if buy else -1) if kind == "entry" else (-1 if buy else 1)
                 _marker(
                     view,
-                    f"Confirmed {kind} · {row[2]}",
+                    f"Confirmed {'long' if direction == 1 else 'short'} {kind} · {row[2]}",
                     kind,
                     t,
                     t,
                     row[5],
                     origin="Recorded execution",
                     slot=row[3],
+                    layer="execution",
+                    direction=direction,
                 )
             else:
                 _marker(
@@ -774,6 +961,7 @@ def _execution_markers(view, db, owner, start, end, ma_tf):
                     row[5],
                     origin="Order outcome · not a confirmed fill",
                     slot=row[3],
+                    layer="diagnostic",
                 )
     cols = _columns(db, "signals")
     if cols and "strategy_instance_id" in cols:
@@ -785,16 +973,29 @@ def _execution_markers(view, db, owner, start, end, ma_tf):
             t, meta = stamp(row[0]), metadata(row[4])
             if t is None or not start <= t < end or (owner == OWNERS["ma"] and row[3] != ma_tf):
                 continue
+            reason = str(row[2])
+            signal = stamp(meta.get("signal_ts"))
+            slot_period = PERIODS.get(str(row[3]))
+            # MA intents are stamped at the decision candle's right-labelled close.
+            closed = (signal is not None and signal < t) or bool(
+                slot_period and t % slot_period == 0
+            )
+            routine = any(
+                word in reason
+                for word in ("cool_off", "restart_state_aligned", "already_matches", "manual")
+            )
             _marker(
                 view,
-                str(row[2]),
+                reason,
                 "signal",
-                stamp(meta.get("signal_ts")),
+                signal,
                 t,
                 meta.get("signal_close", meta.get("close")),
                 origin="Recorded intent · not a fill",
                 slot=row[3],
                 detail=str(row[1]),
+                layer="diagnostic" if routine else "intent",
+                closed=closed,
             )
 
 
@@ -815,7 +1016,10 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
         db.execute("PRAGMA query_only=ON")
         # One transaction: market rows and overlays describe the same SQLite view.
         db.execute("BEGIN")
-        latest = db.execute("SELECT MAX(ts),MAX(id) FROM bars").fetchone()
+        # bars.ts is unindexed; recent ids bound the latest-minute lookup.
+        latest = db.execute(
+            "SELECT MAX(ts),MAX(id) FROM (SELECT ts,id FROM bars ORDER BY id DESC LIMIT 5000)"
+        ).fetchone()
         latest_ts = stamp(latest[0])
         state, as_of, run_id = _snapshot(db, owner)
         run = db.execute(
@@ -840,7 +1044,8 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
         fingerprint = (*fingerprint[:3], hash(fingerprint[3]), *fingerprint[4:])
         with _LOCK:
             cached = _CACHE.get(fingerprint)
-            if cached and time.monotonic() - cached[0] < 10:
+            # Content-addressed by bar/state/journal fingerprints; age only bounds memory.
+            if cached and time.monotonic() - cached[0] < CACHE_SECONDS:
                 _CACHE.move_to_end(fingerprint)
                 return copy.deepcopy(cached[1])
         end = min(
@@ -850,7 +1055,13 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
         end = end - end % 60
         start = end - days * 86400
         query_start = start - start % period
-        candles, missing = _candles(db, query_start, end, tf)
+        if strategy == "ma" and tf == ma_tf:
+            # One aggregation serves both the display and the indicator warm-up.
+            warm = _candles(db, query_start - MA_WARMUP * period, end, tf)[0]
+            candles = [c for c in warm if c["time"] >= query_start]
+            missing = max(0, (end - query_start) // 60 - sum(c["minutes"] for c in candles))
+        else:
+            candles, missing = _candles(db, query_start, end, tf)
         view = {
             "schema_version": 1,
             "strategy": strategy,
@@ -889,14 +1100,25 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
         else:
             try:
                 if strategy == "range":
-                    _range(view, state, as_of, end)
+                    _range(
+                        view,
+                        state,
+                        as_of,
+                        end,
+                        lambda a, b: (
+                            [c for c in candles if a <= c["time"] < b]
+                            if tf == "4h" and a >= query_start
+                            else _candles(db, a, b, "4h")[0]
+                        ),
+                        query_start,
+                    )
                 elif strategy == "breakout":
                     _breakout(view, state, as_of, end)
                 else:
                     ma_candles = (
-                        candles
+                        warm
                         if tf == ma_tf
-                        else _candles(db, query_start - 64 * PERIODS[ma_tf], end, ma_tf)[0]
+                        else _candles(db, query_start - MA_WARMUP * PERIODS[ma_tf], end, ma_tf)[0]
                     )
                     _ma(view, state, as_of, end, ma_tf, ma_candles)
             except (ValueError, TypeError, KeyError, OverflowError):
@@ -926,7 +1148,10 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
             (m for m in view["markers"] if start <= m["time"] < end), key=lambda m: m["time"]
         )[-MAX_MARKERS:]
         for series in view["series"]:
-            series["points"] = [p for p in series["points"] if start <= p["time"] <= end]
+            # Keep one point before the window so lines enter from the left edge.
+            series["points"] = [
+                p for p in series["points"] if start - series["period"] <= p["time"] <= end
+            ]
         warnings[:] = list(dict.fromkeys(warnings))
     with _LOCK:
         _CACHE[fingerprint] = (time.monotonic(), copy.deepcopy(view))
@@ -948,7 +1173,7 @@ def page(strategy="ma", tf="1d", days=30, ma_tf="1d", end=None) -> str:
 <label>Window <select name="days"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></label>
 <button type="button" id="chart-latest">Latest / reset zoom</button><span class="muted">Wheel to zoom · drag to pan</span>
 </form><div id="chart-layers" class="chart-controls" aria-label="Chart layers"></div>
-<p class="chart-key muted">▲ confirmed executions · ○ model observations, intents or order outcomes · hover for source · muted zones mean skipped entries</p>
+<p class="chart-key muted"><b class="up">▲</b> long entry · <b class="down">▼</b> short entry · <b>●</b> exit (ring = side) · <b class="model">△ ○</b> shadow/historical model, not funded · <b class="model">◆</b> model event · <b class="intent">○</b> intent · <b class="schedule">┊</b> schedule · grey dashed levels = entries skipped or paused · hover for source</p>
 <p id="chart-error" role="status"></p>
 <div class="chart-layout"><div class="chart-main"><div class="chart-canvas-wrap"><canvas id="chart-canvas" tabindex="0" aria-label="Price candles with strategy levels; use the level and event tables below for text"></canvas><div id="chart-tooltip" hidden></div></div><p id="chart-coverage" class="muted"></p></div>
 <aside class="chart-inspector"><h2>Latest saved state</h2><dl id="chart-status"></dl><h2>Visible levels</h2><div id="chart-levels"></div></aside></div>

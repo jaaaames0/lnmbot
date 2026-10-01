@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — Dashboard chart fidelity, overview top bar and render cost
+
+Source only; not deployed. Trading behavior, risk and the database schema are
+unchanged.
+
+- Charts: anchor markers to the candle that caused them instead of the next
+  candle boundary; draw price-less events above their candle rather than at the
+  chart top; direction-aware ▲/▼ entries and ● exits; separate execution, model,
+  intent, diagnostic (off by default) and schedule layers; hide intents already
+  shown as fills. Connect step levels, tag current levels on the price axis,
+  keep distant levels from flattening candles, and only flag candles missing
+  over 10% of their minutes.
+- Range: replay formation (impulse extreme, swing, thresholds) and expansion
+  (new extreme, redraw close, width cap) between retained events over recorded
+  4h candles, and keep broken channel edges visible until redraw. Replayed
+  values match the machine's recorded swing and redraw edges on the live copy.
+- MA: recompute SMA20/EMA21 and thresholds across the whole window from recorded
+  candles with an 80-candle warm-up, so partial candles no longer leave holes.
+  On the live copy the final values match the saved indicators within 0.01%.
+- Performance: aggregate chart candles in SQLite (90-day cold build about
+  350 ms to 150 ms); content-addressed chart cache kept 120 s; browser polling
+  15 s with requestAnimationFrame drawing. Bound the per-render market-context
+  query to recent bar ids (page renders roughly 3–4× faster).
+- Overview: funded net P&L and its window toggle move to the top bar on every
+  page and keep the current page; the runner/feed/entry strip is removed (shown
+  in the sidebar status, top bar Execution and Health).
+
 ## 2026-10-01 — Dashboard Overview and strategy charts
 
 Dashboard-only release `prod-20261001.2-g7709dd300b89`, source `7709dd300b89`,
