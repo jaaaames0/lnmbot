@@ -49,13 +49,15 @@ with the host firewall or change the unit to loopback. For a loopback listener,
 use `ssh -L 8082:127.0.0.1:8082 <bot-host>` and open
 `http://127.0.0.1:8082` locally. The dashboard shows account context, strategy
 positions, signals, funding, P&L, run configuration, and health. The top bar
-on every page carries price, equity and funded net P&L with its window toggle.
+on every page carries, left to right, execution state, price, funded net P&L
+with its window toggle, and equity.
 Overview gives each strategy a card with its current state, a positions table
 listing every fundable slot (flat or open, so its shape never changes) and the
-latest signals. Historical campaigns and shadow trades stay out of funded
+latest signals; MA slots read 4h then 1d. Historical campaigns and shadow trades stay out of funded
 positions. The sidebar links straight to `/strategies/ma`, `/strategies/breakout`
-and `/strategies/range`; each holds that strategy's detailed state, its slice of
-the run configuration, how it trades, its recent signals and its event log.
+and `/strategies/range`; each shows that strategy's state, its last five signals
+and events (linking to the Signals page filtered to that strategy), its slice of
+the run configuration as full-width rows, and how it trades.
 Health shows the active run, readiness, account-wide settings and hard risk
 limits. `/strategies` and `/runs` redirect to Overview and Health.
 
@@ -63,7 +65,18 @@ A *signal* is a decision to change exposure: an entry, exit or breakout
 parent/add-on decision, with its outcome (filled, rejected, blocked, suppressed
 by cooldown or model-only). A directional verdict that a cooldown suppressed is
 still a signal; moves to Flat, no-ops, restart alignment, range lifecycle and
-control changes are *events*, listed on the owning strategy's page.
+control changes are *events*, listed on the owning strategy's page. The
+Signals page lists signals only until "Show non-op events" is ticked, which
+merges events into the same table.
+
+The P&L page shows rolling and calendar account P&L, net P&L per strategy, and
+trade-quality and risk tables with a row for every strategy and breakout unit
+(k0–k3), traded or not. *Return on margin* divides each trade's net P&L by the
+isolated margin it posted and compounds it per slot: the return of an account
+holding only the margin it needed, unaffected by deposits or idle balance.
+Groups weight slots by average margin. After 30 days a strategy also shows an
+extrapolated CAGR, which assumes the period so far repeats and is not a
+forecast.
 
 `/charts` overlays strategy levels on recorded LN Markets candles over a 90-day
 window: MA on its 1d or 4h decision candles, breakout and range on 4h. A

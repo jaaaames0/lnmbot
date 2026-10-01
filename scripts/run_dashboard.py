@@ -2498,6 +2498,7 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
             {
                 "closed_at": closed_ts,
                 "opened_at": opened_ts,
+                "margin_sats": _margin_sats(opened),
                 "timeframe": opened.get("trigger_tf", "-"),
                 "strategy": opened.get("strategy", "legacy_ma"),
                 "slot": opened.get("slot", opened.get("trigger_tf", "-")),
@@ -2517,6 +2518,30 @@ def _closed_trade_components(db_path: Path) -> list[dict[str, object]]:
     return events
 
 
+def _margin_sats(opened: dict[str, object]) -> float:
+    """Isolated margin posted at entry: the most the trade could lose."""
+    notional_usd = float(opened.get("qty_sats") or opened.get("contracts") or 0)
+    leverage = float(opened.get("leverage") or 0)
+    entry = float(opened.get("price_usd") or opened.get("entry_price") or 0)
+    if notional_usd <= 0 or leverage <= 0 or entry <= 0:
+        return 0.0
+    return notional_usd / leverage / entry * 1e8
+
+
+PNL_GROUPS = ("MA 4h", "MA 1d", "Breakout", "Range")
+BREAKOUT_UNITS = tuple(f"Breakout k{unit}" for unit in range(4))
+
+
+def _pnl_group(strategy: object, timeframe: object) -> str:
+    if strategy == BREAKOUT_INSTANCE_ID:
+        return "Breakout"
+    if strategy == RANGE_INSTANCE_ID:
+        return "Range"
+    if strategy in {"ma_cross_primary", "legacy_ma"} and timeframe in TIMEFRAMES:
+        return f"MA {timeframe}"
+    return str(strategy or "Other")
+
+
 def _closed_trade_pnl_events(db_path: Path) -> list[tuple[datetime, int]]:
     return [
         (event["closed_at"], int(event["net"]))
@@ -2526,10 +2551,18 @@ def _closed_trade_pnl_events(db_path: Path) -> list[tuple[datetime, int]]:
 
 
 def _pnl_summary(
-    db_path: Path, positions: list[dict[str, object]], now: datetime | None = None
+    db_path: Path,
+    positions: list[dict[str, object]],
+    now: datetime | None = None,
+    group: str | None = None,
 ) -> list[dict[str, object]]:
     now = now or datetime.now(UTC)
     closed_events = _closed_trade_components(db_path)
+    if group is not None:
+        closed_events = [
+            e for e in closed_events if _pnl_group(e["strategy"], e["timeframe"]) == group
+        ]
+        positions = [p for p in positions if _pnl_group(p["strategy"], p["timeframe"]) == group]
     open_gross = sum(
         int(position["estimated_unrealized_sats"])
         for position in positions
@@ -2589,10 +2622,16 @@ def _constant_notional_pnl_summary(
     nominal_usd: float,
     btc_price: float | None,
     now: datetime | None = None,
+    group: str | None = None,
 ) -> list[dict[str, object]]:
     """Replay each trade at one USD notional, independent of actual sizing."""
     now = now or datetime.now(UTC)
     closed_events = _closed_trade_components(db_path)
+    if group is not None:
+        closed_events = [
+            e for e in closed_events if _pnl_group(e["strategy"], e["timeframe"]) == group
+        ]
+        positions = [p for p in positions if _pnl_group(p["strategy"], p["timeframe"]) == group]
     open_returns = _open_return_components(positions, btc_price)
     result: list[dict[str, object]] = []
     for key, label, window in (
@@ -2749,16 +2788,14 @@ def _strategy_performance_rows(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     events = sorted(_closed_trade_components(db_path), key=lambda event: event["closed_at"])
 
-    def group(strategy: object, timeframe: object) -> str:
-        if strategy == BREAKOUT_INSTANCE_ID:
-            return "Breakout units"
-        if strategy == RANGE_INSTANCE_ID:
-            return "Range"
-        if strategy in {"ma_cross_primary", "legacy_ma"} and timeframe in TIMEFRAMES:
-            return f"MA {timeframe}"
-        return str(strategy or "Other")
+    def member(label: str, strategy: object, timeframe: object, slot: object) -> bool:
+        if label == "Combined":
+            return True
+        if label in BREAKOUT_UNITS:
+            return strategy == BREAKOUT_INSTANCE_ID and f"Breakout {slot}" == label
+        return _pnl_group(strategy, timeframe) == label
 
-    labels = ("MA 1d", "MA 4h", "Breakout units", "Range", "Combined")
+    labels = ("MA 4h", "MA 1d", "Breakout", *BREAKOUT_UNITS, "Range", "Combined")
     open_started: dict[str, list[datetime]] = {label: [] for label in labels}
     grouped: dict[str, dict[str, dict[str, object]]] = {}
     for order in reversed(_orders(db_path, limit=None)):
@@ -2771,24 +2808,50 @@ def _strategy_performance_rows(
         if not opened or trade.get("close"):
             continue
         opened_at = _parse_ts(opened.get("ts"))
-        label = group(opened.get("strategy"), opened.get("trigger_tf"))
-        if opened_at and label in open_started:
-            open_started[label].append(opened_at)
+        for label in labels[:-1]:
+            if opened_at and member(
+                label, opened.get("strategy"), opened.get("trigger_tf"), opened.get("slot")
+            ):
+                open_started[label].append(opened_at)
 
     quality_rows: list[dict[str, object]] = []
     risk_rows: list[dict[str, object]] = []
     now = datetime.now(UTC)
     for timeframe in labels:
-        selected = (
-            events
-            if timeframe == "Combined"
-            else [
-                event
-                for event in events
-                if group(event["strategy"], event["timeframe"]) == timeframe
-            ]
-        )
+        selected = [
+            event
+            for event in events
+            if member(timeframe, event["strategy"], event["timeframe"], event["slot"])
+        ]
         if not selected:
+            # Keep every slot visible so the tables hold their shape before data arrives.
+            quality_rows.append(
+                {
+                    **dict.fromkeys(
+                        ("win_rate", "avg_winner", "avg_loser", "payoff_ratio", "profit_factor"),
+                        "-",
+                    ),
+                    "timeframe": timeframe,
+                    "closed_trades": 0,
+                }
+            )
+            risk_rows.append(
+                {
+                    **dict.fromkeys(
+                        (
+                            "avg_trade",
+                            "best_trade",
+                            "worst_trade",
+                            "max_closed_drawdown",
+                            "longest_streaks",
+                            "avg_hold",
+                            "time_in_market",
+                        ),
+                        "-",
+                    ),
+                    "timeframe": timeframe,
+                }
+            )
             continue
         nets: list[float] = (
             [float(event["net_return_pct"]) / 100 * nominal_usd for event in selected]
@@ -2876,6 +2939,104 @@ def _strategy_performance_rows(
             }
         )
     return quality_rows, risk_rows
+
+
+CAGR_MIN_DAYS = 30
+
+
+def _margin_return_rows(
+    db_path: Path,
+    positions: list[dict[str, object]],
+    denomination: str,
+    btc_price: float | None,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Balance-agnostic returns: each trade's net P&L over the isolated margin it posted.
+
+    Per slot, trade returns compound as if the slot's account held only its margin.
+    A group weights its slots by their average margin, so the figure is unchanged by
+    deposits or idle balance. Open positions count at their mark, net of entry fee
+    and funding so far.
+    """
+    now = now or datetime.now(UTC)
+    trades: list[tuple[datetime, str, str, int, float]] = []
+    for event in _closed_trade_components(db_path):
+        if isinstance(event.get("opened_at"), datetime) and event["margin_sats"] > 0:
+            group = _pnl_group(event["strategy"], event["timeframe"])
+            trades.append(
+                (
+                    event["opened_at"],
+                    group,
+                    str(event["slot"]),
+                    int(event["net"]),
+                    event["margin_sats"],
+                )
+            )
+    for position in positions:
+        opened_at = _parse_ts(position.get("entry_ts"))
+        mark = position.get("estimated_unrealized_sats")
+        margin = _margin_sats(position)
+        if opened_at is None or not isinstance(mark, int) or margin <= 0:
+            continue
+        net = (
+            mark
+            - int(position.get("opening_fee_sats") or 0)
+            - int(position.get("accumulated_funding_sats") or 0)
+        )
+        group = _pnl_group(position["strategy"], position["timeframe"])
+        trades.append((opened_at, group, str(position["slot"]), net, margin))
+    trades.sort(key=lambda trade: trade[0])
+    labels: list[tuple[str, set[str], str | None]] = [
+        ("MA 4h", {"MA 4h"}, None),
+        ("MA 1d", {"MA 1d"}, None),
+        ("MA cross", {"MA 4h", "MA 1d"}, None),
+        ("Breakout", {"Breakout"}, None),
+        *((label, {"Breakout"}, label.split()[1]) for label in BREAKOUT_UNITS),
+        ("Range", {"Range"}, None),
+        ("Account", set(PNL_GROUPS), None),
+    ]
+    rows: list[dict[str, object]] = []
+    for label, groups, unit in labels:
+        selected = [t for t in trades if t[1] in groups and (unit is None or t[2] == unit)]
+        if not selected:
+            rows.append(
+                {
+                    "strategy": label,
+                    "since": "-",
+                    "trades": 0,
+                    "net_pl": "-",
+                    "return_on_margin": "-",
+                    "extrapolated_cagr": "-",
+                }
+            )
+            continue
+        growth: dict[tuple[str, str], float] = {}
+        margins: dict[tuple[str, str], list[float]] = {}
+        for _, group, slot, net, margin in selected:
+            key = (group, slot)
+            growth[key] = growth.get(key, 1.0) * (1 + net / margin)
+            margins.setdefault(key, []).append(margin)
+        weights = {key: sum(values) / len(values) for key, values in margins.items()}
+        total = sum(growth[key] * weights[key] for key in growth) / sum(weights.values())
+        days = (now - selected[0][0]).total_seconds() / 86400
+        cagr = total ** (365 / days) - 1 if days >= CAGR_MIN_DAYS and total > 0 else None
+        rows.append(
+            {
+                "strategy": label,
+                "since": f"{selected[0][0]:%Y-%m-%d} · {days:.0f}d",
+                "trades": len(selected),
+                "net_pl": _format_signed_amount(
+                    sum(t[3] for t in selected), denomination, btc_price
+                ),
+                "return_on_margin": _signed_percent_html((total - 1) * 100),
+                "extrapolated_cagr": (
+                    _signed_percent_html(cagr * 100)
+                    if cagr is not None
+                    else f"< {CAGR_MIN_DAYS}d of data"
+                ),
+            }
+        )
+    return rows
 
 
 def _account_profitability_rows(
@@ -3094,7 +3255,7 @@ def _strategy_summaries(db_path, run, positions, price) -> str:
         )
 
     ma_lines = []
-    for tf in TIMEFRAMES:
+    for tf in reversed(TIMEFRAMES):
         owned = [
             p
             for p in positions
@@ -3118,7 +3279,7 @@ def _strategy_summaries(db_path, run, positions, price) -> str:
         ma_lines.append(
             f"{tf} · {owned[0]['side'] if owned else 'Flat'} · {verdict} verdict · {gate}"
         )
-    cards = [card("ma", "MA cross", "1d / 4h", ma_lines)]
+    cards = [card("ma", "MA cross", "4h / 1d", ma_lines)]
     state = _persisted_breakout_state(db_path)
     breakout = _breakout_context(state, positions)
     if cfg.get("strategy_breakout_enabled") or state or breakout["owned"]:
@@ -3189,15 +3350,16 @@ def _strategy_summaries(db_path, run, positions, price) -> str:
 
 
 def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
-    """One strategy: live state, its run configuration, rules, signals and events."""
-    signals, events = _activity(db_path)
+    """One strategy at a glance: state, latest signals and events, config, rules."""
+    signals, events = _activity(db_path, None if strategy == "ma" else strategy)
     return (
         _strategy_state(db_path, run, strategy, denomination, exchange)
+        + _table("Recent signals", _for_strategy(signals, strategy)[:5], SIGNAL_COLUMNS)
+        + f'<a class="activity-more" href="/signals?tf={strategy}">All signals →</a>'
+        + _table("Recent events", _for_strategy(events, strategy)[:5], EVENT_COLUMNS)
+        + f'<a class="activity-more" href="/signals?tf={strategy}&amp;events=1">All signals and events →</a>'
         + _active_config(run, strategy)
         + _strategy_explainer(run, strategy)
-        + _table("Recent signals", _for_strategy(signals, strategy)[:20], SIGNAL_DETAIL_COLUMNS)
-        + f'<a class="activity-more" href="/signals{"" if strategy == "ma" else "?tf=" + strategy}">All signals →</a>'
-        + _table("Recent events", _for_strategy(events, strategy)[:40], EVENT_COLUMNS)
     )
 
 
@@ -3256,7 +3418,7 @@ def _strategy_state(db_path, run, strategy, denomination, exchange) -> str:
                 levels.get(tf),
                 cooldowns[tf],
             )
-            for tf in TIMEFRAMES
+            for tf in reversed(TIMEFRAMES)
         )
         return heading + '<div class="cards">' + cards + "</div>"
     context = _breakout_context(_persisted_breakout_state(db_path), positions)
@@ -3275,6 +3437,13 @@ def _strategy_state(db_path, run, strategy, denomination, exchange) -> str:
 SIGNAL_COLUMNS = ("action_ts", "strategy", "slot", "event", "detail", "outcome")
 SIGNAL_DETAIL_COLUMNS = ("signal_ts", *SIGNAL_COLUMNS, "qualifiers")
 EVENT_COLUMNS = ("action_ts", "strategy", "slot", "event", "detail")
+SCOPE_LABELS = {
+    "1d": "MA 1d",
+    "4h": "MA 4h",
+    "ma": "MA cross",
+    "breakout": "Breakout",
+    "range": "Range",
+}
 
 
 def _slot_rows(
@@ -3286,7 +3455,7 @@ def _slot_rows(
     """Every funded slot the run can hold, flat or open, in a fixed order."""
     cfg = _metadata(run.get("config_json"))
     slots: list[tuple[set[str], str]] = [
-        ({"ma_cross_primary", "legacy_ma"}, tf) for tf in TIMEFRAMES
+        ({"ma_cross_primary", "legacy_ma"}, tf) for tf in reversed(TIMEFRAMES)
     ]
     if cfg.get("strategy_breakout_enabled") or BREAKOUT_INSTANCE_ID in _metadata(
         run.get("strategy_params_json")
@@ -3587,10 +3756,6 @@ def _topbar(
     available = exchange.available_sats if exchange else balance
     running_pl = exchange.running_pl_sats if exchange else local_unrealized
     margin_used = exchange.margin_used_sats if exchange else local_margin
-    account_as_of = (
-        exchange.fetched_at.isoformat() if exchange else str(snapshot.get("ts") or "unavailable")
-    )
-    account_source = "LN Markets" if exchange else "Local account snapshot / estimated mark"
     alignment, alignment_detail, alignment_class = _execution_alignment(
         db_path,
         positions,
@@ -3610,15 +3775,12 @@ def _topbar(
         or "<span>Awaiting enough history for price changes.</span>"
     )
     return (
+        f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
+        f"<strong>{html.escape(alignment)}</strong>"
+        f"<small>{html.escape(alignment_detail)}</small></div>"
         '<div class="topbar-market"><span>BTC/USD</span><div class="market-main"><strong data-live-price>'
         f"{f'${price:,.2f}' if price else 'Awaiting price'}</strong>"
         f"<div class=market-changes>{change_html}</div></div></div>"
-        '<div class="topbar-metric"><div class="equity-main"><span>Total equity</span><strong>'
-        f"{_amount_html(total, denomination, price)}</strong></div>"
-        '<div class="equity-main"><span>Mark P&amp;L</span><strong>'
-        f"{_signed_amount_html(running_pl, denomination, price)}</strong></div>"
-        f"<small>available {_amount_html(available, denomination, price)} · margin {_amount_html(margin_used, denomination, price)}"
-        f"<br>{html.escape(account_source)} · {html.escape(account_as_of)}</small></div>"
         + _pnl_card(
             _pnl_summary(db_path, positions),
             denomination,
@@ -3626,9 +3788,11 @@ def _topbar(
             price,
             pnl_href or (lambda key: f"/?denom={denomination}&pnl_window={key}"),
         )
-        + f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
-        f"<strong>{html.escape(alignment)}</strong>"
-        f"<small>{html.escape(alignment_detail)}</small></div>"
+        + '<div class="topbar-metric"><div class="equity-main"><span>Total equity</span><strong>'
+        f"{_amount_html(total, denomination, price)}</strong></div>"
+        '<div class="equity-main"><span>Mark P&amp;L</span><strong>'
+        f"{_signed_amount_html(running_pl, denomination, price)}</strong></div>"
+        f"<small>available {_amount_html(available, denomination, price)} · margin {_amount_html(margin_used, denomination, price)}</small></div>"
     )
 
 
@@ -3649,12 +3813,10 @@ def _active_config(run: dict[str, object], only: str | None = None) -> str:
 
     def group(title: str, rows: list[tuple[str, object]]) -> str:
         items = "".join(
-            f"<dt>{html.escape(label)}</dt><dd>{html.escape(str(setting))}</dd>"
+            f"<div><dt>{html.escape(label)}</dt><dd>{html.escape(str(setting))}</dd></div>"
             for label, setting in rows
         )
-        return (
-            f"<article class=config-group><h2>{html.escape(title)}</h2><dl>{items}</dl></article>"
-        )
+        return f"<div class=config-row><h2>{html.escape(title)}</h2><dl>{items}</dl></div>"
 
     def strategy_value(key: str, timeframe: str, *, percent: bool = False) -> object:
         raw = strategy.get(key)
@@ -3684,15 +3846,6 @@ def _active_config(run: dict[str, object], only: str | None = None) -> str:
     groups = {
         "ma": group("Sizing", sizing_rows)
         + group(
-            "4h CHOP overlay",
-            [
-                ("Enabled", "yes" if chop_enabled else "no"),
-                ("Lookback", value("strategy_chop_lookback")),
-                ("High threshold", value("strategy_chop_high_threshold")),
-                ("High-CHOP entry size", value("strategy_chop_high_size_multiplier")),
-            ],
-        )
-        + group(
             "Strategy rules",
             [
                 ("Tolerance", strategy_value("tolerance_pct", "1d", percent=True)),
@@ -3712,6 +3865,15 @@ def _active_config(run: dict[str, object], only: str | None = None) -> str:
                     "4h loss cooldown",
                     f"{strategy_value('loss_cooldown_threshold_pct', '4h', percent=True)} · {strategy_value('loss_cooldown_signal_count', '4h')} signals",
                 ),
+            ],
+        )
+        + group(
+            "4h CHOP overlay",
+            [
+                ("Enabled", "yes" if chop_enabled else "no"),
+                ("Lookback", value("strategy_chop_lookback")),
+                ("High threshold", value("strategy_chop_high_threshold")),
+                ("High-CHOP entry size", value("strategy_chop_high_size_multiplier")),
             ],
         ),
         "breakout": group(
@@ -3771,11 +3933,11 @@ def _active_config(run: dict[str, object], only: str | None = None) -> str:
     }
     if only is not None:
         return (
-            f"<section><h2>Configuration</h2><div class=config-grid>{groups[only]}</div></section>"
+            f"<section><h2>Configuration</h2><div class=config-table>{groups[only]}</div></section>"
         )
     range_on = str(config.get("strategy_range_mode") or "off") != "off"
     return (
-        "<section><h2>Active run configuration</h2><div class=config-grid>"
+        "<section><h2>Active run configuration</h2><div class=config-table>"
         + groups["ma"]
         + (groups["range"] if range_on else "")
         + groups["account"]
@@ -3903,6 +4065,10 @@ def _presentation_style() -> str:
 .config-group dl{grid-template-columns:auto minmax(0,1fr)}.config-group dt{white-space:nowrap}.config-group dd{min-width:0;overflow-wrap:anywhere}
 .activity-grid{grid-template-columns:minmax(0,2fr) minmax(240px,1fr);gap:0 1.2rem;align-items:start}.signals-activity{min-width:0}.signals-activity .table-wrap{max-width:100%}.topbar-alignment{display:flex;flex-direction:column;gap:.12rem;min-width:150px;max-width:290px;border-left:1px solid var(--border);padding-left:1rem}.topbar-alignment strong{font-size:.88rem}.topbar-alignment.healthy strong{color:var(--accent)}.topbar-alignment.alert strong{color:#f87171}.topbar-alignment.pending strong{color:#fbbf24}.topbar-alignment small{line-height:1.25}.signals-activity td:nth-child(5){white-space:normal;min-width:12rem}.stack-summary-row td:last-child{white-space:normal;min-width:11rem}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.topbar-alignment{border-left:0;padding-left:0}}
 .strategy-board{display:grid;grid-template-columns:minmax(390px,2fr) minmax(220px,1fr) minmax(220px,1fr);gap:.8rem;align-items:stretch}.strategy-group{min-width:0;display:flex;flex-direction:column}.strategy-group header{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;margin:0 0 .45rem;padding:0 .15rem;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}.strategy-group header b{color:var(--text)}.strategy-group .card{flex:1}.ma-slots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;flex:1}.ma-slots .card{min-width:0}@media(max-width:1300px){.strategy-board{grid-template-columns:repeat(2,minmax(0,1fr))}.ma-group{grid-column:1/-1}}@media(max-width:800px){.strategy-board{grid-template-columns:1fr}.ma-group{grid-column:auto}}@media(max-width:520px){.ma-slots{grid-template-columns:1fr}}
+.topbar>*+*{border-left:1px solid var(--border);padding-left:1rem}.topbar>.topbar-alignment{border-left:0;padding-left:0}@media(max-width:700px){.topbar>*+*{border-left:0;padding-left:0}}
+.config-table{border:1px solid var(--border);border-radius:7px;background:var(--surface)}.config-row{display:grid;grid-template-columns:11rem minmax(0,1fr);gap:1rem;padding:.7rem .9rem;border-bottom:1px solid var(--border)}.config-row:last-child{border-bottom:0}.config-row h2{margin:0;font-size:.72rem;align-self:center}.config-row dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.45rem 1rem;font-size:.8rem}.config-row dt{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.05em}.config-row dd{overflow-wrap:anywhere}@media(max-width:700px){.config-row{grid-template-columns:1fr;gap:.5rem}}
+.events-toggle{margin:-.4rem 0 .2rem;color:var(--muted);font-size:.8rem}.events-toggle label{display:inline-flex;align-items:center;gap:.4rem;cursor:pointer}.events-toggle input{accent-color:var(--accent)}
+.note{color:var(--muted);font-size:.75rem;line-height:1.5;margin:.5rem 0 0;max-width:76rem}
 </style>"""
 
 
@@ -3916,16 +4082,43 @@ def _detail_page(
     pnl_granularity: str = "daily",
     pnl_page: int = 1,
     pnl_basis: str = "actual",
+    show_events: bool = False,
 ) -> str:
     run_id = int(run["id"])
-    suffix = f" · {tf}" if tf else ""
+    suffix = f" · {SCOPE_LABELS.get(tf, tf)}" if tf else ""
     if page == "signals":
-        signals, _ = _activity(db_path, tf)
-        return _table("Signals" + suffix, signals, SIGNAL_DETAIL_COLUMNS) + (
-            "<p class=muted>Entries, exits and breakout decisions with their outcome, "
-            "including directional verdicts a cooldown suppressed. * Historical model "
-            "campaign; no funded order. Verdict changes and model lifecycle are listed "
-            "as events on each strategy page.</p>"
+        signals, events = _activity(db_path, None if tf == "ma" else tf)
+        rows = signals + events if show_events else signals
+        if tf == "ma":
+            rows = _for_strategy(rows, "ma")
+        if show_events:
+            rows.sort(
+                key=lambda row: _parse_ts(row["action_ts"]) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+        hidden = "".join(
+            f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+            for name, value in (("tf", tf), ("denom", denomination))
+            if value and value != "sats"
+        )
+        toggle = (
+            '<form class="events-toggle" method="get" action="/signals">'
+            f"{hidden}<label><input type=checkbox name=events value=1"
+            f'{" checked" if show_events else ""} onchange="this.form.submit()"> '
+            "Show non-op events</label></form>"
+        )
+        return (
+            toggle
+            + _table(
+                "Signals and events" + suffix if show_events else "Signals" + suffix,
+                rows,
+                SIGNAL_DETAIL_COLUMNS,
+            )
+            + (
+                "<p class=muted>Entries, exits and breakout decisions with their outcome, "
+                "including directional verdicts a cooldown suppressed. * Historical model "
+                "campaign; no funded order.</p>"
+            )
         )
     if page == "trades":
         price, _, _ = _market_context(db_path)
@@ -4037,6 +4230,28 @@ def _detail_page(
             }
             for row in calendar_rows
         ]
+
+        def money(value: float) -> SafeHtml | str:
+            if constant:
+                return _signed_usd_html(value)
+            return _format_signed_amount(value, denomination, price)
+
+        by_strategy = []
+        for group in (*PNL_GROUPS, None):
+            windows = (
+                _constant_notional_pnl_summary(db_path, positions, nominal_usd, price, group=group)
+                if constant
+                else _pnl_summary(db_path, positions, group=group)
+            )
+            by_strategy.append(
+                {
+                    "strategy": group or "Total",
+                    **{
+                        str(row["period"]).replace(" ", "_").lower(): money(row["net"])
+                        for row in windows
+                    },
+                }
+            )
         strategy_quality, strategy_risk = _strategy_performance_rows(
             db_path, denomination, price, nominal_usd if constant else None
         )
@@ -4077,6 +4292,29 @@ def _detail_page(
                 pnl_basis,
             )
             + "</div></div>"
+            + _table(
+                "Net P&L by strategy" + replay_label,
+                by_strategy,
+                ("strategy", "1_day", "7_days", "30_days", "all_time"),
+                compact=True,
+            )
+            + _table(
+                "Return on margin",
+                _margin_return_rows(db_path, positions, denomination, price),
+                (
+                    "strategy",
+                    "since",
+                    "trades",
+                    "net_pl",
+                    "return_on_margin",
+                    "extrapolated_cagr",
+                ),
+                compact=True,
+            )
+            + "<p class=note>Each trade's net P&amp;L over the isolated margin it posted, "
+            "compounded per slot: what an account holding only that margin would have made, "
+            "whatever the balance. Groups weight slots by average margin; open positions count "
+            f"at mark. CAGR extrapolates the period so far once it reaches {CAGR_MIN_DAYS} days.</p>"
             + _table(
                 "Strategy · trade quality" + replay_label,
                 strategy_quality,
@@ -4175,6 +4413,7 @@ def _render(
     pnl_page: int = 1,
     pnl_basis: str = "actual",
     chart_query: dict[str, str] | None = None,
+    show_events: bool = False,
 ) -> str:
     run: dict[str, object] | None = None
     exchange: ExchangeSnapshot | None = None
@@ -4207,7 +4446,7 @@ def _render(
                 "pnl": "P&L",
                 "health": "Health",
             }[page]
-            suffix = f" · {tf}" if tf else ""
+            suffix = f" · {SCOPE_LABELS.get(tf, tf)}" if tf else ""
             heading = (
                 '<div class="pnl-page-heading"><h1>P&amp;L</h1>'
                 + _pnl_basis_controls(denomination, pnl_granularity, pnl_basis)
@@ -4228,6 +4467,7 @@ def _render(
                     pnl_granularity,
                     pnl_page,
                     pnl_basis,
+                    show_events,
                 )
             )
     except sqlite3.Error as exc:
@@ -4250,6 +4490,8 @@ def _render(
                 query["pnl_basis"] = "constant"
         if target in filterable_pages and target_tf:
             query["tf"] = target_tf
+        if target == "signals" and page == "signals" and show_events:
+            query["events"] = "1"
         if target == "charts" and page == "charts":
             query.update(chart_query or {})
         return f"{path}?{urlencode(query)}" if query else path
@@ -4534,10 +4776,10 @@ def _handler(db_path: Path):
             }:
                 requested_tf = parse_qs(parsed.query).get("tf", [None])[0]
                 query = parse_qs(parsed.query)
+                scopes = (*TIMEFRAMES, "breakout", "range", *(("ma",) if page == "signals" else ()))
                 tf = (
                     requested_tf
-                    if page in {"signals", "trades"}
-                    and requested_tf in (*TIMEFRAMES, "breakout", "range")
+                    if page in {"signals", "trades"} and requested_tf in scopes
                     else None
                 )
                 denomination = query.get("denom", ["sats"])[0]
@@ -4572,6 +4814,7 @@ def _handler(db_path: Path):
                     }
                     if page == "charts"
                     else None,
+                    page == "signals" and query.get("events", [""])[0] == "1",
                 ).encode()
                 content_type = "text/html; charset=utf-8"
             else:

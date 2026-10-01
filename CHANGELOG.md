@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — Dashboard top bar, compact strategy pages and P&L by strategy
+
+Source only; not deployed.
+
+- Top bar reads execution, price, net P&L, equity; the account source and
+  fetch timestamp are gone.
+- Strategy pages: MA slots in ascending order (4h, 1d; also on Overview), last
+  five signals and events with links to the filtered Signals page,
+  configuration as full-width rows (MA: sizing, rules, 4h CHOP), rules last.
+- Signals page: "Show non-op events" merges events into the table; new MA cross
+  filter (`tf=ma`) and readable scope headings.
+- P&L: net P&L by strategy, every strategy and breakout unit listed in the
+  trade-quality and risk tables, and a balance-agnostic return on margin per
+  strategy and for the account with an extrapolated CAGR after 30 days.
+
 ## 2026-10-01 — Dashboard pages: strategies, signals and health
 
 Dashboard-only release `prod-20261001.5-g71e4d26ea09a`, source `71e4d26ea09a`,

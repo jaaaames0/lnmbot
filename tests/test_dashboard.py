@@ -751,6 +751,34 @@ def test_constant_notional_replay_normalizes_by_entry_size_and_includes_costs(tm
     assert "portfolio_return_pct" not in all_time
 
 
+def test_return_on_margin_ignores_trade_size_and_needs_history_to_annualise(tmp_path):
+    db_path = tmp_path / "normalized.sqlite"
+    _create_normalized_pnl_db(db_path)
+    dashboard = _dashboard_module()
+    # Both trades earn the same multiple of their posted margin; the second is ten
+    # times larger (as after a deposit) but the return on margin is unchanged.
+    per_trade = (18_182 - 100 - 100 - 50) / (100 / 5 / 50_000 * 1e8)
+    larger = (181_820 - 1_000 - 1_000 - 500) / (1_000 / 5 / 50_000 * 1e8)
+    assert larger == pytest.approx(per_trade)
+
+    def rows(now):
+        return {
+            row["strategy"]: row
+            for row in dashboard._margin_return_rows(db_path, [], "sats", None, now=now)
+        }
+
+    early = rows(dashboard.datetime(2026, 8, 5, tzinfo=dashboard.UTC))
+    total = (1 + per_trade) ** 2 - 1
+    assert early["MA 4h"]["trades"] == 2
+    assert early["MA 4h"]["return_on_margin"] == dashboard._signed_percent_html(total * 100)
+    assert early["Account"]["return_on_margin"] == early["MA 4h"]["return_on_margin"]
+    assert early["MA 4h"]["extrapolated_cagr"] == "< 30d of data"
+    assert early["Range"]["trades"] == 0 and early["Breakout k3"]["return_on_margin"] == "-"
+    later = rows(dashboard.datetime(2026, 9, 15, tzinfo=dashboard.UTC))
+    cagr = (1 + total) ** (365 / 45) - 1
+    assert later["MA 4h"]["extrapolated_cagr"] == dashboard._signed_percent_html(cagr * 100)
+
+
 def _create_multistrategy_dashboard_db(db_path, *, funded: bool) -> None:
     from lnmarkets_bot.persistence.db import init_schema, make_engine
 
@@ -899,6 +927,9 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     page = dashboard._render(db_path, "overview", None)
     assert "<span>Execution</span>" in page
     assert page.count('class="topbar-pnl"') == 1 and "<span>Net P&amp;L</span>" in page
+    # Execution, price, net P&L, equity; no account source or fetch timestamp.
+    bar = [page.index(f'class="topbar-{part}') for part in ("alignment", "market", "pnl", "metric")]
+    assert bar == sorted(bar) and "Local account snapshot" not in page
     trades = dashboard._render(db_path, "trades", "1d", pnl_window="30days")
     # The top-bar window toggles keep the current page and its filters.
     assert 'href="/trades?pnl_window=1day&amp;tf=1d"' in trades
@@ -1140,12 +1171,20 @@ def test_trade_quality_groups_breakout_units_by_strategy_not_daily_timeframe(tmp
         nominal_usd=dashboard.CONSTANT_NOTIONAL_USD,
     )
 
+    # Every strategy and breakout unit keeps a row, traded or not.
     assert [(row["timeframe"], row["closed_trades"]) for row in quality] == [
         ("MA 4h", 1),
-        ("Breakout units", 1),
+        ("MA 1d", 0),
+        ("Breakout", 1),
+        ("Breakout k0", 1),
+        ("Breakout k1", 0),
+        ("Breakout k2", 0),
+        ("Breakout k3", 0),
+        ("Range", 0),
         ("Combined", 2),
     ]
-    assert [row["timeframe"] for row in risk] == ["MA 4h", "Breakout units", "Combined"]
+    assert [row["timeframe"] for row in risk] == [row["timeframe"] for row in quality]
+    assert quality[1]["win_rate"] == "-" and risk[1]["avg_trade"] == "-"
     assert all("cumulative_return" not in row for row in quality)
     assert (
         len(
@@ -1204,6 +1243,17 @@ def test_strategy_pages_hold_their_config_and_retired_pages_redirect(tmp_path, m
     ma = dashboard._strategy_page(db_path, run, "ma", "sats", None)
     assert "<h2>Configuration</h2>" in ma and "4h CHOP overlay" in ma
     assert "Hard risk limits" not in ma and "<h2>Recent events</h2>" in ma
+    # At a glance: ascending slots, short activity tables, then config, then rules.
+    assert ma.index("<p>4h</p>") < ma.index("<p>1d</p>")
+    order = ("Recent signals", "Recent events", "<h2>Configuration</h2>", "<h2>Sizing</h2>")
+    order += ("<h2>Strategy rules</h2>", "<h2>4h CHOP overlay</h2>", "strategy-explainer")
+    assert [ma.index(marker) for marker in order] == sorted(ma.index(marker) for marker in order)
+    assert 'href="/signals?tf=ma"' in ma and 'href="/signals?tf=ma&amp;events=1"' in ma
+    signals = dashboard._render(db_path, "signals", "ma")
+    with_events = dashboard._render(db_path, "signals", "ma", show_events=True)
+    assert "Signals · MA cross" in signals and "Show non-op events" in signals
+    assert 'value="ma"' in signals and " checked " not in signals
+    assert "Signals and events · MA cross" in with_events and " checked " in with_events
     breakout = dashboard._strategy_page(db_path, run, "breakout", "sats", None)
     assert "Close-range breakout</h2>" in breakout and "4h CHOP overlay" not in breakout
     health = dashboard._render(db_path, "health", None)
