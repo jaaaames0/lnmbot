@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-01 — Range rule version 3 (tested width rule)
+
+Accepted trader and dashboard runtime: `prod-20260930.4-gccc5170a16a1`, source
+`ccc5170a16a1`, run 70, at 00:09 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-remediation-20260930T233839Z`. Release
+validation: **405 tests passed**, research parity 4/4, scoped Ruff clean, 3
+import contracts kept. Readiness passed before and after the encrypted backup;
+recovery was disarmed last. All owners restored, MA state identical, range
+channel/detector unchanged (choppy, ineligible), 40 orders, zero open trades.
+
+- Range rule version 3 restores the tested width rule: the 40% cap ends a
+  channel that expands beyond it, but a channel may confirm wider (as in the
+  research, after crash impulses). Version 1 and 2 snapshots restore unchanged.
+  The research parity suite again matches trade for trade (filtered 132 trades,
+  160.64%; unfiltered 188, 98.23%). An isolated liquidation that precedes the
+  4h-close stop blocks range re-entry for the rest of that 4h bar.
+
 ## 2026-09-30 — Funded range audit remediation
 
 Accepted trader and dashboard runtime: `prod-20260930.3-g9aac08e365ce`,
@@ -38,13 +55,6 @@ Dates are UTC. Dated entries record operational releases; `Unreleased` records
 source changes that have not been installed as a production release.
 
 ## Unreleased
-
-- Range rule version 3 restores the tested width rule: the 40% cap ends a
-  channel that expands beyond it, but a channel may confirm wider (as in the
-  research, after crash impulses). Version 1 and 2 snapshots restore unchanged.
-  The research parity suite again matches trade for trade (filtered 132 trades,
-  160.64%; unfiltered 188, 98.23%). An isolated liquidation that precedes the
-  4h-close stop blocks range re-entry for the rest of that 4h bar.
 
 ## 2026-09-30 — Impulse-range strategy funded
 
