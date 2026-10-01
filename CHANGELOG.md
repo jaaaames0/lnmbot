@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased — Dashboard capital page
+## 2026-10-01 — Dashboard capital page
 
-Source only; not deployed.
+Dashboard-only release `prod-20261001.7-ga81f3f2ea45f`, source `a81f3f2ea45f`,
+accepted at 23:41 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-capital-20261001T233659Z`. The trader
+stayed on `prod-20261001.1-g0b1650b10779` (PID 1671935, run 73 after the
+operator's 13:23 UTC configuration restart) with 41 orders and 41 fills
+unchanged. Validation: **430 tests passed**, scoped Ruff clean, 3 import
+contracts kept; concurrent load peaked at 126 MiB of the 160 MiB cap; LAN
+desktop/mobile checks, readiness, encrypted backup and monitor (**127/0/0**)
+passed; timed rollback was disarmed.
 
 - New Capital page (sidebar, System): next entry, leverage and margin at risk
   for every slot at current equity, with CHOP, taper and position-cap effects;
