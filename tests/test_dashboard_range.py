@@ -85,28 +85,25 @@ def _db_with_range(tmp_path, state, *, config=None, funded_position=False):
     return db_path
 
 
-def test_overview_shows_range_card_levels_shadow_book_and_events(tmp_path, shadow_state):
+def test_overview_compact_range_with_details_on_strategy_page(tmp_path, shadow_state):
     dashboard = _dashboard_module()
     db_path = _db_with_range(tmp_path, shadow_state)
     run = dashboard._active_run(db_path)
     overview = dashboard._overview(db_path, run, "sats", "7days", None)
     channel = shadow_state["machine"]["channel"]
 
-    assert "Range</b><span>post-impulse channel" in overview
-    assert "Impulse range · Shadow · no orders" in overview
+    assert 'data-strategy="range"' in overview
+    assert "Shadow · Flat" in overview
     assert f"Range #{channel['id']} active" in overview
-    assert "Buy ≤" in overview and "target" in overview
-    assert "Stop on 4h close beyond" in overview
-    assert "ER at confirmation" in overview
-    assert f"Shadow book: {shadow_state['paper_totals']['trades']} trades" in overview
-    assert "excluded from account totals" in overview
-    assert "<h2>Range shadow book</h2>" in overview
-    assert "<h2>Range events</h2>" in overview
-    latest = [e for e in shadow_state["events"] if e["kind"] != "impulse_signal"][-1]["kind"]
-    assert dashboard._RANGE_EVENT_LABELS[latest] in overview
+    assert "Buy ≤" not in overview and "Stop on 4h close beyond" not in overview
+    assert "<h2>Range shadow book</h2>" not in overview
+    assert "Funded positions · Flat" in overview
+    detail = dashboard._strategy_page(db_path, run, "range", "sats", None)
+    assert "Buy ≤" in detail and "Stop on 4h close beyond" in detail
+    assert "ER at confirmation" in detail
+    assert "<h2>Range shadow book</h2>" in detail
+    assert "excluded from account totals" in detail
     assert "Impulse signal" not in overview
-    active = overview.split("<h2>Active positions</h2>", 1)[1].split("<h2>Recent signals", 1)[0]
-    assert ">Range" in active and "stop close" in active
 
     context = dashboard._range_context(dashboard._persisted_range_state(db_path), [], 60_000.0)
     levels = context["levels"]

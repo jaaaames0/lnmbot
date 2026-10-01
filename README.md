@@ -48,7 +48,19 @@ The example dashboard unit binds port `8082` on all interfaces. Restrict it
 with the host firewall or change the unit to loopback. For a loopback listener,
 use `ssh -L 8082:127.0.0.1:8082 <bot-host>` and open
 `http://127.0.0.1:8082` locally. The dashboard shows account context, strategy
-positions, signals, funding, P&L, run configuration, and health.
+positions, signals, funding, P&L, run configuration, and health. Overview gives
+each enabled strategy a compact summary and lists funded positions separately
+from historical campaigns and shadow trades. `/strategies/ma`,
+`/strategies/breakout`, and `/strategies/range` hold the detailed state.
+
+`/charts` overlays strategy levels on recorded LN Markets candles, with 1d/4h
+views and a bounded one-day 1m inspection. It uses native Canvas, local assets
+and no JavaScript build step or chart price API. All three strategies contribute
+to the same read-only chart interface. Sources distinguish confirmed executions,
+intents, model events and shadow trades; partial candles and unavailable history
+are explicit. MA history is a bounded display reconstruction. Snapshots overwrite
+current state, so continuous range formation and historical recovery peaks are
+not available as complete series. This viewer makes no trader-side changes.
 
 Changing sizing or direction settings requires editing the trader env file
 and restarting its service. Existing venue positions are reconciled, not

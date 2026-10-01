@@ -18,6 +18,7 @@ def _dashboard_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module._EXCHANGE_CACHE.disabled = True  # Tests never consult venue credentials.
     return module
 
 
@@ -878,52 +879,28 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
 
     overview = dashboard._overview(db_path, run, "sats", "7days", None)
 
-    assert overview.count("position-card") == 3
-    assert "Cool-off active" in overview
-    assert "11 verdict changes left" in overview
-    assert "Historical campaign" in overview
-    assert "20260822L" in overview
+    assert overview.count('class="strategy-summary"') == 2
+    assert "winner cooldown 11" in overview
+    assert "Historical campaign" in overview and "20260822L" in overview
     assert "no funded units" in overview
-    assert "campaign · 4/4" in overview
-    assert "stack-toggle" in overview
-    assert "Recent breakout decisions" not in overview
-    assert "Four-unit cap" in overview
-    assert "Recent signals" in overview
-    assert "Latest MA 1d signals" not in overview
-    assert "Latest breakout signals" not in overview
-    assert "breakout parent" in overview
-    assert "ma daily" in overview
-    assert "Live strategy attribution" not in overview
-    assert "MA cross</b><span>1d / 4h" in overview
-    assert "Breakout</b><span>1d campaign" in overview
-    assert "Account</b><span>shared wallet" in overview
+    assert "Funded positions · Flat" in overview
+    assert "Recent activity" in overview
+    assert "Latest funding" not in overview and "stack-toggle" not in overview
+    assert "breakout parent" in overview and "ma daily" in overview
+    assert "/strategies/ma" in overview and "/charts?strategy=breakout" in overview
     page = dashboard._render(db_path, "overview", None)
-    assert 'class="strategy-board"' in page
     assert "<span>Execution</span>" in page
-    assert "Action needed" in page
-    assert "new breakout entries blocked" in page
-    assert "Breakout" in overview
-    active_positions = overview.split("<h2>Active positions</h2>", 1)[1].split(
-        "</div><div class=activity-grid>", 1
-    )[0]
-    recent_activity = overview.split("<h2>Recent signals</h2>", 1)[1].split(
-        "<h2>Latest funding</h2>", 1
-    )[0]
-    assert "Blocked by prior short" not in active_positions
-    assert "Four-unit cap" in recent_activity
-    assert "All signals →" in recent_activity
-    assert "MA cross" in recent_activity
-    assert "Breakout" in recent_activity
-    assert active_positions.count("<table>") == 1
-    assert active_positions.count('class="stack-unit-row"') == 4
-    assert "<th>Status</th>" not in active_positions
-    assert "paper" not in active_positions.lower()
-    assert "range close $72,968.00" in active_positions
-    assert "recovery close" not in active_positions
-    assert "<th>Signal close</th>" not in recent_activity
+    assert "Action needed" in page and "new breakout entries blocked" in page
+    detail = dashboard._strategy_page(db_path, run, "breakout", "sats", None)
+    assert "range close $72,968.00" in detail
+    assert detail.count('class="stack-unit-row"') == 4
+    assert "recovery close" not in detail
 
     rows = dashboard._position_status_rows(
-        [], {}, "sats", 85_000.0,
+        [],
+        {},
+        "sats",
+        85_000.0,
         dashboard._breakout_context(dashboard._persisted_breakout_state(db_path), []),
     )
     assert len(rows) == 3
@@ -1096,17 +1073,17 @@ def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):
     )
 
     assert "Long · 2/4 units" in overview
-    assert "20260923L · $200 notional" in overview
-    assert "campaign · 2/4" in overview
+    assert "20260923L" in overview
+    assert "<h2>Funded positions</h2>" in overview
+    assert ">k0<" in overview and ">k1<" in overview
+    assert "campaign · 2/4" not in overview
     assert len(status_rows) == 3
     campaign = next(row for row in status_rows if row["slot"] == "campaign")
     assert campaign["contracts"] == "$200"
     assert [row["slot"] for row in campaign["_children"]] == ["k0", "k1"]
     assert all(row["exit_trigger"] == "venue liq." for row in campaign["_children"])
     assert not any(row["strategy"] == "portfolio" for row in status_rows)
-    marked_positions = dashboard._open_positions(
-        db_path, dashboard._orders(db_path), 85_000.0
-    )
+    marked_positions = dashboard._open_positions(db_path, dashboard._orders(db_path), 85_000.0)
     marked_context = dashboard._breakout_context(
         dashboard._persisted_breakout_state(db_path), marked_positions
     )
@@ -1116,7 +1093,8 @@ def test_overview_shows_funded_breakout_campaign_and_both_owned_units(tmp_path):
     assert marked_campaign["entry_price"] == "$80,000.00"
     assert marked_campaign["mark_pnl"] == dashboard._format_signed_amount(
         sum(position["estimated_unrealized_sats"] for position in marked_positions),
-        "sats", 85_000.0,
+        "sats",
+        85_000.0,
     )
     assert len(dashboard._orders(db_path, tf="breakout")) == 2
     assert dashboard._orders(db_path, tf="1d") == []

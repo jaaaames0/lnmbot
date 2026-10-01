@@ -26,6 +26,7 @@ import websockets
 from lnmarkets_bot.api.account import AccountApi
 from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTradesApi
+from lnmarkets_bot.dashboard import charts
 from lnmarkets_bot.portfolio.store import read_overview
 
 TIMEFRAMES = ("1d", "4h")
@@ -162,9 +163,10 @@ class ExchangeSnapshotCache:
         self._snapshot: ExchangeSnapshot | None = None
         self._fetched_monotonic = 0.0
         self._lock = threading.Lock()
+        self.disabled = False
 
     def get(self) -> ExchangeSnapshot | None:
-        if not _dashboard_credentials_present():
+        if self.disabled or not _dashboard_credentials_present():
             return None
         with self._lock:
             if self._snapshot and time.monotonic() - self._fetched_monotonic < self._ttl_seconds:
@@ -1896,6 +1898,8 @@ def _signal_timeline_rows(
     tf: str | None,
     breakout_state: dict[str, object] | None,
     paper: dict[str, object] | None,
+    *,
+    include_model_events: bool = False,
 ) -> list[dict[str, object]]:
     """Give MA records and breakout decisions one compact event vocabulary."""
     rows: list[dict[str, object]] = []
@@ -2022,6 +2026,34 @@ def _signal_timeline_rows(
         else:
             row["slot"] = slots[0]
     rows = collapsed
+    if include_model_events and tf in {None, "range"}:
+        context = _range_context(_persisted_range_state(db_path), [], None)
+        for event in context["events"]:
+            kind = str(event.get("kind"))
+            if kind in {"impulse_signal", "entry", "exit", "paper_entry", "paper_exit"}:
+                continue
+            observed = _parse_ts(event.get("ts"))
+            if observed is None:
+                continue
+            detail = _metadata(event.get("detail"))
+            close_event = kind in {"pullback", "setup_cancel", "confirm", "redraw"} or (
+                kind == "range_end" and detail.get("reason") == "trend"
+            )
+            known = observed + timedelta(hours=4) if close_event else observed
+            display = _range_event_rows({"events": [event]}, 1)[0]
+            rows.append(
+                {
+                    "signal_ts": known.isoformat(),
+                    "action_ts": known.isoformat(),
+                    "strategy": "Range",
+                    "slot": "r0",
+                    "event": display["event"],
+                    "detail": display["detail"],
+                    "qualifiers": "Model observation · not a fill",
+                    "kind": "model",
+                    "source": "Model",
+                }
+            )
     # At a shared next-open timestamp, show the observed breakout before its
     # decision so the table reads in causal order despite newest-first dates.
     rows.sort(
@@ -2934,6 +2966,207 @@ def _strategy_accounting_panel(
     )
 
 
+def _strategy_summaries(db_path, run, positions, price) -> str:
+    """One compact presence per enabled owner; model references are never inventory."""
+    cfg = _metadata(run.get("config_json"))
+    cooldowns = _persisted_cooldowns(db_path)
+    ma_rows = _query(
+        db_path,
+        "SELECT state_json FROM strategy_state_snapshots WHERE mode='live' "
+        "AND strategy_name IN (?,?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+        ("ma_cross_primary", MA_STRATEGY_NAME, "ma_cross_primary"),
+    )
+    ma = _metadata(ma_rows[0]["state_json"]) if ma_rows else {}
+
+    def card(name, title, status, lines):
+        return (
+            f'<article class="strategy-summary" data-strategy="{name}"><header><h2>{title}</h2>'
+            f"<span>{html.escape(status)}</span></header>"
+            + "".join(f"<p>{html.escape(line)}</p>" for line in lines)
+            + f'<footer><a href="/strategies/{name}">Details →</a>'
+            f'<a href="/charts?strategy={name}">Chart →</a></footer></article>'
+        )
+
+    ma_lines = []
+    for tf in TIMEFRAMES:
+        owned = [
+            p
+            for p in positions
+            if p["strategy"] in {"ma_cross_primary", "legacy_ma"} and p["slot"] == tf
+        ]
+        verdict = _verdict_label(_metadata(_metadata(ma.get("timeframes")).get(tf)).get("verdict"))
+        cooldown = cooldowns[tf]
+        gate = (
+            f"winner cooldown {cooldown['winner']}"
+            if cooldown["winner"]
+            else f"loss cooldown {cooldown['loss']}"
+            if cooldown["loss"]
+            else "ready for next transition"
+        )
+        if _metadata(ma.get("manual_flat_hold")).get(tf):
+            gate = "manual flat hold"
+        if _metadata(ma.get("pending_position_reconciliation")).get(tf):
+            gate = "reconciliation pending"
+        if ma.get("engine_data_health"):
+            gate = "market evidence incomplete · entries blocked"
+        ma_lines.append(
+            f"{tf} · {owned[0]['side'] if owned else 'Flat'} · {verdict} verdict · {gate}"
+        )
+    cards = [card("ma", "MA cross", "1d / 4h", ma_lines)]
+    state = _persisted_breakout_state(db_path)
+    breakout = _breakout_context(state, positions)
+    if cfg.get("strategy_breakout_enabled") or state or breakout["owned"]:
+        campaign = breakout["campaign"]
+        count = len(breakout["owned"])
+        historical = isinstance(campaign, dict) and campaign.get("origin") == "historical"
+        status = (
+            "Historical campaign"
+            if historical
+            else f"{str(breakout['owned'][0]['side']).title()} · {count}/4 units"
+            if count
+            else "Flat"
+        )
+        lines = [f"Funded: {count} units · {_breakout_mode_label(breakout['direction_mode'])}"]
+        if isinstance(campaign, dict):
+            lines.append(
+                f"Model: {campaign.get('campaign_id', '—')} · day {campaign.get('held_days', 0)}"
+                + (" · no funded units" if historical and not count else "")
+            )
+            lines.append(
+                "New parent blocked by historical model"
+                if historical
+                else f"Daily-close exit boundary {_format_price(campaign.get('boundary'))}"
+            )
+        else:
+            lines.append("Watching completed daily closes")
+        if breakout.get("pending_exit"):
+            status = "Close pending"
+        elif not breakout.get("historical_model_complete", True):
+            status = "Model incomplete · entries blocked"
+        elif not _metadata((state or {}).get("machine")).get("historical_funding_available", True):
+            status = "Historical funding pending · entries paused"
+        cards.append(card("breakout", "Close-range breakout", status, lines))
+    state = _persisted_range_state(db_path)
+    mode = str(cfg.get("strategy_range_mode") or "off")
+    context = _range_context(state, positions, price, None if mode == "off" else mode)
+    if mode != "off" or state or context["owned"]:
+        status, detail = _range_status(context)
+        channel = context["channel"]
+        lines = [
+            f"{context['mode'].title()} · {'Funded position open' if context['owned'] else 'Flat'}",
+            detail,
+        ]
+        if isinstance(channel, dict) and channel.get("tradeable") is False:
+            status = (
+                "Chop skipped · Flat" if not context["owned"] else "Chop skipped · owned position"
+            )
+            er = channel.get("er_at_confirm")
+            threshold = context["params"].get("chop_threshold", 0.22)
+            lines.append(
+                f"Confirmation ER {float(er):.3f}"
+                if er is not None
+                else "Confirmation ER unavailable"
+            )
+            lines[-1] += f" · filter {threshold} · entries skipped for this channel"
+        elif isinstance(channel, dict):
+            lines.append(f"{int(channel.get('redraws') or 0)} redraws · channel levels in chart")
+        if context["closing"]:
+            status = "Close pending"
+        elif not context["model_complete"]:
+            status = "Model incomplete · entries blocked"
+        elif context["mode"] == "off":
+            status = "Disabled"
+        elif not context["entries_enabled"] and context["mode"] == "funded":
+            lines.append("Entries disabled · owned exits continue")
+        cards.append(card("range", "Impulse range", status, lines))
+    return '<div class="strategy-summaries">' + "".join(cards) + "</div>"
+
+
+def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
+    price, _, _ = _market_context(db_path)
+    positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
+    if strategy is None:
+        return "<h1>Strategies</h1>" + _strategy_summaries(db_path, run, positions, price)
+    title = {"ma": "MA cross", "breakout": "Close-range breakout", "range": "Impulse range"}[
+        strategy
+    ]
+    heading = f'<h1>{title}</h1><a class="activity-more" href="/charts?strategy={strategy}">Open strategy chart →</a>'
+    if strategy == "range":
+        mode = str(_metadata(run.get("config_json")).get("strategy_range_mode") or "off")
+        context = _range_context(
+            _persisted_range_state(db_path), positions, price, mode if mode != "off" else None
+        )
+        return (
+            heading
+            + _range_card(context, denomination, price)
+            + _table(
+                "Funded position",
+                [_range_position_row(context, denomination, price)],
+                ("side", "contracts", "entry_ts", "entry_price", "mark_pnl", "exit_trigger"),
+            )
+            + _table(
+                "Range shadow book",
+                _range_trade_rows(context),
+                (
+                    "entry_ts",
+                    "exit_ts",
+                    "range",
+                    "side",
+                    "entry_price",
+                    "exit_price",
+                    "reason",
+                    "net",
+                    "source",
+                ),
+            )
+            + _table(
+                "Range events (source candle timestamps)",
+                _range_event_rows(context, 200),
+                ("ts", "event", "detail"),
+            )
+        )
+    levels = _ma_levels(db_path, _strategy_tolerance(run))
+    if strategy == "ma":
+        cooldowns = _persisted_cooldowns(db_path)
+        cards = "".join(
+            _position_card(
+                tf,
+                next(
+                    (
+                        p
+                        for p in positions
+                        if p["strategy"] in {"legacy_ma", "ma_cross_primary"} and p["slot"] == tf
+                    ),
+                    None,
+                ),
+                denomination,
+                price,
+                levels.get(tf),
+                cooldowns[tf],
+            )
+            for tf in TIMEFRAMES
+        )
+        return (
+            heading
+            + '<p class="muted">Completed close above/below both averages by the tolerance; only directional verdict transitions act. Cooldown blocks replacement entries and preserves owned exits.</p>'
+            + '<div class="cards">'
+            + cards
+            + "</div>"
+        )
+    context = _breakout_context(_persisted_breakout_state(db_path), positions)
+    return (
+        heading
+        + _breakout_card(context, denomination, price)
+        + '<p class="muted">Add-ons require a fresh same-side daily breakout and admission checks; there is no fixed K-price ladder. Historical references are excluded from funded P&amp;L.</p>'
+        + _table(
+            "Campaign and unit detail",
+            _position_status_rows([], levels, denomination, price, context)[2:],
+            ("strategy", "slot", "side", "entry_ts", "exposure", "entry_price", "exit_watch"),
+        )
+        + _portfolio_panel()
+    )
+
+
 def _overview(
     db_path: Path,
     run: dict[str, object],
@@ -2941,163 +3174,65 @@ def _overview(
     pnl_window: str,
     exchange: ExchangeSnapshot | None,
 ) -> str:
-    price, _, _ = _market_context(db_path)
-    orders = _orders(db_path, limit=None)
-    positions = _open_positions(db_path, orders, price, exchange)
-    levels = _ma_levels(db_path, _strategy_tolerance(run))
-    breakout_state = _persisted_breakout_state(db_path)
-    breakout = _breakout_context(breakout_state, positions)
-    breakout_enabled = (
-        bool(_metadata(run.get("config_json")).get("strategy_breakout_enabled"))
-        or breakout_state is not None
-        or bool(breakout["owned"])
+    price, _, last_bar = _market_context(db_path)
+    positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
+    cfg = _metadata(run.get("config_json"))
+    entry_policy = (
+        "Enabled" if cfg.get("live_entries_enabled", True) else "Disabled · owned exits continue"
     )
-    range_state = _persisted_range_state(db_path)
-    range_mode = str(_metadata(run.get("config_json")).get("strategy_range_mode") or "off")
-    range_context = _range_context(
-        range_state, positions, price, None if range_mode == "off" else range_mode
-    )
-    range_enabled = range_mode != "off" or range_state is not None or bool(range_context["owned"])
     pnl = _pnl_summary(db_path, positions)
-    by_timeframe = {
-        str(position["timeframe"]): position
-        for position in positions
-        if position.get("strategy") in {"legacy_ma", "ma_cross_primary"}
-    }
-    cooldowns = _persisted_cooldowns(db_path)
-    ma_cards = "".join(
-        _position_card(
-            timeframe,
-            by_timeframe.get(timeframe),
-            denomination,
-            price,
-            levels.get(timeframe),
-            cooldowns[timeframe],
-        )
-        for timeframe in TIMEFRAMES
-    )
-    strategy_board = (
-        '<div class="strategy-board">'
-        '<section class="strategy-group ma-group"><header><b>MA cross</b><span>1d / 4h</span></header>'
-        f'<div class="ma-slots">{ma_cards}</div></section>'
-        + (
-            '<section class="strategy-group breakout-group"><header><b>Breakout</b>'
-            "<span>1d campaign</span></header>"
-            + _breakout_card(breakout, denomination, price)
-            + "</section>"
-            if breakout_enabled
-            else ""
-        )
-        + (
-            '<section class="strategy-group range-group"><header><b>Range</b>'
-            "<span>post-impulse channel</span></header>"
-            + _range_card(range_context, denomination, price)
-            + "</section>"
-            if range_enabled
-            else ""
-        )
-        + '<section class="strategy-group account-group"><header><b>Account</b>'
-        "<span>shared wallet</span></header>"
-        + _pnl_card(pnl, denomination, pnl_window, price)
-        + "</section></div>"
-    )
-    paper = _historical_paper_position(breakout, price) if breakout_enabled else None
-    recent_signals: list[dict[str, object]] = []
-    per_stream: dict[tuple[str, str], int] = {}
-    for signal in _signal_timeline_rows(db_path, None, breakout_state, paper):
-        stream = (
-            str(signal["strategy"]),
-            str(signal["slot"]) if signal["strategy"] == "MA cross" else "campaign",
-        )
-        if per_stream.get(stream, 0) >= 4:
-            continue
-        recent_signals.append(signal)
-        per_stream[stream] = per_stream.get(stream, 0) + 1
-        if len(recent_signals) == 10:
-            break
-    funding_rows = [
-        dict(row)
-        for row in _query(
-            db_path, "SELECT ts, trade_id, fee_sats FROM funding_fees ORDER BY id DESC LIMIT 5"
-        )
-    ]
-    owners = _trade_owners(orders)
-    funding_display = [
+    funded_rows = [
         {
-            "ts": row["ts"],
-            "strategy": _strategy_label(owners.get(str(row["trade_id"]), ("unknown", "-"))[0]),
-            "slot": owners.get(str(row["trade_id"]), ("unknown", "-"))[1],
-            "funding": _format_signed_amount(row["fee_sats"], denomination, price, invert=True),
+            "strategy": _strategy_label(str(p["strategy"])),
+            "slot": p["slot"],
+            "side": p["side"],
+            "notional": f"${int(p['contracts']):,}",
+            "entry_price": _format_price(p["entry_price"]),
+            "mark_pnl": _format_signed_amount(p["estimated_unrealized_sats"], denomination, price),
+            "source": p["pnl_source"],
         }
-        for row in funding_rows
+        for p in positions
     ]
-    return "".join(
-        (
-            "<h1>Operational overview</h1>",
-            strategy_board,
-            "<div class=overview-grid><div class=full-width>",
+    state = _persisted_breakout_state(db_path)
+    paper = _historical_paper_position(_breakout_context(state, positions), price)
+    recent = []
+    cooldown_shown = set()
+    for signal in _signal_timeline_rows(db_path, None, state, paper, include_model_events=True):
+        if (
+            "cool" in str(signal.get("reason", "")).lower()
+            or "cool" in str(signal["detail"]).lower()
+        ):
+            stream = (signal["strategy"], signal["slot"])
+            if stream in cooldown_shown:
+                continue
+            cooldown_shown.add(stream)
+        recent.append(signal)
+        if len(recent) == 6:
+            break
+    fresh = bool(last_bar and (datetime.now(UTC) - last_bar).total_seconds() <= 180)
+    health = (
+        f'<section class="execution-strip"><div><span>Runner</span><strong>{html.escape(str(run["status"]))} · run {run["id"]}</strong></div>'
+        f"<div><span>Recorded feed</span><strong>{'Fresh' if fresh else 'Stale / unavailable'}</strong><small>{html.escape(str(last_bar or '—'))}</small></div>"
+        f"<div><span>Entry policy</span><strong>{entry_policy}</strong><small>Execution admission shown above</small></div>"
+        '<a href="/health">Health details →</a></section>'
+    )
+    return (
+        '<h1>Operational overview</h1><div class="overview-account">'
+        + _pnl_card(pnl, denomination, pnl_window, price)
+        + '<p class="muted">Funded ledger + open mark, trading fees and funding. Historical campaigns and shadow trades stay separate. <a href="/pnl">P&amp;L details →</a></p></div>'
+        + health
+        + _strategy_summaries(db_path, run, positions, price)
+        + (
             _table(
-                "Active positions",
-                _position_status_rows(
-                    positions, levels, denomination, price, breakout if breakout_enabled else None
-                )
-                + (
-                    [_range_position_row(range_context, denomination, price)]
-                    if range_enabled
-                    else []
-                ),
-                (
-                    "strategy",
-                    "slot",
-                    "side",
-                    "entry_ts",
-                    "exposure",
-                    "entry_price",
-                    "mark_pnl",
-                    "funding",
-                    "exit_watch",
-                ),
-            ),
-            "</div><div class=activity-grid>",
-            '<div class="signals-activity">',
-            _table(
-                "Recent signals",
-                recent_signals,
-                ("signal_ts", "strategy", "slot", "event", "detail"),
-            ),
-            '<a class="activity-more" href="/signals">All signals →</a>',
-            "<p class=muted>* Historical paper campaign decision.</p>"
-            if any(signal["strategy"] == "Breakout*" for signal in recent_signals)
-            else "",
-            "</div>",
-            _table("Latest funding", funding_display, ("ts", "strategy", "slot", "funding")),
-            "</div></div>",
-            (
-                "<div class=activity-grid>"
-                + _table(
-                    "Range shadow book",
-                    _range_trade_rows(range_context),
-                    (
-                        "entry_ts",
-                        "exit_ts",
-                        "range",
-                        "side",
-                        "entry_price",
-                        "exit_price",
-                        "reason",
-                        "net",
-                        "source",
-                    ),
-                )
-                + _table(
-                    "Range events", _range_event_rows(range_context), ("ts", "event", "detail")
-                )
-                + "</div>"
-                if range_enabled
-                else ""
-            ),
-            _portfolio_panel(),
+                "Funded positions",
+                funded_rows,
+                ("strategy", "slot", "side", "notional", "entry_price", "mark_pnl", "source"),
+            )
+            if funded_rows
+            else '<section class="flat-inventory"><b>Funded positions · Flat</b><span>No owned venue positions in the ledger.</span></section>'
         )
+        + _table("Recent activity", recent, ("action_ts", "strategy", "slot", "event", "detail"))
+        + '<a class="activity-more" href="/signals">All signals and model observations →</a>'
     )
 
 
@@ -3119,6 +3254,13 @@ def _execution_alignment(
     breakout_enabled: bool = False,
 ) -> tuple[str, str, str]:
     """Summarize current reconciliation evidence without journaling a signal."""
+    pending_venue = getattr(exchange, "pending_trade_ids", ())
+    if pending_venue:
+        return (
+            "Action needed",
+            f"{len(pending_venue)} pending venue trade(s); inspect entry outcomes",
+            "alert",
+        )
     if _table_columns(db_path, "execution_commands"):
         unresolved = _query(
             db_path,
@@ -3295,6 +3437,11 @@ def _topbar(
     total = exchange.total_sats if exchange else balance + local_margin + local_unrealized
     available = exchange.available_sats if exchange else balance
     running_pl = exchange.running_pl_sats if exchange else local_unrealized
+    margin_used = exchange.margin_used_sats if exchange else local_margin
+    account_as_of = (
+        exchange.fetched_at.isoformat() if exchange else str(snapshot.get("ts") or "unavailable")
+    )
+    account_source = "LN Markets" if exchange else "Local account snapshot / estimated mark"
     alignment, alignment_detail, alignment_class = _execution_alignment(
         db_path,
         positions,
@@ -3321,7 +3468,8 @@ def _topbar(
         f"{_amount_html(total, denomination, price)}</strong></div>"
         '<div class="equity-main"><span>Mark P&amp;L</span><strong>'
         f"{_signed_amount_html(running_pl, denomination, price)}</strong></div>"
-        f"<small>available {_amount_html(available, denomination, price)}</small></div>"
+        f"<small>available {_amount_html(available, denomination, price)} · margin {_amount_html(margin_used, denomination, price)}"
+        f"<br>{html.escape(account_source)} · {html.escape(account_as_of)}</small></div>"
         f'<div class="topbar-alignment {alignment_class}"><span>Execution</span>'
         f"<strong>{html.escape(alignment)}</strong>"
         f"<small>{html.escape(alignment_detail)}</small></div>"
@@ -3575,7 +3723,9 @@ def _detail_page(
         return (
             _table(
                 "Signals" + suffix,
-                _signal_timeline_rows(db_path, tf, breakout_state, paper),
+                _signal_timeline_rows(
+                    db_path, tf, breakout_state, paper, include_model_events=True
+                ),
                 (
                     "signal_ts",
                     "strategy",
@@ -3826,6 +3976,7 @@ def _render(
     pnl_granularity: str = "daily",
     pnl_page: int = 1,
     pnl_basis: str = "actual",
+    chart_query: dict[str, str] | None = None,
 ) -> str:
     run: dict[str, object] | None = None
     exchange: ExchangeSnapshot | None = None
@@ -3840,6 +3991,14 @@ def _render(
             exchange = _EXCHANGE_CACHE.get()
             content = _presentation_style() + _overview(
                 db_path, run, denomination, pnl_window, exchange
+            )
+        elif page == "charts":
+            exchange = _EXCHANGE_CACHE.get()
+            content = _presentation_style() + charts.page()
+        elif page == "strategies" or page.startswith("strategies/"):
+            exchange = _EXCHANGE_CACHE.get()
+            content = _presentation_style() + _strategy_page(
+                db_path, run, page.split("/")[1] if "/" in page else None, denomination, exchange
             )
         else:
             exchange = _EXCHANGE_CACHE.get()
@@ -3894,10 +4053,16 @@ def _render(
                 query["pnl_basis"] = "constant"
         if target in filterable_pages and target_tf:
             query["tf"] = target_tf
+        if target == "charts" and page == "charts":
+            query.update(chart_query or {})
         return f"{path}?{urlencode(query)}" if query else path
 
     def nav_link(target: str, label: str, icon: str) -> str:
-        active = " active" if page == target else ""
+        active = (
+            " active"
+            if page == target or (target == "strategies" and page.startswith("strategies/"))
+            else ""
+        )
         return (
             f'<a class="nav-link{active}" href="{href(target)}">'
             f"<span class=nav-icon>{icon}</span>{html.escape(label)}</a>"
@@ -3946,11 +4111,37 @@ def _render(
         ".activity-grid .signals-activity .table-wrap{max-width:100%}"
         ".activity-more{display:inline-block;margin:.45rem 0;color:var(--accent);font-size:.75rem;text-decoration:none}</style>",
     )
+    template = template.replace(
+        "<span class=nav-label>Activity</span>",
+        nav_link("strategies", "Strategies", "◇")
+        + nav_link("charts", "Charts", "⌁")
+        + "<span class=nav-label>Activity</span>",
+    )
+    template = template.replace(
+        "</style>",
+        """
+.content{min-width:0;width:calc(100% - var(--sidebar-width))}.layout{width:100%}
+.strategy-summaries{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;margin-top:1.4rem}
+.strategy-summary{display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:1rem;min-width:0}
+.strategy-summary header{display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;margin-bottom:.7rem}.strategy-summary h2{margin:0;color:var(--text);font-size:.85rem}
+.strategy-summary header span{color:var(--accent);font-size:.75rem}.strategy-summary p{margin:.3rem 0;color:var(--muted);font-size:.78rem;overflow-wrap:anywhere}
+.strategy-summary footer{display:flex;gap:1rem;margin-top:auto;padding-top:.8rem}.strategy-summary a,.execution-strip a,.overview-account a{color:var(--accent);text-decoration:none}
+.execution-strip{display:flex;flex-wrap:wrap;align-items:center;gap:1rem 2rem;background:var(--surface);padding:1rem;border:1px solid var(--border);border-radius:7px}
+.execution-strip span,.execution-strip small{display:block;color:var(--muted);font-size:.72rem}.execution-strip strong{font-size:.8rem}
+.overview-account{display:flex;gap:1.2rem;align-items:center;margin:0 0 1rem}.overview-account .pnl-card{min-width:220px;flex-shrink:0}.overview-account p{max-width:44rem}
+.flat-inventory{display:flex;gap:1.5rem;margin-top:1.5rem;border:1px solid var(--border);border-radius:7px;padding:1rem}.flat-inventory span{color:var(--muted)}
+.topbar{flex-wrap:wrap}.topbar-metric{flex-wrap:wrap}.table-section{min-width:0}.table-wrap{max-width:100%}
+.overview-account~.table-section:last-of-type td:last-child{min-width:22rem}
+@media(max-width:1100px){.strategy-summaries{grid-template-columns:1fr}.strategy-summary footer{margin-top:.3rem}}
+@media(max-width:700px){.layout{flex-direction:column}.content{width:100%;padding:1rem}.overview-account,.flat-inventory{flex-direction:column;align-items:stretch}.topbar-market,.topbar-metric,.topbar-alignment{min-width:0;width:100%}.config-grid{grid-template-columns:1fr 1fr}}
+</style>""",
+    )
     refresh_script = """<script>
 (()=>{
   const sync=(current,next)=>{
     if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){current.replaceWith(next.cloneNode(true));return}
     if(current.nodeType===Node.TEXT_NODE){if(current.nodeValue!==next.nodeValue)current.nodeValue=next.nodeValue;return}
+    if(current.hasAttribute('data-preserve-chart'))return
     const wasOpen=current.nodeName==='DETAILS'&&current.hasAttribute('data-preserve-open')?current.open:null
     for(const attribute of [...current.attributes])if(!next.hasAttribute(attribute.name))current.removeAttribute(attribute.name)
     for(const attribute of [...next.attributes])if(current.getAttribute(attribute.name)!==attribute.value)current.setAttribute(attribute.name,attribute.value)
@@ -3996,6 +4187,7 @@ def _render(
   })
   syncStackRows()
   const refreshPrice=async()=>{
+    if(document.hidden)return
     try{
       const response=await fetch('/api/live-price',{cache:'no-store'})
       const tick=await response.json()
@@ -4043,6 +4235,8 @@ def _render(
                 query["pnl_basis"] = "constant"
         if page in filterable_pages and tf:
             query["tf"] = tf
+        if page == "charts":
+            query.update(chart_query or {})
         path = "/" if page == "overview" else f"/{page}"
         denomination_links.append(
             f'<a class="denom-toggle{" active" if denomination == value else ""}" '
@@ -4056,14 +4250,7 @@ def _render(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
-    args = parser.parse_args()
-    _PRICE_STREAM.start(os.getenv("LNM_DASHBOARD_WS_URL", "wss://stream.lnmarkets.com/v1"))
-
+def _handler(db_path: Path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -4074,7 +4261,7 @@ def main() -> None:
 
                 exchange = _EXCHANGE_CACHE.get()
                 readiness = inspect_readiness(
-                    args.db,
+                    db_path,
                     venue_ids=set(exchange.trades) if exchange else None,
                     venue_ts=exchange.fetched_at if exchange else None,
                     pending_ids=exchange.pending_trade_ids if exchange else (),
@@ -4091,6 +4278,23 @@ def main() -> None:
                     {"price": tick.price, "ts": tick.ts.isoformat()} if tick else {"price": None}
                 ).encode()
                 content_type = "application/json"
+            elif page == "api/chart":
+                try:
+                    payload = json.dumps(
+                        charts.chart_data(db_path, **charts.options(parse_qs(parsed.query))),
+                        allow_nan=False,
+                    ).encode()
+                except ValueError as exc:
+                    payload = json.dumps({"error": str(exc)}).encode()
+                    status_code = 400
+                except sqlite3.Error:
+                    payload = b'{"error":"Recorded chart data unavailable"}'
+                    status_code = 503
+                content_type = "application/json"
+            elif page in {"assets/dashboard_chart.css", "assets/dashboard_chart.js"}:
+                asset = page.split("/")[1]
+                payload = Path(charts.__file__).with_name(asset).read_bytes()
+                content_type = "text/css" if asset.endswith(".css") else "text/javascript"
             elif page in {
                 "overview",
                 "signals",
@@ -4099,6 +4303,11 @@ def main() -> None:
                 "pnl",
                 "runs",
                 "health",
+                "charts",
+                "strategies",
+                "strategies/ma",
+                "strategies/breakout",
+                "strategies/range",
             }:
                 requested_tf = parse_qs(parsed.query).get("tf", [None])[0]
                 query = parse_qs(parsed.query)
@@ -4125,7 +4334,7 @@ def main() -> None:
                 if pnl_basis not in {"actual", "constant"}:
                     pnl_basis = "actual"
                 payload = _render(
-                    args.db,
+                    db_path,
                     page,
                     tf,
                     denomination,
@@ -4133,6 +4342,13 @@ def main() -> None:
                     pnl_granularity,
                     pnl_page,
                     pnl_basis,
+                    {
+                        key: query[key][0]
+                        for key in ("strategy", "tf", "ma_tf", "days", "end")
+                        if key in query
+                    }
+                    if page == "charts"
+                    else None,
                 ).encode()
                 content_type = "text/html; charset=utf-8"
             else:
@@ -4141,14 +4357,33 @@ def main() -> None:
             self.send_response(status_code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(payload)
 
         def log_message(self, _format: str, *_args: object) -> None:
             return
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"dashboard listening on http://{args.host}:{args.port}")
+    return Handler
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable venue credentials and public price streaming for local previews",
+    )
+    args = parser.parse_args()
+    _EXCHANGE_CACHE.disabled = args.offline
+    if not args.offline:
+        _PRICE_STREAM.start(os.getenv("LNM_DASHBOARD_WS_URL", "wss://stream.lnmarkets.com/v1"))
+    server = ThreadingHTTPServer((args.host, args.port), _handler(args.db))
+    print(f"dashboard listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
 
 

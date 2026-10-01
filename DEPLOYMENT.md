@@ -340,6 +340,30 @@ default on hosts without that firewall boundary. The dashboard uses the
 separate key for authoritative account snapshots and a public WebSocket for
 the visual BTC/USD ticker; neither path can submit orders.
 
+The chart viewer at `/charts` reads only recorded candles and strategy snapshots.
+`/api/chart` provides the bounded display interface; chart JavaScript and CSS are
+served from fixed `/assets/dashboard_chart.*` routes. No node toolchain, new
+credentials or schema migration is required. Keep the package's local chart
+assets in dashboard release artifacts.
+
+Preview source changes against a consistent SQLite backup, with the copied file
+made read-only, without loading protected env files:
+
+```bash
+uv run python scripts/run_dashboard.py --offline \
+  --db /path/to/read-only-copy.sqlite --host 127.0.0.1 --port 8099
+```
+
+`--offline` disables venue credential use and the public price stream; account
+and execution labels reflect the copied evidence. Preview state ages normally.
+
+Dashboard deployment is a separate operation. For a dashboard-only change, use
+the host handbook's independent immutable dashboard release procedure and leave
+the trader release and process running. `scripts/deploy_range_remediation.py`
+restarts both services and is unsuitable for this purpose. Verify service paths,
+dashboard readiness and the unchanged trader PID/release before and after the
+change. Avoid the 00/04/08/12/16/20 UTC boundaries, including funding at 00/08/16.
+
 An optional, separately installed `lnmbot-breakout-shadow.service` and timer
 can advance an order-incapable daily breakout book from completed public
 Binance candles. Render its `@SHADOW_RELEASE_DIR@` placeholder before

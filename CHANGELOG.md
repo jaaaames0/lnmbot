@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — Dashboard Overview and strategy charts
+
+- Compact Overview with funded P&L, execution/feed/entry context, consistent
+  strategy summaries, funded inventory and six recent activity rows. Collapse
+  repeated cooldown activity and include range formation observations.
+- Move full MA, campaign, channel and shadow-book detail to strategy pages.
+- Add one native Canvas viewer and a bounded read-only JSON interface for MA,
+  breakout and range levels on 1d/4h candles or one-day 1m inspection. Preserve
+  zoom and layer choices during refresh; label timing, provenance and incomplete
+  history, including chop-skipped channels and model-only campaign units.
+- Add offline database-copy previews. No trader, strategy, risk, schema or live
+  deployment change is included.
+
 ## 2026-10-01 — Routine funding publication delay
 
 Accepted trader and dashboard runtime: `prod-20261001.1-g0b1650b10779`, source
