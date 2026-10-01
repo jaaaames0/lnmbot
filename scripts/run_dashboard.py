@@ -1957,6 +1957,7 @@ def _signal_timeline_rows(
                     ),
                     "detail": _signal_detail(signal["reason"], signal["metadata"]),
                     "reason": signal["reason"],
+                    "verdict": signal["metadata"].get("verdict"),
                     "qualifiers": " · ".join(qualifiers) or "-",
                 }
             )
@@ -2084,6 +2085,91 @@ def _signal_timeline_rows(
         reverse=True,
     )
     return rows
+
+
+SIGNAL_KINDS = {
+    "entry",
+    "entry_long",
+    "entry_short",
+    "exit",
+    "campaign_exit",
+    "paper_parent",
+    "paper_addon",
+    "historical_parent",
+    "historical_addon",
+    "reject",
+}
+STRATEGY_PAGES = {"ma": "MA cross", "breakout": "Breakout", "range": "Range"}
+_LABEL_INSTANCES = {
+    "MA cross": "ma_cross_primary",
+    "Breakout": BREAKOUT_INSTANCE_ID,
+    "Range": RANGE_INSTANCE_ID,
+}
+
+
+def _is_signal(row: dict[str, object]) -> bool:
+    """A signal is a decision to change exposure, acted on or not.
+
+    Entries, exits and breakout parent/add-on decisions count, as do directional
+    verdicts a cooldown suppressed and entries admission blocked. Moves to Flat,
+    no-ops, restart alignment, model lifecycle and control changes are events.
+    """
+    reason = str(row.get("reason") or "")
+    if reason in {"shadow_entry", "shadow_exit"}:
+        return False
+    if reason.startswith("cool_off"):
+        return row.get("verdict") in {"UP_TRUE", "DOWN_TRUE"}
+    # Historical-campaign replay rows are the model's own entries, exits and blocks.
+    return row.get("kind") in SIGNAL_KINDS or row.get("source") == "Replay"
+
+
+def _activity(
+    db_path: Path, tf: str | None = None
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Split the unified timeline into signals (with outcomes) and model events."""
+    breakout_state = _persisted_breakout_state(db_path)
+    price, _, _ = _market_context(db_path)
+    positions = _open_positions(db_path, _orders(db_path, limit=None), price, None)
+    paper = _historical_paper_position(_breakout_context(breakout_state, positions), price)
+    rows = _signal_timeline_rows(db_path, tf, breakout_state, paper, include_model_events=True)
+    orders: dict[str, list[tuple[datetime, str, str]]] = {}
+    for order in _orders(db_path, limit=None):
+        ts = _parse_ts(order["ts"])
+        if ts is not None:
+            orders.setdefault(str(order.get("strategy_instance_id") or ""), []).append(
+                (ts, str(order.get("position_key") or ""), str(order.get("status") or ""))
+            )
+    signals, events = [], []
+    for row in rows:
+        if not _is_signal(row):
+            events.append(row)
+            continue
+        reason, strategy = str(row.get("reason") or ""), str(row["strategy"])
+        if reason.startswith("cool_off"):
+            outcome = "Suppressed · cooldown"
+        elif row.get("kind") == "reject":
+            outcome = "Blocked"
+        elif strategy.endswith("*"):
+            outcome = "Model only · not funded"
+        else:
+            # The executor submits within moments of the decision; match its slot.
+            ts = _parse_ts(row["action_ts"])
+            slot = str(row.get("slot") or "").lower()
+            match = [
+                status
+                for when, key, status in orders.get(_LABEL_INSTANCES.get(strategy, ""), [])
+                if ts is not None
+                and -60 <= (when - ts).total_seconds() <= 900
+                and (key == slot or slot in {"", "-"} or "-" in slot)
+            ]
+            outcome = match[0].capitalize() if match else "No order"
+        signals.append({**row, "outcome": outcome})
+    return signals, events
+
+
+def _for_strategy(rows: list[dict[str, object]], strategy: str) -> list[dict[str, object]]:
+    label = STRATEGY_PAGES[strategy]
+    return [row for row in rows if str(row["strategy"]).startswith(label)]
 
 
 def _ma_levels(db_path: Path, tolerance_pct: float) -> dict[str, dict[str, object]]:
@@ -3103,10 +3189,21 @@ def _strategy_summaries(db_path, run, positions, price) -> str:
 
 
 def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
+    """One strategy: live state, its run configuration, rules, signals and events."""
+    signals, events = _activity(db_path)
+    return (
+        _strategy_state(db_path, run, strategy, denomination, exchange)
+        + _active_config(run, strategy)
+        + _strategy_explainer(run, strategy)
+        + _table("Recent signals", _for_strategy(signals, strategy)[:20], SIGNAL_DETAIL_COLUMNS)
+        + f'<a class="activity-more" href="/signals{"" if strategy == "ma" else "?tf=" + strategy}">All signals →</a>'
+        + _table("Recent events", _for_strategy(events, strategy)[:40], EVENT_COLUMNS)
+    )
+
+
+def _strategy_state(db_path, run, strategy, denomination, exchange) -> str:
     price, _, _ = _market_context(db_path)
     positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
-    if strategy is None:
-        return "<h1>Strategies</h1>" + _strategy_summaries(db_path, run, positions, price)
     title = {"ma": "MA cross", "breakout": "Close-range breakout", "range": "Impulse range"}[
         strategy
     ]
@@ -3139,11 +3236,6 @@ def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
                     "source",
                 ),
             )
-            + _table(
-                "Range events (source candle timestamps)",
-                _range_event_rows(context, 200),
-                ("ts", "event", "detail"),
-            )
         )
     levels = _ma_levels(db_path, _strategy_tolerance(run))
     if strategy == "ma":
@@ -3166,18 +3258,11 @@ def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
             )
             for tf in TIMEFRAMES
         )
-        return (
-            heading
-            + '<p class="muted">Completed close above/below both averages by the tolerance; only directional verdict transitions act. Cooldown blocks replacement entries and preserves owned exits.</p>'
-            + '<div class="cards">'
-            + cards
-            + "</div>"
-        )
+        return heading + '<div class="cards">' + cards + "</div>"
     context = _breakout_context(_persisted_breakout_state(db_path), positions)
     return (
         heading
         + _breakout_card(context, denomination, price)
-        + '<p class="muted">Add-ons require a fresh same-side daily breakout and admission checks; there is no fixed K-price ladder. Historical references are excluded from funded P&amp;L.</p>'
         + _table(
             "Campaign and unit detail",
             _position_status_rows([], levels, denomination, price, context)[2:],
@@ -3185,6 +3270,80 @@ def _strategy_page(db_path, run, strategy, denomination, exchange) -> str:
         )
         + _portfolio_panel()
     )
+
+
+SIGNAL_COLUMNS = ("action_ts", "strategy", "slot", "event", "detail", "outcome")
+SIGNAL_DETAIL_COLUMNS = ("signal_ts", *SIGNAL_COLUMNS, "qualifiers")
+EVENT_COLUMNS = ("action_ts", "strategy", "slot", "event", "detail")
+
+
+def _slot_rows(
+    run: dict[str, object],
+    positions: list[dict[str, object]],
+    denomination: str,
+    price: float | None,
+) -> list[dict[str, object]]:
+    """Every funded slot the run can hold, flat or open, in a fixed order."""
+    cfg = _metadata(run.get("config_json"))
+    slots: list[tuple[set[str], str]] = [
+        ({"ma_cross_primary", "legacy_ma"}, tf) for tf in TIMEFRAMES
+    ]
+    if cfg.get("strategy_breakout_enabled") or BREAKOUT_INSTANCE_ID in _metadata(
+        run.get("strategy_params_json")
+    ):
+        slots += [({BREAKOUT_INSTANCE_ID}, f"k{k}") for k in range(4)]
+    if str(cfg.get("strategy_range_mode") or "off") != "off":
+        slots.append(({RANGE_INSTANCE_ID}, "r0"))
+    rows = []
+    for owners, slot in slots:
+        position = next(
+            (p for p in positions if p["strategy"] in owners and str(p["slot"]) == slot), None
+        )
+        label = _strategy_label(sorted(owners)[-1])
+        if position is None:
+            rows.append(
+                {
+                    "strategy": label,
+                    "slot": slot,
+                    "side": "Flat",
+                    "notional": "-",
+                    "entry_price": "-",
+                    "mark_pnl": "-",
+                    "source": "-",
+                }
+            )
+            continue
+        rows.append(
+            {
+                "strategy": label,
+                "slot": slot,
+                "side": position["side"],
+                "notional": f"${int(position['contracts']):,}",
+                "entry_price": _format_price(position["entry_price"]),
+                "mark_pnl": _format_signed_amount(
+                    position["estimated_unrealized_sats"], denomination, price
+                ),
+                "source": position["pnl_source"],
+            }
+        )
+    # Positions in unexpected slots still appear rather than disappearing.
+    known = {(frozenset(o), s) for o, s in slots}
+    for position in positions:
+        if not any(position["strategy"] in o and str(position["slot"]) == s for o, s in known):
+            rows.append(
+                {
+                    "strategy": _strategy_label(str(position["strategy"])),
+                    "slot": position["slot"],
+                    "side": position["side"],
+                    "notional": f"${int(position['contracts']):,}",
+                    "entry_price": _format_price(position["entry_price"]),
+                    "mark_pnl": _format_signed_amount(
+                        position["estimated_unrealized_sats"], denomination, price
+                    ),
+                    "source": position["pnl_source"],
+                }
+            )
+    return rows
 
 
 def _overview(
@@ -3196,48 +3355,28 @@ def _overview(
 ) -> str:
     price, _, _ = _market_context(db_path)
     positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
-    funded_rows = [
-        {
-            "strategy": _strategy_label(str(p["strategy"])),
-            "slot": p["slot"],
-            "side": p["side"],
-            "notional": f"${int(p['contracts']):,}",
-            "entry_price": _format_price(p["entry_price"]),
-            "mark_pnl": _format_signed_amount(p["estimated_unrealized_sats"], denomination, price),
-            "source": p["pnl_source"],
-        }
-        for p in positions
-    ]
-    state = _persisted_breakout_state(db_path)
-    paper = _historical_paper_position(_breakout_context(state, positions), price)
-    recent = []
-    cooldown_shown = set()
-    for signal in _signal_timeline_rows(db_path, None, state, paper, include_model_events=True):
-        if (
-            "cool" in str(signal.get("reason", "")).lower()
-            or "cool" in str(signal["detail"]).lower()
-        ):
-            stream = (signal["strategy"], signal["slot"])
-            if stream in cooldown_shown:
+    signals, _ = _activity(db_path)
+    # Repeated cooldown suppressions on one slot collapse to the latest.
+    recent, suppressed = [], set()
+    for row in signals:
+        stream = (row["strategy"], row["slot"])
+        if str(row.get("outcome", "")).startswith("Suppressed"):
+            if stream in suppressed:
                 continue
-            cooldown_shown.add(stream)
-        recent.append(signal)
-        if len(recent) == 6:
+            suppressed.add(stream)
+        recent.append(row)
+        if len(recent) == 8:
             break
     return (
         "<h1>Operational overview</h1>"
         + _strategy_summaries(db_path, run, positions, price)
-        + (
-            _table(
-                "Funded positions",
-                funded_rows,
-                ("strategy", "slot", "side", "notional", "entry_price", "mark_pnl", "source"),
-            )
-            if funded_rows
-            else '<section class="flat-inventory"><b>Funded positions · Flat</b><span>No owned venue positions in the ledger.</span></section>'
+        + _table(
+            "Funded positions",
+            _slot_rows(run, positions, denomination, price),
+            ("strategy", "slot", "side", "notional", "entry_price", "mark_pnl", "source"),
         )
-        + _table("Recent activity", recent, ("action_ts", "strategy", "slot", "event", "detail"))
-        + '<a class="activity-more" href="/signals">All signals and model observations →</a>'
+        + _table("Recent signals", recent, SIGNAL_COLUMNS)
+        + '<a class="activity-more" href="/signals">All signals →</a>'
     )
 
 
@@ -3493,7 +3632,8 @@ def _topbar(
     )
 
 
-def _active_config(run: dict[str, object]) -> str:
+def _active_config(run: dict[str, object], only: str | None = None) -> str:
+    """Run configuration grouped by owner; `only` is ma, breakout, range or account."""
     config = _metadata(run.get("config_json"))
     strategy = _strategy_params(run)
     if not config:
@@ -3541,9 +3681,8 @@ def _active_config(run: dict[str, object]) -> str:
             )
         )
     chop_enabled = bool(config.get("strategy_4h_chop_reduce_enabled"))
-    return (
-        "<section><h2>Active run configuration</h2><div class=config-grid>"
-        + group("Sizing", sizing_rows)
+    groups = {
+        "ma": group("Sizing", sizing_rows)
         + group(
             "4h CHOP overlay",
             [
@@ -3574,21 +3713,49 @@ def _active_config(run: dict[str, object]) -> str:
                     f"{strategy_value('loss_cooldown_threshold_pct', '4h', percent=True)} · {strategy_value('loss_cooldown_signal_count', '4h')} signals",
                 ),
             ],
-        )
-        + (
-            group(
-                "Impulse range",
-                [
-                    ("Mode", value("strategy_range_mode")),
-                    ("Unit notional", value("strategy_range_unit_notional_usd")),
-                    ("Leverage", value("strategy_range_leverage")),
-                    ("Direction", value("strategy_range_direction_mode")),
-                    ("Chop filter", value("strategy_range_chop_filter")),
-                    ("Chop threshold", value("strategy_range_chop_threshold")),
-                ],
-            )
-            if str(config.get("strategy_range_mode") or "off") != "off"
-            else ""
+        ),
+        "breakout": group(
+            "Close-range breakout",
+            [
+                ("Enabled", "yes" if config.get("strategy_breakout_enabled") else "no"),
+                ("Unit notional", value("strategy_breakout_unit_notional_usd")),
+                ("Leverage", value("strategy_breakout_leverage")),
+                ("Direction", value("strategy_breakout_direction_mode")),
+                (
+                    "Seed campaign",
+                    Path(str(config.get("strategy_breakout_seed_campaign_path") or "-")).name,
+                ),
+                (
+                    "Seed daily candles",
+                    Path(str(config.get("strategy_breakout_seed_daily_path") or "-")).name,
+                ),
+            ],
+        ),
+        "range": group(
+            "Impulse range",
+            [
+                ("Mode", value("strategy_range_mode")),
+                ("Unit notional", value("strategy_range_unit_notional_usd")),
+                ("Leverage", value("strategy_range_leverage")),
+                ("Direction", value("strategy_range_direction_mode")),
+                ("Chop filter", value("strategy_range_chop_filter")),
+                ("Chop threshold", value("strategy_range_chop_threshold")),
+                (
+                    "Seed daily candles",
+                    Path(str(config.get("strategy_range_seed_daily_path") or "-")).name,
+                ),
+            ],
+        ),
+        "account": group(
+            "Account-wide",
+            [
+                (
+                    "Live entries",
+                    "enabled" if config.get("live_entries_enabled", True) else "disabled",
+                ),
+                ("Halted", "yes" if config.get("halted") else "no"),
+                ("Network", value("lnm_network")),
+            ],
         )
         + group(
             "Hard risk limits",
@@ -3600,13 +3767,24 @@ def _active_config(run: dict[str, object]) -> str:
                 ("Aggregate notional", value("risk_max_total_notional_usd")),
                 ("Aggregate margin", value("risk_max_total_margin_usd")),
             ],
+        ),
+    }
+    if only is not None:
+        return (
+            f"<section><h2>Configuration</h2><div class=config-grid>{groups[only]}</div></section>"
         )
+    range_on = str(config.get("strategy_range_mode") or "off") != "off"
+    return (
+        "<section><h2>Active run configuration</h2><div class=config-grid>"
+        + groups["ma"]
+        + (groups["range"] if range_on else "")
+        + groups["account"]
         + "</div></section>"
     )
 
 
-def _strategy_explainer(run: dict[str, object]) -> str:
-    """Describe all active strategy rules without exposing implementation jargon."""
+def _strategy_explainer(run: dict[str, object], only: str | None = None) -> str:
+    """Describe active strategy rules; `only` limits it to ma, breakout or range."""
     all_strategies = _metadata(run.get("strategy_params_json"))
     strategy = _strategy_params(run)
     config = _metadata(run.get("config_json"))
@@ -3687,8 +3865,7 @@ def _strategy_explainer(run: dict[str, object]) -> str:
             )
             + "</p>"
         )
-    return (
-        "<section class=strategy-explainer><h2>How the active strategies behave</h2>"
+    ma_note = (
         "<p><b>MA strategy:</b> the 1d and 4h timeframes operate independently, "
         "each with at most one isolated position. "
         f"After a completed candle, the bot is bullish only when the close is more than {tolerance:.2%} above both the 20-period SMA and 21-period EMA; "
@@ -3703,7 +3880,17 @@ def _strategy_explainer(run: dict[str, object]) -> str:
         f"{count('cooldown_signal_count', '1d')} winner or {count('loss_cooldown_signal_count', '1d')} loss changes on 1d, and "
         f"{count('cooldown_signal_count', '4h')} winner or {count('loss_cooldown_signal_count', '4h')} loss changes on 4h. "
         f"A slot is spent by {consumption}. An exposure-reducing close is still allowed during cool-off; only its replacement entry is suppressed.{chop_note}</p>"
-        f"{breakout_note}{range_note}"
+    )
+    notes = {"ma": ma_note, "breakout": breakout_note, "range": range_note}
+    if only is not None:
+        return (
+            f"<section class=strategy-explainer><h2>How it trades</h2>{notes[only]}</section>"
+            if notes[only]
+            else ""
+        )
+    return (
+        "<section class=strategy-explainer><h2>How the active strategies behave</h2>"
+        f"{ma_note}{breakout_note}{range_note}"
         "</section>"
     )
 
@@ -3713,6 +3900,7 @@ def _presentation_style() -> str:
 .page-header{display:none}:root{--sidebar-width:176px}html,body{font-size:12px}.brand{font-size:1.15rem}.brand-sub,.nav-label{font-size:.72rem}.nav-link{font-size:.9rem}.content{padding-top:1.7rem}h1{font-size:1.7rem}.cards{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.card strong{font-size:1.45rem}.card p,.card small{font-size:.8rem}table{font-size:.9rem}th{font-size:.72rem}.sat-symbol{font-style:normal;margin-left:.08em}.market-changes{display:flex;gap:.35rem;flex-wrap:wrap;color:var(--muted);font-size:.7rem;margin:.4rem 0}.market-changes b{color:var(--text);margin-right:.1rem}.sidebar-controls{display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;padding:0 .5rem}.sidebar-control-group{display:flex;flex-direction:column;gap:.35rem}.denom-controls{display:flex;gap:.35rem}.denom-toggle,.pnl-toggle,.period-toggle{border:1px solid var(--border-hover);border-radius:4px;color:var(--muted);padding:.18rem .42rem;text-decoration:none;font-size:.74rem}.denom-toggle:hover,.denom-toggle.active,.pnl-toggle:hover,.pnl-toggle.active,.period-toggle:hover,.period-toggle.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}.position-card.long{border-color:var(--accent)}.position-card.short{border-color:#f87171}.position-card.short strong{color:#f87171}.position-card.flat{opacity:.62}.pnl-card small{display:flex;gap:.3rem;align-items:center;flex-wrap:wrap}.overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1.2rem}.overview-grid .full-width{grid-column:1/-1}.overview-grid .full-width .table-wrap{width:100%}.activity-grid{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 1.2rem}.activity-grid .table-wrap{width:100%}.compact-table .table-wrap{width:max-content;max-width:100%}.compact-table table{width:auto}.copy-id{border:1px solid var(--border-hover);border-radius:3px;background:var(--surface-2);color:var(--muted);font:inherit;font-size:.72rem;padding:.08rem .3rem;cursor:pointer}.copy-id:hover{border-color:var(--accent);color:var(--accent)}.period-controls{display:flex;gap:.35rem;flex-wrap:wrap;margin:-.15rem 0 1rem}.pagination{display:flex;align-items:center;gap:.65rem;margin-top:.65rem;color:var(--muted)}.pagination a{color:var(--accent);text-decoration:none}.topbar{display:flex;align-items:center;gap:1.4rem;flex-wrap:wrap;border-bottom:1px solid var(--border);padding:0 0 1rem;margin-bottom:1.7rem}.topbar-status,.topbar-metric,.topbar-market{display:flex;flex-direction:column;gap:.1rem}.topbar-status{flex-direction:row;align-items:center;gap:.55rem;margin-right:auto}.topbar span{color:var(--muted);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase}.topbar b,.topbar strong{font-size:.92rem}.topbar small{color:var(--muted);font-size:.7rem}.status-dot{width:.58rem;height:.58rem;border-radius:99px;background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.12)}.status-dot.healthy{background:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:.8rem}.config-group{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.9rem}.config-group h2{margin:0 0 .6rem;font-size:.72rem}.config-group dl{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.38rem .7rem;font-size:.8rem}.config-group dt{color:var(--muted)}.config-group dd{text-align:right}.strategy-explainer{max-width:76rem}.strategy-explainer p{color:var(--muted);margin:.65rem 0;line-height:1.7}.strategy-explainer b{color:var(--text)}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.overview-grid,.config-grid{grid-template-columns:1fr}.topbar-status{margin-right:0;width:100%}}@media(max-width:700px){html,body{font-size:12px}.content{padding:1.25rem}.topbar{gap:.9rem}.topbar-status{width:100%}}
 .pnl-page-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.25rem}.pnl-page-heading h1{margin:0}.pnl-basis-actions{display:flex;align-items:center;justify-content:flex-end;gap:.4rem;flex-wrap:wrap}@media(max-width:700px){.pnl-page-heading{align-items:flex-start;flex-direction:column}.pnl-basis-actions{justify-content:flex-start}}
 .config-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+.config-group dl{grid-template-columns:auto minmax(0,1fr)}.config-group dt{white-space:nowrap}.config-group dd{min-width:0;overflow-wrap:anywhere}
 .activity-grid{grid-template-columns:minmax(0,2fr) minmax(240px,1fr);gap:0 1.2rem;align-items:start}.signals-activity{min-width:0}.signals-activity .table-wrap{max-width:100%}.topbar-alignment{display:flex;flex-direction:column;gap:.12rem;min-width:150px;max-width:290px;border-left:1px solid var(--border);padding-left:1rem}.topbar-alignment strong{font-size:.88rem}.topbar-alignment.healthy strong{color:var(--accent)}.topbar-alignment.alert strong{color:#f87171}.topbar-alignment.pending strong{color:#fbbf24}.topbar-alignment small{line-height:1.25}.signals-activity td:nth-child(5){white-space:normal;min-width:12rem}.stack-summary-row td:last-child{white-space:normal;min-width:11rem}@media(max-width:1100px){.activity-grid{grid-template-columns:1fr}.topbar-alignment{border-left:0;padding-left:0}}
 .strategy-board{display:grid;grid-template-columns:minmax(390px,2fr) minmax(220px,1fr) minmax(220px,1fr);gap:.8rem;align-items:stretch}.strategy-group{min-width:0;display:flex;flex-direction:column}.strategy-group header{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;margin:0 0 .45rem;padding:0 .15rem;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}.strategy-group header b{color:var(--text)}.strategy-group .card{flex:1}.ma-slots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;flex:1}.ma-slots .card{min-width:0}@media(max-width:1300px){.strategy-board{grid-template-columns:repeat(2,minmax(0,1fr))}.ma-group{grid-column:1/-1}}@media(max-width:800px){.strategy-board{grid-template-columns:1fr}.ma-group{grid-column:auto}}@media(max-width:520px){.ma-slots{grid-template-columns:1fr}}
 </style>"""
@@ -3732,27 +3920,12 @@ def _detail_page(
     run_id = int(run["id"])
     suffix = f" · {tf}" if tf else ""
     if page == "signals":
-        breakout_state = _persisted_breakout_state(db_path)
-        btc_price, _, _ = _market_context(db_path)
-        positions = _open_positions(db_path, _orders(db_path, limit=None), btc_price, exchange)
-        context = _breakout_context(breakout_state, positions)
-        paper = _historical_paper_position(context, btc_price)
-        return (
-            _table(
-                "Signals" + suffix,
-                _signal_timeline_rows(
-                    db_path, tf, breakout_state, paper, include_model_events=True
-                ),
-                (
-                    "signal_ts",
-                    "strategy",
-                    "slot",
-                    "event",
-                    "detail",
-                    "qualifiers",
-                ),
-            )
-            + "<p class=muted>* Historical paper campaign decision; no funded order.</p>"
+        signals, _ = _activity(db_path, tf)
+        return _table("Signals" + suffix, signals, SIGNAL_DETAIL_COLUMNS) + (
+            "<p class=muted>Entries, exits and breakout decisions with their outcome, "
+            "including directional verdicts a cooldown suppressed. * Historical model "
+            "campaign; no funded order. Verdict changes and model lifecycle are listed "
+            "as events on each strategy page.</p>"
         )
     if page == "trades":
         price, _, _ = _market_context(db_path)
@@ -3940,28 +4113,16 @@ def _detail_page(
             )
             + '<p class="note">Transfer scope: Lightning and on-chain only. Internal transfers and other account adjustments are excluded. This comparison is not strategy P&amp;L or a time-weighted return.</p>'
         )
-    if page == "runs":
-        active_details = [
-            {
-                "run": run_id,
-                "mode": run.get("mode", "-"),
-                "status": run.get("status", "-"),
-                "started_at": run.get("started_at", "-"),
-                "strategy": str(run.get("strategy_name", "-")).rsplit(".", maxsplit=1)[-1],
-            }
-        ]
-        return (
-            _table(
-                "Active run",
-                active_details,
-                ("run", "mode", "status", "started_at", "strategy"),
-                compact=True,
-            )
-            + _active_config(run)
-            + _strategy_explainer(run)
-        )
     if page == "health":
+        from lnmarkets_bot.operations.readiness import inspect_readiness
+
         price, _, last_bar = _market_context(db_path)
+        readiness = inspect_readiness(
+            db_path,
+            venue_ids=set(exchange.trades) if exchange else None,
+            venue_ts=exchange.fetched_at if exchange else None,
+            pending_ids=exchange.pending_trade_ids if exchange else (),
+        )
         risk_events = [
             dict(row)
             for row in _query(
@@ -3970,16 +4131,36 @@ def _detail_page(
                 (run_id,),
             )
         ]
-        health = [
+        active = [
             {
                 "run": run_id,
-                "status": run["status"],
+                "mode": run.get("mode", "-"),
+                "status": run.get("status", "-"),
+                "started_at": run.get("started_at", "-"),
                 "last_1m_bar": last_bar.isoformat() if last_bar else "-",
-                "btc_usd": price or "-",
+                "btc_usd": _format_price(price) if price else "-",
             }
         ]
-        return _table("Run health", health, ("run", "status", "last_1m_bar", "btc_usd")) + _table(
-            "Risk events", risk_events, ("ts", "kind", "detail_json")
+        checks = [
+            {
+                "readiness": "Ready" if readiness["ready"] else "Not ready",
+                "owners": ", ".join(readiness.get("owners") or []) or "-",
+                "errors": "; ".join(map(str, readiness.get("errors") or [])) or "-",
+                "pending": "; ".join(map(str, readiness.get("pending") or [])) or "-",
+            }
+        ]
+        return (
+            _table(
+                "Active run",
+                active,
+                ("run", "mode", "status", "started_at", "last_1m_bar", "btc_usd"),
+                compact=True,
+            )
+            + _table(
+                "Readiness", checks, ("readiness", "owners", "errors", "pending"), compact=True
+            )
+            + _active_config(run, "account")
+            + _table("Risk events", risk_events, ("ts", "kind", "detail_json"))
         )
     return "<h1>Not found</h1>"
 
@@ -4012,7 +4193,7 @@ def _render(
         elif page == "charts":
             exchange = _EXCHANGE_CACHE.get()
             content = _presentation_style() + charts.page()
-        elif page == "strategies" or page.startswith("strategies/"):
+        elif page.startswith("strategies/"):
             exchange = _EXCHANGE_CACHE.get()
             content = _presentation_style() + _strategy_page(
                 db_path, run, page.split("/")[1] if "/" in page else None, denomination, exchange
@@ -4024,7 +4205,6 @@ def _render(
                 "trades": "Trades",
                 "funding": "Funding",
                 "pnl": "P&L",
-                "runs": "Runs",
                 "health": "Health",
             }[page]
             suffix = f" · {tf}" if tf else ""
@@ -4075,11 +4255,7 @@ def _render(
         return f"{path}?{urlencode(query)}" if query else path
 
     def nav_link(target: str, label: str, icon: str) -> str:
-        active = (
-            " active"
-            if page == target or (target == "strategies" and page.startswith("strategies/"))
-            else ""
-        )
+        active = " active" if page == target else ""
         return (
             f'<a class="nav-link{active}" href="{href(target)}">'
             f"<span class=nav-icon>{icon}</span>{html.escape(label)}</a>"
@@ -4130,8 +4306,11 @@ def _render(
     )
     template = template.replace(
         "<span class=nav-label>Activity</span>",
-        nav_link("strategies", "Strategies", "◇")
-        + nav_link("charts", "Charts", "⌁")
+        nav_link("charts", "Charts", "⌁")
+        + "<span class=nav-label>Strategies</span>"
+        + nav_link("strategies/ma", "MA cross", "◇")
+        + nav_link("strategies/breakout", "Breakout", "◇")
+        + nav_link("strategies/range", "Range", "◇")
         + "<span class=nav-label>Activity</span>",
     )
     template = template.replace(
@@ -4263,7 +4442,7 @@ def _render(
         "{nav_link('trades', 'Trades', '⇄')}": nav_link("trades", "Trades", "⇄"),
         "{nav_link('funding', 'Funding', '₿')}": nav_link("funding", "Funding", "₿"),
         "{nav_link('pnl', 'P&L', '±')}": nav_link("pnl", "P&L", "±"),
-        "{nav_link('runs', 'Runs', '◌')}": nav_link("runs", "Runs", "◌"),
+        "{nav_link('runs', 'Runs', '◌')}": "",
         "{nav_link('health', 'Health', '✓')}": nav_link("health", "Health", "✓"),
         "{scope_links_html}": scope_links_html,
         "{topbar}": topbar,
@@ -4331,16 +4510,24 @@ def _handler(db_path: Path):
                 asset = page.split("/")[1]
                 payload = Path(charts.__file__).with_name(asset).read_bytes()
                 content_type = "text/css" if asset.endswith(".css") else "text/javascript"
+            elif page in {"strategies", "runs"}:
+                # Retired pages: strategy detail lives on the overview cards and
+                # sidebar; run configuration is split across strategy pages and Health.
+                target = "/" if page == "strategies" else "/health"
+                self.send_response(302)
+                self.send_header("Location", target + (f"?{parsed.query}" if parsed.query else ""))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             elif page in {
                 "overview",
                 "signals",
                 "trades",
                 "funding",
                 "pnl",
-                "runs",
                 "health",
                 "charts",
-                "strategies",
                 "strategies/ma",
                 "strategies/breakout",
                 "strategies/range",

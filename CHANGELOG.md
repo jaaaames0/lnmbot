@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — Dashboard pages: strategies, signals and health
+
+Source only; not deployed.
+
+- Overview: strategy cards, a positions table that always lists every fundable
+  slot (flat rows included) and recent signals with outcomes; repeated cooldown
+  suppressions on a slot collapse to the latest.
+- Signals now means decisions to change exposure, each with its outcome
+  (filled, rejected, blocked, suppressed by cooldown, model only). Verdict moves
+  to Flat, no-ops, restart alignment, range lifecycle and control changes are
+  events on each strategy page.
+- Strategy pages gain their own run configuration, rules, recent signals and
+  events; the sidebar links to each directly. `/strategies` redirects to
+  Overview.
+- Runs folds into Health (active run, readiness, account-wide settings and hard
+  risk limits); `/runs` redirects there.
+
 ## 2026-10-01 — Chart page panels
 
 Dashboard-only release `prod-20261001.4-g0f6fecf07e52`, source `0f6fecf07e52`,

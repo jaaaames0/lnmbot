@@ -50,9 +50,20 @@ use `ssh -L 8082:127.0.0.1:8082 <bot-host>` and open
 `http://127.0.0.1:8082` locally. The dashboard shows account context, strategy
 positions, signals, funding, P&L, run configuration, and health. The top bar
 on every page carries price, equity and funded net P&L with its window toggle.
-Overview gives each enabled strategy a compact summary and lists funded positions separately
-from historical campaigns and shadow trades. `/strategies/ma`,
-`/strategies/breakout`, and `/strategies/range` hold the detailed state.
+Overview gives each strategy a card with its current state, a positions table
+listing every fundable slot (flat or open, so its shape never changes) and the
+latest signals. Historical campaigns and shadow trades stay out of funded
+positions. The sidebar links straight to `/strategies/ma`, `/strategies/breakout`
+and `/strategies/range`; each holds that strategy's detailed state, its slice of
+the run configuration, how it trades, its recent signals and its event log.
+Health shows the active run, readiness, account-wide settings and hard risk
+limits. `/strategies` and `/runs` redirect to Overview and Health.
+
+A *signal* is a decision to change exposure: an entry, exit or breakout
+parent/add-on decision, with its outcome (filled, rejected, blocked, suppressed
+by cooldown or model-only). A directional verdict that a cooldown suppressed is
+still a signal; moves to Flat, no-ops, restart alignment, range lifecycle and
+control changes are *events*, listed on the owning strategy's page.
 
 `/charts` overlays strategy levels on recorded LN Markets candles over a 90-day
 window: MA on its 1d or 4h decision candles, breakout and range on 4h. A

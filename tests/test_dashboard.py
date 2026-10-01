@@ -6,6 +6,9 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import threading
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -885,8 +888,11 @@ def test_overview_shows_historical_breakout_without_counting_it_as_funded(tmp_pa
     assert "Model incomplete · entries blocked" in overview and "20260822L" in overview
     assert "execution-strip" not in overview and "pnl-card" not in overview
     assert "no funded units" in overview
-    assert "Funded positions · Flat" in overview
-    assert "Recent activity" in overview
+    # Every fundable slot is listed even when flat, so the table keeps its shape.
+    assert "<h2>Funded positions</h2>" in overview
+    for slot in ("1d", "4h", "k0", "k1", "k2", "k3"):
+        assert f"<td>{slot}</td>" in overview
+    assert "Recent signals" in overview and "Recent activity" not in overview
     assert "Latest funding" not in overview and "stack-toggle" not in overview
     assert "breakout parent" in overview and "ma daily" in overview
     assert "/strategies/ma" in overview and "/charts?strategy=breakout" in overview
@@ -1170,3 +1176,55 @@ def test_trade_ledger_and_fixed_pnl_controls(tmp_path):
     assert "pnl_basis=constant" in controls
     assert "nominal_usd" not in controls
     assert "USD per trade" not in controls
+
+
+def test_signals_are_exposure_decisions_and_the_rest_are_events():
+    dashboard = _dashboard_module()
+    assert dashboard._is_signal({"kind": "entry", "reason": "4h MA-cross ↑ flip to long"})
+    assert dashboard._is_signal({"kind": "reject", "reason": "addon_cap"})
+    assert dashboard._is_signal({"kind": "decision", "source": "Replay"})
+    # A cooldown only suppresses a signal when the new verdict would open or flip.
+    assert dashboard._is_signal({"kind": "noop", "reason": "cool_off", "verdict": "UP_TRUE"})
+    assert not dashboard._is_signal({"kind": "noop", "reason": "cool_off", "verdict": "FLAT"})
+    for row in (
+        {"kind": "noop", "reason": "verdict_flat"},
+        {"kind": "noop", "reason": "restart_state_aligned"},
+        {"kind": "model", "source": "Model"},
+        {"kind": "control", "source": "Decision", "reason": "direction_mode_changed"},
+        {"kind": "entry", "reason": "shadow_entry"},
+    ):
+        assert not dashboard._is_signal(row)
+
+
+def test_strategy_pages_hold_their_config_and_retired_pages_redirect(tmp_path, monkeypatch):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=False)
+    dashboard = _dashboard_module()
+    run = dashboard._active_run(db_path)
+    ma = dashboard._strategy_page(db_path, run, "ma", "sats", None)
+    assert "<h2>Configuration</h2>" in ma and "4h CHOP overlay" in ma
+    assert "Hard risk limits" not in ma and "<h2>Recent events</h2>" in ma
+    breakout = dashboard._strategy_page(db_path, run, "breakout", "sats", None)
+    assert "Close-range breakout</h2>" in breakout and "4h CHOP overlay" not in breakout
+    health = dashboard._render(db_path, "health", None)
+    for heading in ("Active run", "Readiness", "Account-wide", "Hard risk limits"):
+        assert heading in health
+    assert 'href="/runs' not in health and 'href="/strategies"' not in health
+    for target in ("/strategies/ma", "/strategies/breakout", "/strategies/range"):
+        assert f'href="{target}"' in health
+
+    monkeypatch.setattr(dashboard._EXCHANGE_CACHE, "disabled", True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard._handler(db_path))
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        for path, location in (("/strategies", "/"), ("/runs?denom=usd", "/health?denom=usd")):
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            assert response.status == 302 and response.getheader("Location") == location
+            connection.close()
+    finally:
+        server.shutdown()
+        worker.join(timeout=5)
+        server.server_close()

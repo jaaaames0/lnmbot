@@ -97,7 +97,7 @@ def test_overview_compact_range_with_details_on_strategy_page(tmp_path, shadow_s
     assert f"Range #{channel['id']} active" in overview
     assert "Buy ≤" not in overview and "Stop on 4h close beyond" not in overview
     assert "<h2>Range shadow book</h2>" not in overview
-    assert "Funded positions · Flat" in overview
+    assert "<h2>Funded positions</h2>" in overview and "<td>r0</td>" in overview
     detail = dashboard._strategy_page(db_path, run, "range", "sats", None)
     assert "Buy ≤" in detail and "Stop on 4h close beyond" in detail
     assert "ER at confirmation" in detail
@@ -178,8 +178,13 @@ def test_range_signals_filter_and_labels(tmp_path, shadow_state):
     assert rows[0]["detail"] == "range #7 · Midpoint target · +1.25%"
     assert rows[1]["detail"] == "range #7 · at $60,000.00"
     assert all(r["strategy"] == "Range" for r in rows)
+    # Shadow fills are not funded exposure changes: events, not signals.
     page = dashboard._render(db_path, "signals", "range")
-    assert ">Range</a>" in page and "Paper exit" in page
+    assert ">Range</a>" in page and "Paper exit" not in page
+    run = dashboard._active_run(db_path)
+    detail = dashboard._strategy_page(db_path, run, "range", "sats", None)
+    events = detail[detail.index("<h2>Recent events</h2>") :]
+    assert "Paper exit" in events and "Paper enter long" in events
 
 
 def test_alignment_flags_incomplete_model_and_unmodelled_funded_position(tmp_path, shadow_state):
