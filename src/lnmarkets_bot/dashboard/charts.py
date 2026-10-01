@@ -1014,6 +1014,9 @@ def chart_data(path: Path, *, strategy="ma", tf="1d", days=30, ma_tf="1d", end=N
     days = opts["days"]
     with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3) as db:
         db.execute("PRAGMA query_only=ON")
+        # Concurrent long-window aggregations each hold a page cache; a small one
+        # keeps the dashboard inside its 160 MiB cap at no measured speed cost.
+        db.execute("PRAGMA cache_size=-512")
         # One transaction: market rows and overlays describe the same SQLite view.
         db.execute("BEGIN")
         # bars.ts is unindexed; recent ids bound the latest-minute lookup.
