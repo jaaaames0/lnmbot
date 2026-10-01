@@ -1,8 +1,15 @@
 # Changelog
 
-## Unreleased — Dashboard top bar, compact strategy pages and P&L by strategy
+## 2026-10-01 — Dashboard top bar, compact strategy pages and P&L by strategy
 
-Source only; not deployed.
+Dashboard-only release `prod-20261001.6-gb1608a859bc7`, source `b1608a859bc7`,
+accepted at 12:39 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-pnl-20261001T123748Z`. The trader
+stayed on `prod-20261001.1-g0b1650b10779` (PID 1568026, run 72) with 40 orders
+and 40 fills unchanged. Validation: **429 tests passed**, scoped Ruff clean, 3
+import contracts kept; concurrent chart and page load peaked at 127 MiB of the
+160 MiB cap; LAN desktop/mobile checks, readiness, encrypted backup and monitor
+(**127/0/0**) passed; timed rollback was disarmed.
 
 - Top bar reads execution, price, net P&L, equity; the account source and
   fetch timestamp are gone.
