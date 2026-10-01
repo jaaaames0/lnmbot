@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased — Dashboard pages: strategies, signals and health
+## 2026-10-01 — Dashboard pages: strategies, signals and health
 
-Source only; not deployed.
+Dashboard-only release `prod-20261001.5-g71e4d26ea09a`, source `71e4d26ea09a`,
+accepted at 10:05 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-pages-20261001T100440Z`. The trader
+stayed on `prod-20261001.1-g0b1650b10779` (PID 1568026, run 72 after an
+unrelated 06:46 UTC unattended OpenSSL upgrade restart) with 40 orders and 40
+fills unchanged. Validation: **428 tests passed**, scoped Ruff clean, 3 import
+contracts kept; concurrent chart load peaked at 132 MiB of the 160 MiB cap;
+LAN desktop/mobile checks, readiness, encrypted backup and monitor
+(**127/0/0**) passed; timed rollback was disarmed.
 
 - Overview: strategy cards, a positions table that always lists every fundable
   slot (flat rows included) and recent signals with outcomes; repeated cooldown
