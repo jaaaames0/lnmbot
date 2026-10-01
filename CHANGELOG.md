@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-10-01 — Routine funding publication delay
+
+Accepted trader and dashboard runtime: `prod-20261001.1-g0b1650b10779`, source
+`0b1650b10779`, run 71, at 00:26 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-remediation-20261001T002246Z`. Release
+validation: **411 tests passed**, scoped Ruff clean, 3 import contracts kept.
+Readiness passed before and after the encrypted backup; recovery was disarmed
+last. Strategy state, settings (apart from release paths), 40 orders and zero
+open trades were unchanged.
+
+- Breakout historical funding: LN Markets publishes each 8h settlement two to
+  three minutes late. Waits under 15 minutes now log as info, and `/readyz`
+  lists them under `pending` instead of failing (previously three false
+  readiness failures a day). A daily decision held by that wait now acts if
+  funding arrives within ten minutes of the daily close, instead of being
+  dropped as a missed entry; longer outages keep the never-late rule.
+
 ## 2026-10-01 — Range rule version 3 (tested width rule)
 
 Accepted trader and dashboard runtime: `prod-20260930.4-gccc5170a16a1`, source
@@ -55,13 +72,6 @@ Dates are UTC. Dated entries record operational releases; `Unreleased` records
 source changes that have not been installed as a production release.
 
 ## Unreleased
-
-- Breakout historical funding: LN Markets publishes each 8h settlement two to
-  three minutes late. Waits under 15 minutes now log as info, and `/readyz`
-  lists them under `pending` instead of failing (previously three false
-  readiness failures a day). A daily decision held by that wait now acts if
-  funding arrives within ten minutes of the daily close, instead of being
-  dropped as a missed entry; longer outages keep the never-late rule.
 
 ## 2026-09-30 — Impulse-range strategy funded
 
