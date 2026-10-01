@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — Dashboard capital page
+
+Source only; not deployed.
+
+- New Capital page (sidebar, System): next entry, leverage and margin at risk
+  for every slot at current equity, with CHOP, taper and position-cap effects;
+  worst-case (all liquidated) and observed-drawdown loss; current mix.
+- Planner: risk budget and MA / breakout / range mix produce per-slot sizes and
+  suggested `SIZING_*`, unit notional and cap settings; a reverse calculation
+  gives the equity a set of sizes needs. Inputs survive the page refresh.
+
 ## 2026-10-01 — Dashboard top bar, compact strategy pages and P&L by strategy
 
 Dashboard-only release `prod-20261001.6-gb1608a859bc7`, source `b1608a859bc7`,

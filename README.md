@@ -78,6 +78,16 @@ Groups weight slots by average margin. After 30 days a strategy also shows an
 extrapolated CAGR, which assumes the period so far repeats and is not a
 forecast.
 
+The Capital page puts all sizing in one place. For every slot it shows the next
+entry's notional, leverage and posted margin at current equity, including the
+4h CHOP multiplier, the range taper and any clip by `RISK_MAX_POSITION_USD`.
+Isolated margin is the most a position can lose, so the worst case is every slot
+open and liquidated together; an observed case applies each strategy's worst
+margin-only drawdown so far (100% without history). A planner turns a risk
+budget and a MA / breakout / range mix into suggested `SIZING_*` and unit
+notional settings, and works back from desired sizes to the equity they need.
+It only suggests values; changing them is a trader configuration change.
+
 `/charts` overlays strategy levels on recorded LN Markets candles over a 90-day
 window: MA on its 1d or 4h decision candles, breakout and range on 4h. A
 fixed-size levels panel beside the chart and an events table below it follow

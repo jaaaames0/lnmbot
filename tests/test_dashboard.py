@@ -779,6 +779,62 @@ def test_return_on_margin_ignores_trade_size_and_needs_history_to_annualise(tmp_
     assert later["MA 4h"]["extrapolated_cagr"] == dashboard._signed_percent_html(cagr * 100)
 
 
+def test_capital_page_sizes_next_entries_and_plans_a_target_mix(tmp_path):
+    db_path = tmp_path / "portfolio.sqlite"
+    _create_multistrategy_dashboard_db(db_path, funded=False)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO bars (run_id, ts, open, high, low, close, volume) "
+            "VALUES (1, '2026-09-24 00:00:00', 80000, 80000, 80000, 80000, 0)"
+        )
+        connection.execute(
+            "INSERT INTO account_snapshots (run_id, ts, balance_sats, equity_sats, "
+            "margin_used_sats, unrealized_pnl_sats) "
+            "VALUES (1, '2026-09-24 00:00:00', 5000000, 5000000, 0, 0)"
+        )
+    dashboard = _dashboard_module()
+    config = {
+        "sizing_mode": "equity_fraction",
+        "sizing_leverage": 5,
+        "sizing_total_margin_fraction": 0.2,
+        "sizing_timeframe_weights": {"1d": 0.6, "4h": 0.4},
+        "sizing_equity_haircut": 0.95,
+        "risk_max_position_usd": 2000,
+        "risk_max_leverage": 5,
+        "strategy_breakout_enabled": True,
+        "strategy_breakout_unit_notional_usd": 100,
+        "strategy_breakout_leverage": 5,
+        "strategy_range_mode": "funded",
+        "strategy_range_unit_notional_usd": 100,
+        "strategy_range_leverage": 5,
+    }
+    run = {"id": 1, "config_json": json.dumps(config)}
+    # $4,000 equity: MA 1d would open $2,280 but the position cap clips it to $2,000.
+    page = dashboard._capital_page(
+        db_path,
+        run,
+        "sats",
+        None,
+        {"budget": "40", "ma": "50", "breakout": "25", "range": "25", "w1d": "60",
+         "n4h": "1600", "n1d": "2400", "nk": "500", "nr": "2000"},
+    )
+    assert "clipped by position cap $2,000" in page
+    assert "<td>$1,520</td>" in page and "<td>$304</td>" in page
+    # 40% of $4,000 = $1,600 margin: MA $800 (1d $480, 4h $320), $100 per breakout
+    # unit and $400 for range, at 5x.
+    for notional in ("$2,400", "$1,600", "$500", "$2,000"):
+        assert f"<td>{notional}</td>" in page
+    assert "<td>SIZING_TOTAL_MARGIN_FRACTION</td><td>0.2</td><td>0.2105</td>" in page
+    assert "<td>STRATEGY_BREAKOUT_UNIT_NOTIONAL_USD</td><td>100</td><td>500</td>" in page
+    assert "<td>STRATEGY_RANGE_UNIT_NOTIONAL_USD</td><td>100</td><td>2000</td>" in page
+    assert "<td>RISK_MAX_POSITION_USD</td><td>2000</td><td>2400</td>" in page
+    # Those sizes need exactly the current equity at a 40% budget.
+    assert "<td>Equity needed at 40% budget</td><td>$4,000</td>" in page
+    assert "no history · counted as 100%" in page and "data-preserve" in page
+    rendered = dashboard._render(db_path, "capital", None)
+    assert "<h1>Capital</h1>" in rendered and 'href="/capital"' in rendered
+
+
 def _create_multistrategy_dashboard_db(db_path, *, funded: bool) -> None:
     from lnmarkets_bot.persistence.db import init_schema, make_engine
 

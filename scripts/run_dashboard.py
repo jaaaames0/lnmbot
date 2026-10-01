@@ -2944,21 +2944,10 @@ def _strategy_performance_rows(
 CAGR_MIN_DAYS = 30
 
 
-def _margin_return_rows(
-    db_path: Path,
-    positions: list[dict[str, object]],
-    denomination: str,
-    btc_price: float | None,
-    now: datetime | None = None,
-) -> list[dict[str, object]]:
-    """Balance-agnostic returns: each trade's net P&L over the isolated margin it posted.
-
-    Per slot, trade returns compound as if the slot's account held only its margin.
-    A group weights its slots by their average margin, so the figure is unchanged by
-    deposits or idle balance. Open positions count at their mark, net of entry fee
-    and funding so far.
-    """
-    now = now or datetime.now(UTC)
+def _margin_trades(
+    db_path: Path, positions: list[dict[str, object]]
+) -> list[tuple[datetime, str, str, int, float]]:
+    """(opened_at, group, slot, net sats, posted margin sats), oldest first; open at mark."""
     trades: list[tuple[datetime, str, str, int, float]] = []
     for event in _closed_trade_components(db_path):
         if isinstance(event.get("opened_at"), datetime) and event["margin_sats"] > 0:
@@ -2986,6 +2975,41 @@ def _margin_return_rows(
         group = _pnl_group(position["strategy"], position["timeframe"])
         trades.append((opened_at, group, str(position["slot"]), net, margin))
     trades.sort(key=lambda trade: trade[0])
+    return trades
+
+
+def _lean_drawdowns(trades: list[tuple[datetime, str, str, int, float]]) -> dict[str, float]:
+    """Worst peak-to-trough fall of any one slot's margin-only account, per group."""
+    curves: dict[tuple[str, str], list[float]] = {}
+    for _, group, slot, net, margin in trades:
+        curve = curves.setdefault((group, slot), [1.0])
+        curve.append(curve[-1] * (1 + net / margin))
+    worst: dict[str, float] = {}
+    for (group, _), curve in curves.items():
+        peak, drawdown = curve[0], 0.0
+        for value in curve:
+            peak = max(peak, value)
+            drawdown = max(drawdown, 1 - value / peak if peak > 0 else 1.0)
+        worst[group] = max(worst.get(group, 0.0), min(drawdown, 1.0))
+    return worst
+
+
+def _margin_return_rows(
+    db_path: Path,
+    positions: list[dict[str, object]],
+    denomination: str,
+    btc_price: float | None,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Balance-agnostic returns: each trade's net P&L over the isolated margin it posted.
+
+    Per slot, trade returns compound as if the slot's account held only its margin.
+    A group weights its slots by their average margin, so the figure is unchanged by
+    deposits or idle balance. Open positions count at their mark, net of entry fee
+    and funding so far.
+    """
+    now = now or datetime.now(UTC)
+    trades = _margin_trades(db_path, positions)
     labels: list[tuple[str, set[str], str | None]] = [
         ("MA 4h", {"MA 4h"}, None),
         ("MA 1d", {"MA 1d"}, None),
@@ -3431,6 +3455,451 @@ def _strategy_state(db_path, run, strategy, denomination, exchange) -> str:
             ("strategy", "slot", "side", "entry_ts", "exposure", "entry_price", "exit_watch"),
         )
         + _portfolio_panel()
+    )
+
+
+CAPITAL_DEFAULTS = {"budget": 40.0, "ma": 50.0, "breakout": 25.0, "range": 25.0}
+CAPITAL_FIELDS = ("budget", "ma", "breakout", "range", "w1d", "equity", "n1d", "n4h", "nk", "nr")
+
+
+def _account_equity_sats(
+    db_path: Path, positions: list[dict[str, object]], exchange: ExchangeSnapshot | None
+) -> int:
+    """Venue equity when available, else the local snapshot plus open mark."""
+    if exchange is not None:
+        return int(exchange.total_sats)
+    rows = _query(
+        db_path,
+        "SELECT balance_sats, margin_used_sats FROM account_snapshots ORDER BY id DESC LIMIT 1",
+    )
+    snapshot = dict(rows[0]) if rows else {}
+    unrealized = sum(
+        int(position["estimated_unrealized_sats"])
+        for position in positions
+        if isinstance(position.get("estimated_unrealized_sats"), int)
+    )
+    return (
+        int(snapshot.get("balance_sats") or 0)
+        + int(snapshot.get("margin_used_sats") or 0)
+        + unrealized
+    )
+
+
+def _capital_page(
+    db_path: Path,
+    run: dict[str, object],
+    denomination: str,
+    exchange: ExchangeSnapshot | None,
+    params: dict[str, str],
+) -> str:
+    """Sizing in one place: what each slot will open next, and a planner for a target mix.
+
+    Every position is isolated, so its posted margin is the most it can lose. The
+    worst case is every slot open and liquidated at once; the observed case applies
+    each strategy's worst margin-only drawdown so far. Read-only: it suggests
+    configuration values and never changes them.
+    """
+    price, _, _ = _market_context(db_path)
+    if not price:
+        return "<h1>Capital</h1><p class=muted>Awaiting a price.</p>"
+    cfg = _metadata(run.get("config_json"))
+    positions = _open_positions(db_path, _orders(db_path, limit=None), price, exchange)
+    equity_sats = _account_equity_sats(db_path, positions, exchange)
+    equity_usd = equity_sats * price / 1e8
+
+    def number(key: str, default: float) -> float:
+        try:
+            value = float(cfg.get(key))
+        except (TypeError, ValueError):
+            return default
+        return value
+
+    def optional(key: str) -> float | None:
+        value = cfg.get(key)
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    cap_position = number("risk_max_position_usd", float("inf"))
+    cap_leverage = number("risk_max_leverage", float("inf"))
+    cap_notional = optional("risk_max_total_notional_usd")
+    cap_margin = optional("risk_max_total_margin_usd")
+    haircut = number("sizing_equity_haircut", 1.0)
+    fraction = number("sizing_total_margin_fraction", 0.0)
+    weights = cfg.get("sizing_timeframe_weights")
+    weights = weights if isinstance(weights, dict) else {}
+    ma_leverage = min(number("sizing_leverage", 1.0), cap_leverage)
+    breakout_leverage = min(number("strategy_breakout_leverage", 1.0), cap_leverage)
+    range_leverage = min(number("strategy_range_leverage", 1.0), cap_leverage)
+    breakout_on = bool(cfg.get("strategy_breakout_enabled"))
+    range_on = str(cfg.get("strategy_range_mode") or "off") == "funded"
+
+    ma_rows = _query(
+        db_path,
+        "SELECT state_json FROM strategy_state_snapshots WHERE mode='live' "
+        "AND strategy_name IN (?,?) ORDER BY CASE strategy_name WHEN ? THEN 0 ELSE 1 END LIMIT 1",
+        ("ma_cross_primary", MA_STRATEGY_NAME, "ma_cross_primary"),
+    )
+    ma_state = _metadata(ma_rows[0]["state_json"]) if ma_rows else {}
+    chop = _metadata(_metadata(ma_state.get("timeframes")).get("4h")).get("chop")
+    chop_high = (
+        bool(cfg.get("strategy_4h_chop_reduce_enabled"))
+        and isinstance(chop, (int, float))
+        and chop > number("strategy_chop_high_threshold", 100.0)
+    )
+    range_levels = _range_context(_persisted_range_state(db_path), [], None)["levels"]
+    taper = float(range_levels["size_multiplier"]) if range_levels else None
+
+    def usd(value: float) -> str:
+        return f"-${-value:,.0f}" if value < 0 else f"${value:,.0f}"
+
+    def share(value: float) -> str:
+        return f"{value / equity_usd:.1%}" if equity_usd > 0 else "-"
+
+    # Next entry per slot, as the risk guard would size it now.
+    slots: list[dict[str, object]] = []
+    for tf in ("4h", "1d"):
+        notes = []
+        if str(cfg.get("sizing_mode")) == "equity_fraction":
+            weight = float(weights.get(tf, 0.0))
+            notional = float(math.floor(equity_usd * fraction * weight * haircut * ma_leverage))
+            sizing = f"equity x {fraction:g} x {weight:g} x {haircut:g} x {ma_leverage:g}x"
+        else:
+            notional = number("sizing_fixed_notional_usd", 0.0)
+            sizing = f"fixed {usd(notional)}"
+        if tf == "4h" and chop_high:
+            multiplier = number("strategy_chop_high_size_multiplier", 1.0)
+            notional *= multiplier
+            notes.append(f"high CHOP x{multiplier:g}")
+        slots.append(
+            {
+                "strategy": "MA",
+                "slot": tf,
+                "sizing": sizing,
+                "raw": notional,
+                "leverage": ma_leverage,
+                "notes": notes,
+            }
+        )
+    for unit in range(4):
+        unit_notional = number("strategy_breakout_unit_notional_usd", 0.0)
+        slots.append(
+            {
+                "strategy": "Breakout",
+                "slot": f"k{unit}",
+                "sizing": f"fixed {usd(unit_notional)} per unit",
+                "raw": unit_notional if breakout_on else 0.0,
+                "leverage": breakout_leverage,
+                "notes": [] if breakout_on else ["entries disabled"],
+            }
+        )
+    range_unit = number("strategy_range_unit_notional_usd", 0.0)
+    range_notes = [] if range_on else ["not funded"]
+    if taper is None:
+        range_notes.append("no channel · full size shown")
+    else:
+        range_notes.append(f"taper x{taper:.2f}")
+    slots.append(
+        {
+            "strategy": "Range",
+            "slot": "r0",
+            "sizing": f"fixed {usd(range_unit)} x taper",
+            "raw": range_unit * (taper if taper is not None else 1.0) if range_on else 0.0,
+            "leverage": range_leverage,
+            "notes": range_notes,
+        }
+    )
+    open_margin: dict[tuple[str, str], float] = {}
+    for position in positions:
+        label = {
+            "ma_cross_primary": "MA",
+            "legacy_ma": "MA",
+            BREAKOUT_INSTANCE_ID: "Breakout",
+            RANGE_INSTANCE_ID: "Range",
+        }.get(str(position.get("strategy")), "")
+        key = (label, str(position.get("slot")))
+        open_margin[key] = open_margin.get(key, 0.0) + _margin_sats(position) * price / 1e8
+    for slot in slots:
+        notional = min(float(slot["raw"]), cap_position)
+        if float(slot["raw"]) > cap_position:
+            slot["notes"].append(f"clipped by position cap {usd(cap_position)}")
+        slot["notional"] = notional
+        slot["margin"] = notional / float(slot["leverage"]) if slot["leverage"] else 0.0
+    deployed = sum(float(slot["margin"]) for slot in slots)
+    by_strategy = {
+        name: sum(float(slot["margin"]) for slot in slots if slot["strategy"] == name)
+        for name in ("MA", "Breakout", "Range")
+    }
+    drawdowns = _lean_drawdowns(_margin_trades(db_path, positions))
+
+    def drawdown_for(slot: dict[str, object]) -> float | None:
+        group = f"MA {slot['slot']}" if slot["strategy"] == "MA" else str(slot["strategy"])
+        return drawdowns.get(group)
+
+    observed = sum(
+        float(slot["margin"]) * (drawdown_for(slot) if drawdown_for(slot) is not None else 1.0)
+        for slot in slots
+    )
+    current_rows = [
+        {
+            "strategy": slot["strategy"],
+            "slot": slot["slot"],
+            "sizing": slot["sizing"],
+            "next_notional": usd(float(slot["notional"])),
+            "leverage": f"{float(slot['leverage']):g}x",
+            "margin_at_risk": usd(float(slot["margin"])),
+            "of_equity": share(float(slot["margin"])),
+            "open_now": usd(open_margin[(str(slot["strategy"]), str(slot["slot"]))])
+            if (slot["strategy"], slot["slot"]) in open_margin
+            else "flat",
+            "notes": " · ".join(slot["notes"]) or "-",
+        }
+        for slot in slots
+    ]
+    mix = {name: value / deployed * 100 if deployed else 0.0 for name, value in by_strategy.items()}
+    summary = [
+        {
+            "measure": "Equity",
+            "value": _amount_html(equity_sats, denomination, price),
+            "of_equity": "100%",
+        },
+        {
+            "measure": "Margin with every slot open",
+            "value": usd(deployed),
+            "of_equity": share(deployed),
+        },
+        {
+            "measure": "Buffer never posted",
+            "value": usd(equity_usd - deployed),
+            "of_equity": share(equity_usd - deployed),
+        },
+        {
+            "measure": "Worst case · all liquidated",
+            "value": usd(-deployed),
+            "of_equity": share(deployed),
+        },
+        {
+            "measure": "Observed case · worst drawdowns",
+            "value": usd(-observed),
+            "of_equity": share(observed),
+        },
+        {
+            "measure": "Mix · MA / Breakout / Range",
+            "value": " / ".join(f"{mix[name]:.0f}%" for name in ("MA", "Breakout", "Range")),
+            "of_equity": "-",
+        },
+    ]
+    drawdown_rows = [
+        {
+            "strategy": group,
+            "worst_drawdown_of_margin": f"{drawdowns[group]:.1%}"
+            if group in drawdowns
+            else "no history · counted as 100%",
+        }
+        for group in PNL_GROUPS
+    ]
+
+    # Planner. Inputs are percentages and USD; blanks fall back to defaults.
+    def field(name: str, default: float) -> float:
+        try:
+            value = float(params.get(name, ""))
+        except ValueError:
+            return default
+        return value if value >= 0 else default
+
+    current_w1d = float(weights.get("1d", 0.5)) / (sum(float(v) for v in weights.values()) or 1)
+    budget = min(field("budget", CAPITAL_DEFAULTS["budget"]), 100.0) / 100
+    raw_mix = {name: field(name, CAPITAL_DEFAULTS[name]) for name in ("ma", "breakout", "range")}
+    mix_total = sum(raw_mix.values()) or 1.0
+    plan_mix = {name: value / mix_total for name, value in raw_mix.items()}
+    w1d = min(field("w1d", round(current_w1d * 100)), 100.0) / 100
+    plan_equity = field("equity", 0.0) or equity_usd
+    plan_margin = plan_equity * budget
+    planned = [
+        ("MA", "4h", plan_margin * plan_mix["ma"] * (1 - w1d), ma_leverage),
+        ("MA", "1d", plan_margin * plan_mix["ma"] * w1d, ma_leverage),
+        *(
+            ("Breakout", f"k{unit}", plan_margin * plan_mix["breakout"] / 4, breakout_leverage)
+            for unit in range(4)
+        ),
+        ("Range", "r0", plan_margin * plan_mix["range"], range_leverage),
+    ]
+    plan_rows = [
+        {
+            "strategy": name,
+            "slot": slot,
+            "notional": usd(margin * leverage),
+            "margin_at_risk": usd(margin),
+            "of_equity": f"{margin / plan_equity:.1%}" if plan_equity > 0 else "-",
+        }
+        for name, slot, margin, leverage in planned
+    ]
+    largest = max(margin * leverage for _, _, margin, leverage in planned)
+    total_notional = sum(margin * leverage for _, _, margin, leverage in planned)
+    suggested_fraction = budget * plan_mix["ma"] / haircut if haircut else 0.0
+    breakout_unit = math.floor(plan_margin * plan_mix["breakout"] / 4 * breakout_leverage)
+    range_notional = math.floor(plan_margin * plan_mix["range"] * range_leverage)
+    suggestions = [
+        ("SIZING_MODE", cfg.get("sizing_mode"), "equity_fraction"),
+        ("SIZING_TOTAL_MARGIN_FRACTION", fraction, f"{suggested_fraction:.4f}"),
+        (
+            "SIZING_TIMEFRAME_WEIGHTS",
+            json.dumps(weights, separators=(",", ":")),
+            json.dumps({"1d": round(w1d, 4), "4h": round(1 - w1d, 4)}, separators=(",", ":")),
+        ),
+        (
+            "STRATEGY_BREAKOUT_UNIT_NOTIONAL_USD",
+            cfg.get("strategy_breakout_unit_notional_usd"),
+            breakout_unit,
+        ),
+        (
+            "STRATEGY_RANGE_UNIT_NOTIONAL_USD",
+            cfg.get("strategy_range_unit_notional_usd"),
+            range_notional,
+        ),
+        (
+            "RISK_MAX_POSITION_USD",
+            cfg.get("risk_max_position_usd"),
+            cfg.get("risk_max_position_usd") if largest <= cap_position else math.ceil(largest),
+        ),
+    ]
+    if cap_notional is not None and total_notional > cap_notional:
+        suggestions.append(("RISK_MAX_TOTAL_NOTIONAL_USD", cap_notional, math.ceil(total_notional)))
+    if cap_margin is not None and plan_margin > cap_margin:
+        suggestions.append(("RISK_MAX_TOTAL_MARGIN_USD", cap_margin, math.ceil(plan_margin)))
+    suggestion_rows = [
+        {
+            "setting": key,
+            "current": "-" if current is None else str(current),
+            "suggested": str(new),
+            "change": "change" if str(current) != str(new) else "-",
+        }
+        for key, current, new in suggestions
+    ]
+    warnings = []
+    if abs(mix_total - 100) > 0.01:
+        warnings.append(f"Mix entered sums to {mix_total:g}%; scaled to 100%.")
+    drift = max(
+        abs(mix[name] - plan_mix[key] * 100)
+        for name, key in (("MA", "ma"), ("Breakout", "breakout"), ("Range", "range"))
+    )
+    if deployed and drift > 10:
+        warnings.append(
+            f"Current mix differs from the plan by up to {drift:.0f} points. Breakout and range "
+            "are fixed notional, so the mix drifts as equity changes."
+        )
+    if taper is not None and taper < 1:
+        warnings.append(
+            f"Range's next entry is x{taper:.2f} of its unit notional while the current channel ages."
+        )
+
+    # Reverse: the equity a set of sizes needs at the chosen budget.
+    defaults = {
+        "n4h": slots[0]["notional"],
+        "n1d": slots[1]["notional"],
+        "nk": number("strategy_breakout_unit_notional_usd", 0.0),
+        "nr": range_unit,
+    }
+    targets = {key: field(key, float(value)) for key, value in defaults.items()}
+    target_margin = (
+        targets["n4h"] / ma_leverage
+        + targets["n1d"] / ma_leverage
+        + 4 * targets["nk"] / breakout_leverage
+        + targets["nr"] / range_leverage
+    )
+    needed = target_margin / budget if budget else float("inf")
+    reverse_rows = [
+        {"measure": "Margin with every slot open", "value": usd(target_margin)},
+        {"measure": f"Equity needed at {budget:.0%} budget", "value": usd(needed)},
+        {"measure": "Current equity", "value": usd(equity_usd)},
+        {"measure": "Surplus / shortfall", "value": _signed_usd_html(equity_usd - needed)},
+    ]
+    if max(targets.values()) > cap_position:
+        reverse_rows.append(
+            {
+                "measure": "Position cap",
+                "value": f"{usd(cap_position)} · raise to {usd(math.ceil(max(targets.values())))}",
+            }
+        )
+
+    def box(name: str, label: str, value: float | None, unit: str) -> str:
+        shown = "" if value is None else f"{value:g}"
+        return (
+            f'<label>{html.escape(label)}<span><input type=number min=0 step=any name="{name}" '
+            f'value="{shown}">{unit}</span></label>'
+        )
+
+    form = (
+        '<form class="capital-form" method="get" action="/capital" data-preserve>'
+        + (
+            f'<input type=hidden name=denom value="{html.escape(denomination)}">'
+            if denomination != "sats"
+            else ""
+        )
+        + "<fieldset><legend>Plan</legend>"
+        + box("budget", "Risk budget (max posted)", budget * 100, "% of equity")
+        + box("ma", "MA cross", raw_mix["ma"], "%")
+        + box("w1d", "· of which 1d", w1d * 100, "%")
+        + box("breakout", "Breakout (k0-k3)", raw_mix["breakout"], "%")
+        + box("range", "Range", raw_mix["range"], "%")
+        + box("equity", "Equity (blank = current)", field("equity", 0.0) or None, "USD")
+        + "</fieldset><fieldset><legend>Equity needed for sizes</legend>"
+        + box("n4h", "MA 4h notional", targets["n4h"], "USD")
+        + box("n1d", "MA 1d notional", targets["n1d"], "USD")
+        + box("nk", "Breakout unit notional", targets["nk"], "USD")
+        + box("nr", "Range unit notional", targets["nr"], "USD")
+        + "</fieldset><button type=submit>Calculate</button>"
+        + '<a class="activity-more" href="/capital">Reset</a></form>'
+    )
+    return (
+        "<h1>Capital</h1>"
+        + '<div class="pnl-grid">'
+        + _table("Allocation now", summary, ("measure", "value", "of_equity"), compact=True)
+        + _table(
+            "Drawdown basis", drawdown_rows, ("strategy", "worst_drawdown_of_margin"), compact=True
+        )
+        + "</div>"
+        + _table(
+            "Next entry by slot",
+            current_rows,
+            (
+                "strategy",
+                "slot",
+                "sizing",
+                "next_notional",
+                "leverage",
+                "margin_at_risk",
+                "of_equity",
+                "open_now",
+                "notes",
+            ),
+        )
+        + "<p class=note>Isolated margin is the most a position can lose. The worst case is "
+        "every slot open and liquidated together; the observed case applies each strategy's "
+        "worst margin-only drawdown so far.</p>"
+        + "<section><h2>Planner</h2>"
+        + form
+        + "</section>"
+        + "".join(f"<p class=capital-warning>{html.escape(text)}</p>" for text in warnings)
+        + '<div class="pnl-grid">'
+        + _table(
+            f"Plan · {budget:.0%} of {usd(plan_equity)} at risk",
+            plan_rows,
+            ("strategy", "slot", "notional", "margin_at_risk", "of_equity"),
+            compact=True,
+        )
+        + _table("Equity needed", reverse_rows, ("measure", "value"), compact=True)
+        + "</div>"
+        + _table(
+            "Suggested configuration",
+            suggestion_rows,
+            ("setting", "current", "suggested", "change"),
+            compact=True,
+        )
+        + "<p class=note>Suggestions only: apply them through the trader's protected "
+        "environment and a normal trader restart. MA sizing follows equity; breakout and "
+        "range notionals are fixed until changed.</p>"
     )
 
 
@@ -4069,6 +4538,7 @@ def _presentation_style() -> str:
 .config-table{border:1px solid var(--border);border-radius:7px;background:var(--surface)}.config-row{display:grid;grid-template-columns:11rem minmax(0,1fr);gap:1rem;padding:.7rem .9rem;border-bottom:1px solid var(--border)}.config-row:last-child{border-bottom:0}.config-row h2{margin:0;font-size:.72rem;align-self:center}.config-row dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.45rem 1rem;font-size:.8rem}.config-row dt{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.05em}.config-row dd{overflow-wrap:anywhere}@media(max-width:700px){.config-row{grid-template-columns:1fr;gap:.5rem}}
 .events-toggle{margin:-.4rem 0 .2rem;color:var(--muted);font-size:.8rem}.events-toggle label{display:inline-flex;align-items:center;gap:.4rem;cursor:pointer}.events-toggle input{accent-color:var(--accent)}
 .note{color:var(--muted);font-size:.75rem;line-height:1.5;margin:.5rem 0 0;max-width:76rem}
+.capital-form{display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end}.capital-form fieldset{display:grid;grid-template-columns:repeat(auto-fill,minmax(12rem,1fr));gap:.6rem 1rem;flex:1 1 30rem;border:1px solid var(--border);border-radius:7px;background:var(--surface);padding:.8rem .9rem}.capital-form legend{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;padding:0 .3rem}.capital-form label{display:flex;flex-direction:column;gap:.25rem;color:var(--muted);font-size:.72rem}.capital-form label span{display:flex;align-items:center;gap:.35rem}.capital-form input{width:7rem;background:var(--surface-2);border:1px solid var(--border-hover);border-radius:4px;color:var(--text);font:inherit;font-size:.82rem;padding:.25rem .4rem}.capital-form input:focus{outline:none;border-color:var(--accent)}.capital-form button{background:var(--accent-dim);border:1px solid var(--accent);border-radius:4px;color:var(--accent);font:inherit;font-size:.8rem;padding:.35rem .9rem;cursor:pointer}.capital-warning{color:#fbbf24;font-size:.78rem;margin:.6rem 0 0}
 </style>"""
 
 
@@ -4432,6 +4902,11 @@ def _render(
         elif page == "charts":
             exchange = _EXCHANGE_CACHE.get()
             content = _presentation_style() + charts.page()
+        elif page == "capital":
+            exchange = _EXCHANGE_CACHE.get()
+            content = _presentation_style() + _capital_page(
+                db_path, run, denomination, exchange, chart_query or {}
+            )
         elif page.startswith("strategies/"):
             exchange = _EXCHANGE_CACHE.get()
             content = _presentation_style() + _strategy_page(
@@ -4578,7 +5053,7 @@ def _render(
   const sync=(current,next)=>{
     if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){current.replaceWith(next.cloneNode(true));return}
     if(current.nodeType===Node.TEXT_NODE){if(current.nodeValue!==next.nodeValue)current.nodeValue=next.nodeValue;return}
-    if(current.hasAttribute('data-preserve-chart'))return
+    if(current.hasAttribute('data-preserve-chart')||current.hasAttribute('data-preserve'))return
     const wasOpen=current.nodeName==='DETAILS'&&current.hasAttribute('data-preserve-open')?current.open:null
     for(const attribute of [...current.attributes])if(!next.hasAttribute(attribute.name))current.removeAttribute(attribute.name)
     for(const attribute of [...next.attributes])if(current.getAttribute(attribute.name)!==attribute.value)current.setAttribute(attribute.name,attribute.value)
@@ -4685,7 +5160,8 @@ def _render(
         "{nav_link('funding', 'Funding', '₿')}": nav_link("funding", "Funding", "₿"),
         "{nav_link('pnl', 'P&L', '±')}": nav_link("pnl", "P&L", "±"),
         "{nav_link('runs', 'Runs', '◌')}": "",
-        "{nav_link('health', 'Health', '✓')}": nav_link("health", "Health", "✓"),
+        "{nav_link('health', 'Health', '✓')}": nav_link("capital", "Capital", "▤")
+        + nav_link("health", "Health", "✓"),
         "{scope_links_html}": scope_links_html,
         "{topbar}": topbar,
         "{sidebar_status}": sidebar_status,
@@ -4770,6 +5246,7 @@ def _handler(db_path: Path):
                 "pnl",
                 "health",
                 "charts",
+                "capital",
                 "strategies/ma",
                 "strategies/breakout",
                 "strategies/range",
@@ -4809,10 +5286,14 @@ def _handler(db_path: Path):
                     pnl_basis,
                     {
                         key: query[key][0]
-                        for key in ("strategy", "tf", "ma_tf", "days", "end")
+                        for key in (
+                            CAPITAL_FIELDS
+                            if page == "capital"
+                            else ("strategy", "tf", "ma_tf", "days", "end")
+                        )
                         if key in query
                     }
-                    if page == "charts"
+                    if page in {"charts", "capital"}
                     else None,
                     page == "signals" and query.get("events", [""])[0] == "1",
                 ).encode()
