@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased — Chart page panels
+## 2026-10-01 — Chart page panels
 
-Source only; not deployed.
+Dashboard-only release `prod-20261001.4-g0f6fecf07e52`, source `0f6fecf07e52`,
+accepted at 05:38 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-dashboard-panels-20261001T053640Z`. The trader
+remains on `prod-20261001.1-g0b1650b10779`, PID 1411724, run 71, with 40
+orders and 40 fills unchanged. Validation: **426 tests passed**, scoped Ruff
+clean, 3 import contracts kept; concurrent chart load peaked at 127 MiB of the
+160 MiB cap; LAN desktop/mobile checks showed no page movement while hovering.
+Readiness, encrypted backup and monitor (**127/0/0**) passed; timed rollback
+was disarmed.
 
 - Fixed-size Levels panel beside the chart: one row per level, highest price
   first, with line swatches; hovering no longer reflows the page.
