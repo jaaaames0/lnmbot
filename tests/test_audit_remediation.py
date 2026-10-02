@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import structlog
 
 from lnmarkets_bot.api.client import LnmRestClient
 from lnmarkets_bot.api.isolated import IsolatedTrade
@@ -309,9 +310,11 @@ async def test_funding_transaction_failure_retries_without_dedup_loss(cfg):
     await e.sync_funding(minute().ts, force=True)
     assert not _rows(f, funding_fees)
     r.record_strategy_pnl_event = original
-    await e.sync_funding(minute().ts, force=True)
-    await e.sync_funding(minute().ts, force=True)
+    with structlog.testing.capture_logs() as logs:
+        await e.sync_funding(minute().ts, force=True)
+        await e.sync_funding(minute().ts, force=True)
     assert len(_rows(f, funding_fees)) == 1
+    assert [log["event"] for log in logs].count("live.funding_recorded") == 1
     assert r.net_daily_pnl_sats("2026-08-29") == -100
 
 

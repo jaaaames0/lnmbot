@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — Quieter funding sync logs
+
+- Log `live.funding_recorded` only for a newly inserted settlement. The
+  full-history funding replay added on 2026-09-27 had been logging every known
+  settlement on each 15-minute sync (about 30,000 lines a day). Funding
+  accounting and deduplication are unchanged.
+
 ## 2026-10-01 — Dashboard capital page
 
 Dashboard-only release `prod-20261001.7-ga81f3f2ea45f`, source `a81f3f2ea45f`,
@@ -65,6 +72,16 @@ LAN desktop/mobile checks, readiness, encrypted backup and monitor
   Overview.
 - Runs folds into Health (active run, readiness, account-wide settings and hard
   risk limits); `/runs` redirects there.
+
+## 2026-10-01 — Quarterly strategy review procedure (documentation)
+
+- Document an agent-run quarterly audit in the local research archive, with
+  per-owner and portfolio checks, frozen expectations, market diagnostics,
+  risk/continuation gates and forward-challenger discipline.
+- Add report, baseline and challenger templates requiring reproducible
+  evidence, contrary findings and carried-forward actions. Calibration and
+  operator loss budgets remain first-run work. No funded behavior, service,
+  production database or review schedule was changed or installed.
 
 ## 2026-10-01 — Chart page panels
 

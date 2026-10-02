@@ -657,12 +657,14 @@ class LiveExecutor:
                             kind="funding",
                             amount_sats=-fee_sats,
                         )
-                    _log.info(
-                        "live.funding_recorded",
-                        trade_id=trade_id,
-                        settlement_id=settlement_id,
-                        fee_sats=fee_sats,
-                    )
+                        # The full-history replay revisits every known
+                        # settlement each sync; log only new ones.
+                        _log.info(
+                            "live.funding_recorded",
+                            trade_id=trade_id,
+                            settlement_id=settlement_id,
+                            fee_sats=fee_sats,
+                        )
             self._last_funding_sync_at = ts
         except Exception as exc:
             _log.warning("live.funding_sync_failed", error=str(exc))
