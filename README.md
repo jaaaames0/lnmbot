@@ -121,6 +121,13 @@ APIs. Historical strategy investigations under the local, Git-ignored `docs/`,
 collection. See [CHANGELOG.md](CHANGELOG.md) for production and dashboard
 history.
 
+The local [quarterly strategy audit protocol](docs/research/2026-10-01-strategy-review-protocol/README.md)
+defines repeatable checks of execution, profitability expectations, market
+change and forward challengers, with comprehensive evidence and action notes.
+Reviews recommend changes through explicit gates; they do not automatically
+retune funded strategies after a losing quarter. The protocol and audit
+artifacts live in the Git-ignored local research archive; no timer is installed.
+
 Funded range recovery retains an owned close obligation until venue flatness,
 including restart during submission. Range construction rule version 3 is the
 tested research rule: the 40% width cap ends an expanding channel, while a

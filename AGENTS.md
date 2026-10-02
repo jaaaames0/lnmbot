@@ -53,6 +53,19 @@ for the current task take precedence over this file.
   Keep new research evidence in the ignored local archive unless explicitly
   asked to publish it.
 
+## Strategy reviews
+
+- For a quarterly strategy audit, start with the local
+  [review protocol](docs/research/2026-10-01-strategy-review-protocol/README.md)
+  and follow its workflow, templates and evidence/action registers. If the
+  ignored archive is absent, report the missing protocol rather than inventing
+  its thresholds.
+- Carry prior adverse evidence, unresolved actions and frozen baselines into
+  each review. Distinguish insufficient evidence from meeting expectations.
+  A losing quarter alone does not justify retuning. Audit requests authorize
+  local research and read-only inspection; funded changes follow their own
+  operator authorization and deployment procedure.
+
 ## Live host boundary
 
 A source-editing task does not itself call for a live service or database
