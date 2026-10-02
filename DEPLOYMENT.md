@@ -364,8 +364,8 @@ restarts both services and is unsuitable for this purpose. Verify service paths,
 dashboard readiness and the unchanged trader PID/release before and after the
 change. Avoid the 00/04/08/12/16/20 UTC boundaries, including funding at 00/08/16.
 
-The current dashboard-only release is `prod-20261001.7-ga81f3f2ea45f` (1 October,
-23:41 UTC); the trader remains on `prod-20261001.1-g0b1650b10779`. The readiness oneshot's Python
+The current trader and dashboard release is `prod-20261002.1-g82b8a2c130f8` (2 October,
+00:25 UTC), switched together by `scripts/deploy_range_remediation.py`. The readiness oneshot's Python
 and script paths follow the dashboard release and must switch with it. Preserve
 the installed unit's identity, sandbox, credential path and **160 MiB** cap;
 the repository template's memory value is not the current host baseline.
@@ -396,7 +396,8 @@ The dated transactions and detailed evidence are in the local ignored
 `docs/operations/2026-10-01-dashboard-panels-release.md` and
 `docs/operations/2026-10-01-dashboard-pages-release.md` and
 `docs/operations/2026-10-01-dashboard-pnl-release.md` and
-`docs/operations/2026-10-01-dashboard-capital-release.md` archives.
+`docs/operations/2026-10-01-dashboard-capital-release.md` and
+`docs/operations/2026-10-02-trader-funding-log-release.md` archives.
 
 An optional, separately installed `lnmbot-breakout-shadow.service` and timer
 can advance an order-incapable daily breakout book from completed public

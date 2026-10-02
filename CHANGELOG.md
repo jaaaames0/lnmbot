@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased — Quieter funding sync logs
+## 2026-10-02 — Quieter funding sync logs
+
+Trader and dashboard release `prod-20261002.1-g82b8a2c130f8`, source `82b8a2c130f8`, accepted at
+00:25 UTC. Protected checkpoint:
+`/data/security-backups/lnmbot-remediation-20261002T002144Z`. Restart into run
+74 restored all three strategy snapshots, kept the open MA 4h long aligned at the
+venue, the MA 1d winner cool-off (11 left) and 41 orders/41 fills, and placed no
+startup order. Validation: **430 tests passed**, scoped Ruff clean, 3 import
+contracts kept; readiness before and after the encrypted backup, monitor
+(**127/0/0**); compatible recovery disarmed. The dashboard code is unchanged from
+the Capital release.
 
 - Log `live.funding_recorded` only for a newly inserted settlement. The
   full-history funding replay added on 2026-09-27 had been logging every known
